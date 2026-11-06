@@ -98,6 +98,7 @@ class Agent:
         approve: Callable[[ToolCall], tuple[bool, str]] | None = None,
         depth: int = 0,
         system_base: str | None = None,
+        system_note: str = "",
         label: str = "",
         vision_model: str = "",
         image_model: str = "",
@@ -122,6 +123,7 @@ class Agent:
         self.approve = approve
         self.depth = depth
         self.system_base = system_base
+        self.system_note = system_note
         self.label = label
         self.vision_model = vision_model
         self.image_model = image_model
@@ -386,6 +388,8 @@ class Agent:
             if self.depth == 0:
                 self.ws.install_harness(self.harness)
             system = build_system(self.harness, self.ws, base=self.system_base, extra_tools=self.extra_tools)
+            if self.system_note:
+                system += "\n\n" + self.system_note
             options = ModelOptions(effort=self.effort, role=self.role, cancel=self.cancel)
             out_budget = min(options.max_tokens, self.output_limit or options.max_tokens)
             if self.context_limit:

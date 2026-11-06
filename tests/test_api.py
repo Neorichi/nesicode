@@ -943,3 +943,25 @@ def test_bot_is_a_conversation(alice, project):
     # a normal conversation is not a bot
     t = alice.post(f"/api/projects/{project['id']}/threads", json={}).json()
     assert alice.get(f"/api/threads/{t['id']}").json()["thread"]["bot"] is None
+
+
+def test_connector_usage_modes(alice, project):
+    from nesicode.server.app import db, jobs
+
+    assert alice.post("/api/connectors", json={"template": "office"}).status_code == 200
+    me = alice.get("/api/auth/me").json()
+    c = next(c for c in alice.get("/api/connectors").json()["connectors"] if c["template"] == "office")
+    assert c["usage"] == "mention"  # default: only when the user names it
+    info: dict = {}
+    tools = jobs.connector_tools(me["id"], lambda e: None, context="resume el informe del proyecto", info=info)
+    assert not any(n.startswith("mcp__office") for n in tools) and "Office (Word, Excel, PowerPoint)" in info["on_request"]
+    tools = jobs.connector_tools(me["id"], lambda e: None, context="pásalo a un Word", info={})
+    assert any(n.startswith("mcp__office") for n in tools)
+    # 'ask': always offered, but every use needs the user's OK
+    alice.patch(f"/api/connectors/{c['name']}", json={"usage": "ask"})
+    info = {}
+    tools = jobs.connector_tools(me["id"], lambda e: None, context="resume el informe", info=info)
+    assert any(n.startswith("mcp__office") for n in tools) and any(n.startswith("mcp__office") for n in info["ask"])
+    alice.patch(f"/api/connectors/{c['name']}", json={"usage": "auto"})
+    assert any(n.startswith("mcp__office") for n in jobs.connector_tools(me["id"], lambda e: None, context="hola", info={}))
+    assert db.one("SELECT usage FROM user_connectors WHERE name=? AND user_id=?", (c["name"], me["id"]))["usage"] == "auto"

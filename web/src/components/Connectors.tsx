@@ -27,12 +27,13 @@ type Connector = {
   command: string
   url: string
   enabled: boolean
+  usage?: string
   tools: string[]
   status: string
 }
 type Resp = { catalog: CatalogItem[]; connectors: Connector[]; local_allowed: boolean }
 
-const ICON: Record<string, string> = { chrome: '◉', browser: '◎', github: '⌥', word: 'W', office: 'O', microsoft: '⊞', burp: 'B', custom: '⚙' }
+const ICON: Record<string, string> = { chrome: '◉', browser: '◎', github: '⌥', word: 'W', office: 'O', microsoft: '⊞', burp: 'B', virustotal: 'Σ', custom: '⚙' }
 
 function Card({ item, onAdded }: { item: CatalogItem; onAdded: (msg: string) => void }) {
   const [open, setOpen] = useState(false)
@@ -61,7 +62,7 @@ function Card({ item, onAdded }: { item: CatalogItem; onAdded: (msg: string) => 
       <div className="mcp-card-top">
         <span className={`mcp-icon icon-${item.icon}`}>{ICON[item.icon] ?? '⚙'}</span>
         <div>
-          <b>{item.label}</b>
+          <b>{t(item.label)}</b>
           <div className="muted small">{item.kind === 'stdio' || item.kind === 'builtin' || item.local_only ? t('Local') : t('Remoto')}</div>
         </div>
       </div>
@@ -234,6 +235,7 @@ function YourChrome() {
           </li>
         </ol>
       )}
+      {st.connected && <BrowserUsage />}
       {st.connected && (
         <div className="small muted">
           {t('El agente ya puede usar tu Chrome. Para que vea una pestaña tuya, pulsa el icono de Nesicode en Chrome → «Compartir».')}{' '}
@@ -381,12 +383,18 @@ export default function ConnectorsSection() {
             <div key={c.name} className="prov">
               <div className="prov-main">
                 <div>
-                  <span className={`mcp-dot ${c.status}`} /> <b>{c.label}</b>{' '}
+                  <span className={`mcp-dot ${c.status}`} /> <b>{t(c.label)}</b>{' '}
                   <span className="muted small">· {t('{n} herramientas', { n: c.tools.length })}</span>
                 </div>
                 <div className="small muted clamp1">{c.kind === 'stdio' ? c.command : c.url}</div>
               </div>
               <div className="row">
+                <select className="usage-select small" value={c.usage ?? 'mention'} title={t('Cuándo puede usarlo el agente')}
+                  onChange={async (e) => { await api.patch(`/api/connectors/${c.name}`, { usage: e.target.value }); load() }}>
+                  <option value="mention">{t('Solo cuando lo pida')}</option>
+                  <option value="auto">{t('Cuando le sea útil')}</option>
+                  <option value="ask">{t('Preguntarme siempre')}</option>
+                </select>
                 <label className="check small">
                   <input
                     type="checkbox"
@@ -451,5 +459,25 @@ export default function ConnectorsSection() {
       </div>
       {custom && <CustomForm localAllowed={data.local_allowed} onAdded={done} onCancel={() => setCustom(false)} />}
     </div>
+  )
+}
+
+function BrowserUsage() {
+  useLang()
+  const [usage, setUsage] = useState<string | null>(null)
+  useEffect(() => { api.get<Record<string, any>>('/api/me/settings').then((p) => setUsage(p.browser_usage ?? 'mention')).catch(() => {}) }, [])
+  if (usage === null) return null
+  return (
+    <label className="inline small" style={{ margin: '6px 0' }}>
+      {t('Cuándo puede usarlo el agente')}
+      <select className="usage-select" value={usage} onChange={async (e) => {
+        setUsage(e.target.value)
+        await api.put('/api/me/settings', { browser_usage: e.target.value })
+      }}>
+        <option value="mention">{t('Solo cuando lo pida')}</option>
+        <option value="auto">{t('Cuando le sea útil')}</option>
+        <option value="ask">{t('Preguntarme siempre')}</option>
+      </select>
+    </label>
   )
 }

@@ -48,6 +48,14 @@ CATALOG: list[dict] = [
         "hint": "Built into Nesicode: paths are relative to the workspace. The file is shared with the user automatically.",
     },
     {
+        "id": "virustotal", "label": "VirusTotal", "icon": "virustotal",
+        "description": "Consulta en VirusTotal hashes de archivos, URLs, dominios e IPs (veredicto de más de 70 antivirus). Integrado: solo necesitas tu API key gratuita de virustotal.com. Subir un archivo o una URL siempre te pide permiso, porque se comparte con VirusTotal.",
+        "kind": "builtin", "requires": [],
+        "fields": [{"key": "api_key", "label": "API key de VirusTotal", "secret": True, "env": "VT_API_KEY",
+                    "help": "virustotal.com → tu perfil → API key (la gratuita permite 4 consultas por minuto)."}],
+        "hint": "Lookups are cheap and private; vt_scan_url / vt_scan_file share data with VirusTotal (the user approves).",
+    },
+    {
         "id": "burp", "label": "Burp Suite", "icon": "burp",
         "description": "Tu Burp Suite (Pro o Community): historial del proxy, Repeater, enviar peticiones, Collaborator (solo Pro), codificar/decodificar. Antes instala en Burp la extensión oficial «MCP Server» (BApp Store) y actívala en su pestaña MCP.",
         "kind": "http", "url": "http://{address}/mcp", "requires": [], "local_only": True,
@@ -82,6 +90,36 @@ CATALOG: list[dict] = [
         "kind": "http", "url": "https://www.microsoft.com/releasecommunications/mcp", "requires": [], "fields": [],
     },
 ]
+
+
+# Words that count as "the user asked for this connector" (besides its name and label).
+ALIASES = {
+    "chrome": ["chrome devtools", "devtools", "chrome aparte"],
+    "playwright": ["playwright"],
+    "github": ["github", "pull request", "issue"],
+    "office": ["office", "word", "excel", "powerpoint", "docx", "xlsx", "pptx", "hoja de calculo", "presentacion"],
+    "burp": ["burp"], "burp-rest": ["burp"], "burp-dast": ["burp", "dast"],
+    "ms-roadmap": ["roadmap", "microsoft 365", "azure update"],
+    "virustotal": ["virustotal", "virus total"],
+    "browser": ["chrome", "mi navegador", "my browser", "navegador del usuario", "pestana", "tab"],
+}
+
+
+def _fold(text: str) -> str:
+    import unicodedata
+
+    return "".join(c for c in unicodedata.normalize("NFD", text.lower()) if unicodedata.category(c) != "Mn")
+
+
+def mentioned(text: str, *, name: str = "", label: str = "", template: str = "") -> bool:
+    """Did the user name this connector? ('usa burp', 'en un Excel', 'con VirusTotal'…)"""
+    t = " " + re.sub(r"[^a-z0-9]+", " ", _fold(text)) + " "
+    words = list(ALIASES.get(template, [])) + [name, label.split("(")[0]]
+    for w in words:
+        w = re.sub(r"[^a-z0-9]+", " ", _fold(w)).strip()
+        if len(w) >= 3 and f" {w} " in t or (len(w) >= 3 and f" {w}s " in t):
+            return True
+    return False
 
 
 def catalog_entry(template_id: str) -> dict | None:
@@ -261,6 +299,10 @@ def builtin_module(which: str):
         from . import burp_rest
 
         return burp_rest
+    if which == "virustotal":
+        from . import virustotal
+
+        return virustotal
     raise RuntimeError(f"unknown built-in connector {which!r}")
 
 

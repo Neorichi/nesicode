@@ -2,6 +2,10 @@
 
 A coding agent that **improves its own harness** task by task, with a multi-user web interface and desktop apps.
 
+![Nesicode quick start: add a provider, pick models by role, chat, connectors and bots](docs/demo/nesicode-demo.gif)
+
+▶ [Watch the quick-start video (MP4, 78 s)](docs/demo/nesicode-demo.mp4) — add your API key, pick a model for each role, chat, connectors and bots.
+
 The model's weights never change: what gets optimized is the system around it (instructions, rules, memory,
 skills, sub-agents, scripts and hooks).
 
@@ -83,7 +87,11 @@ Downloads are on the [Releases](../../releases) page.
 - **Execution permissions**: auto, ask before commands, or ask before everything, with per-conversation approvals.
 - **Connectors (MCP)**: one-click gallery (Chrome DevTools, Playwright, GitHub, Microsoft 365 roadmap, Burp Suite)
   plus custom stdio/HTTP servers, and built-in connectors that need nothing installed:
-  **Office** (Word, Excel with formulas and charts, PowerPoint) and **Burp Suite REST API** for older versions.
+  **Office** (Word, Excel with formulas and charts, PowerPoint), **VirusTotal** (hashes, URLs, domains, IPs) and
+  **Burp Suite REST API** for older versions. Each connector has a usage mode: *only when I ask for it* (default:
+  "audit this site" won't fire Burp, "use Burp to audit this site" will), *whenever useful*, or *always ask me*.
+- **Bots**: tasks that run on their own — on a schedule, when a web page changes, from Telegram or by webhook —
+  each one a conversation you can also talk to. Create them from a plain-language description or from any chat.
 - **Your own Chrome**: a Chrome extension lets the agent use only the tabs in a "Nesicode" tab group.
 - **Telegram**: drive your conversations from a Telegram bot (attach/detach chats, approvals, files).
 - **Context management** for long tasks: large outputs saved to disk, old tool results masked, structured
@@ -134,13 +142,15 @@ src/nesicode/
   harness/      8-component tree, validation, base harness
   agent/        agent loop, tools, hooks, isolated workspace, context management
   harnessing/   Propose-Probe-Compose, selection, reflection
-  server/       FastAPI, SQLite, auth, job queue, SSE, vault, Telegram, connectors
+  server/       FastAPI, SQLite, auth, job queue, SSE, vault, Telegram, connectors, bots + scheduler
   office.py     built-in Office connector (Word, Excel, PowerPoint)
+  virustotal.py built-in VirusTotal connector (REST API v3)
   burp_rest.py  built-in Burp Suite REST API connector
   speech.py     speech to text for the microphone button
 web/            React + Vite (chat, harness editor, harnessing pipeline, lessons, integrations)
 extension/      Chrome extension ("Nesicode" tab group)
 packaging/      macOS (.app/.dmg) and Windows (installer) builds
+docs/demo/      quick-start video and the script that records it
 tests/          uv run pytest
 ```
 

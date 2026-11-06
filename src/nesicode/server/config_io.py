@@ -69,7 +69,7 @@ def build(db: DB, user_id: int, *, project_id: int | None, include_telegram: boo
     for c in db.all("SELECT * FROM user_connectors WHERE user_id=? ORDER BY id", (user_id,)):
         fields = loads(c["fields"], [])
         secrets_ = {f["key"]: v.get(user_id, f"connector:{c['name']}:{f['key']}") or "" for f in fields if f.get("secret")}
-        connectors.append({k: c[k] for k in ("name", "label", "template", "kind", "command", "url", "enabled")}
+        connectors.append({k: c[k] for k in ("name", "label", "template", "kind", "command", "url", "enabled", "usage")}
                           | {"args": loads(c["args"], []), "fields": fields, "secrets": secrets_})
     row = db.one("SELECT settings FROM users WHERE id=?", (user_id,))
     doc: dict = {"providers": providers, "connectors": connectors, "settings": loads(row["settings"], {}) if row else {}}
@@ -134,12 +134,13 @@ def apply(db: DB, user_id: int, doc: dict) -> dict:
             v.put(user_id, f"provider:{p['name']}", p["api_key"])
     for c in doc.get("connectors", []):
         db.execute(
-            "INSERT INTO user_connectors (user_id, name, label, template, kind, command, args, url, fields, enabled, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, name) DO UPDATE SET label=excluded.label, "
+            "INSERT INTO user_connectors (user_id, name, label, template, kind, command, args, url, fields, enabled, created_at, usage) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, name) DO UPDATE SET label=excluded.label, "
             "template=excluded.template, kind=excluded.kind, command=excluded.command, args=excluded.args, url=excluded.url, "
-            "fields=excluded.fields, enabled=excluded.enabled",
+            "fields=excluded.fields, enabled=excluded.enabled, usage=excluded.usage",
             (user_id, c["name"], c["label"], c.get("template", ""), c["kind"], c.get("command", ""),
-             json.dumps(c.get("args", [])), c.get("url", ""), json.dumps(c.get("fields", [])), int(c.get("enabled", 1)), now),
+             json.dumps(c.get("args", [])), c.get("url", ""), json.dumps(c.get("fields", [])), int(c.get("enabled", 1)), now,
+             c.get("usage") or "mention"),
         )
         for key, value in (c.get("secrets") or {}).items():
             if value:

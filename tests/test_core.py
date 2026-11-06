@@ -497,3 +497,58 @@ def test_same_tool_error_three_times_stops_the_loop(tmp_path):
     agent2 = Agent(model="mock/demo", harness=base_harness(), workspace=Workspace(tmp_path / "b"))
     outs = [agent2._call_tool(ToolCall(f"r{i}", "read_file", {"path": f"nope{i}-{'x' * i}.txt"}), Usage()) for i in range(4)]
     assert "disabled" not in outs[3].content
+
+
+def test_virustotal_builtin(tmp_path):
+    import httpx
+
+    from nesicode import virustotal as vt
+    from nesicode.connectors import ConnectorConfig
+
+    seen = []
+
+    def handler(req):
+        seen.append((req.method, req.url.path, req.headers.get("x-apikey")))
+        if req.headers.get("x-apikey") != "K":
+            return httpx.Response(401)
+        if req.url.path.endswith("/files/" + "a" * 64):
+            return httpx.Response(200, json={"data": {"attributes": {
+                "meaningful_name": "evil.exe", "type_description": "Win32 EXE", "size": 1234, "sha256": "a" * 64,
+                "last_analysis_stats": {"malicious": 40, "suspicious": 1, "undetected": 20},
+                "last_analysis_results": {"Kaspersky": {"category": "malicious", "result": "Trojan.Win32.X"}},
+                "popular_threat_classification": {"suggested_threat_label": "trojan.x"}}}})
+        if "/domains/" in req.url.path:
+            return httpx.Response(200, json={"data": {"attributes": {"last_analysis_stats": {"harmless": 70}, "registrar": "R",
+                                                                       "categories": {"a": "search engines"}}}})
+        return httpx.Response(404)
+
+    vt.transport = httpx.MockTransport(handler)
+    try:
+        cfg = ConnectorConfig(name="virustotal", kind="builtin", command="virustotal", env={"VT_API_KEY": "K"})
+        ws = Workspace(tmp_path / "ws")
+        text, _ = vt.vt_file_report({"hash": "A" * 64}, ws, cfg)
+        assert "MALICIOUS" in text and "Trojan.Win32.X" in text and "trojan.x" in text
+        text, _ = vt.vt_domain_report({"domain": "https://google.com/x"}, ws, cfg)
+        assert "clean" in text and seen[-1][1].endswith("/domains/google.com")
+        assert "never seen" in vt.vt_file_report({"hash": "b" * 64}, ws, cfg)[0]
+        with pytest.raises(ToolError):
+            vt.vt_file_report({"hash": "not-a-hash"}, ws, cfg)
+        with pytest.raises(ToolError, match="API key"):
+            vt.ping(ConnectorConfig(name="v", kind="builtin", env={"VT_API_KEY": "bad"}))
+    finally:
+        vt.transport = None
+    from nesicode.server.jobs import needs_approval
+    assert needs_approval("auto", "mcp__virustotal__vt_scan_file") and needs_approval("auto", "mcp__virustotal__vt_scan_url")
+    assert not needs_approval("auto", "mcp__virustotal__vt_file_report")
+
+
+def test_connector_only_when_asked():
+    from nesicode.connectors import mentioned
+
+    burp = dict(name="burp", label="Burp Suite", template="burp")
+    assert not mentioned("audita la web example.com y dime qué falla", **burp)
+    assert mentioned("usa Burp para auditar example.com", **burp)
+    assert mentioned("hazme un Excel con las ventas", name="office", label="Office (Word, Excel, PowerPoint)", template="office")
+    assert mentioned("mira este hash en virus total", name="virustotal", label="VirusTotal", template="virustotal")
+    assert not mentioned("busca información en la web", template="browser")
+    assert mentioned("ábrelo en mi navegador", template="browser")

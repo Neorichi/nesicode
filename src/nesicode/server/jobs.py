@@ -289,7 +289,7 @@ APPROVAL_TIMEOUT = 30 * 60
 WRITE_TOOLS = {"write_file", "edit_file", "generate_image"}
 
 
-ALWAYS_ASK = ("__burp_scan", "create_bot")  # active attacks against a target: the user approves each one, in every mode
+ALWAYS_ASK = ("__burp_scan", "create_bot", "__vt_scan_file", "__vt_scan_url")  # active attacks against a target: the user approves each one, in every mode
 
 
 def needs_approval(mode: str, tool: str) -> bool:
@@ -521,8 +521,16 @@ class Jobs:
                 task += "\n\n" + attachments_note(ws, attachments, vision, keys, emit)
             harness = current_harness(db, project)
             bot = db.one("SELECT * FROM bots WHERE id=?", (run["bot_id"],)) if run.get("bot_id") else None
-            tools = self.connector_tools(project["user_id"], emit)
+            info: dict = {}
+            recent = " ".join([run["task"]] + [h[0] for h in history[-3:]] + ([bot["instructions"]] if bot else []))
+            tools = self.connector_tools(project["user_id"], emit, context=recent, info=info)
             tools.update(self.chat_tools(project, emit))
+            note = ""
+            if info["on_request"]:
+                note = ("# Connectors available on request\nThe user has these connectors but wants them used ONLY when they "
+                        "explicitly ask for them by name: " + ", ".join(sorted(set(info["on_request"]))) + ". Do the task with "
+                        "your other tools. If one of them would clearly help, say so at the end and suggest the user ask for it "
+                        "(e.g. 'use Burp to …'); never pretend you used it.")
             model, steps, system_base = project["executor_model"], project["max_steps"], None
             if bot and self.bots:
                 tools.update(self.bots.agent_tools(bot, run_id))
@@ -537,7 +545,9 @@ class Jobs:
                 user_keys=keys,
                 max_steps=steps,
                 cancel=cancel,
-                approve=self._approver(run_id, thread, project, emit, cancel, bot, attended=run.get("trigger") == "chat"),
+                approve=self._approver(run_id, thread, project, emit, cancel, bot, attended=run.get("trigger") == "chat",
+                                       ask_tools=info["ask"]),
+                system_note=note,
                 vision_model=vision,
                 image_model=image,
                 system_base=system_base,
@@ -607,19 +617,43 @@ class Jobs:
         )
         return {"create_bot": (spec, create_bot)}
 
-    def connector_tools(self, user_id: int, emit) -> dict:
-        """Tools of the user's enabled MCP connectors, as agent tools named mcp__<connector>__<tool>."""
-        from ..connectors import catalog_entry, manager, tool_name
+    def connector_tools(self, user_id: int, emit, context: str | None = None, info: dict | None = None) -> dict:
+        """Tools of the user's enabled MCP connectors, as agent tools named mcp__<connector>__<tool>.
+
+        `context` (the user's recent words): connectors in 'mention' mode are only offered when named there;
+        the others are listed in info['on_request'] so the agent can suggest them. info['ask'] collects the
+        tool names that need the user's OK on every use. context=None → everything (connector tests, etc.)."""
+        from ..connectors import catalog_entry, manager, mentioned, tool_name
         from ..llm import ToolSpec
         from .connectors_store import connector_configs
 
-        out: dict = dict(browser_tools(user_id))
-        own_chrome = bool(out)
+        info = info if info is not None else {}
+        info.setdefault("on_request", [])
+        info.setdefault("ask", set())
+        out: dict = {}
+        browser = browser_tools(user_id)
+        usage = (loads((self.db.one("SELECT settings FROM users WHERE id=?", (user_id,)) or {}).get("settings"), {}) or {}).get("browser_usage", "mention")
+        if browser:
+            if context is None or usage != "mention" or mentioned(context, template="browser"):
+                out.update(browser)
+                if usage == "ask":
+                    info["ask"].update(browser)
+            else:
+                info["on_request"].append("the user's own Chrome (Nesicode extension)")
+        own_chrome = bool(browser)
         for row, cfg in connector_configs(self.db, user_id, enabled_only=True):
             if own_chrome and row["template"] == "chrome":
                 continue  # the user's own Chrome is connected: don't offer a second, separate Chrome
+            mode = row.get("usage") or "mention"
+            if context is not None and mode == "mention" and not mentioned(context, name=row["name"], label=row["label"],
+                                                                          template=row["template"]):
+                info["on_request"].append(row["label"])
+                continue
+            before = set(out)
             if cfg.kind == "builtin":
                 out.update(builtin_agent_tools(row["name"], row["label"], cfg.command, cfg))
+                if mode == "ask":
+                    info["ask"].update(set(out) - before)
                 continue
             try:
                 tools = manager().tools(user_id, cfg, timeout=90)
@@ -631,6 +665,8 @@ class Jobs:
                 name = tool_name(row["name"], tool.name)
                 desc = f"[{row['label']}] {tool.description}".strip()[:1600] + (f" ({hint})" if hint else "")
                 out[name] = (ToolSpec(name, desc, tool.schema), _mcp_caller(user_id, cfg, tool.name))
+            if mode == "ask":
+                info["ask"].update(set(out) - before)
         return out
 
     # ------------------------------------------------------------ approvals
@@ -641,7 +677,7 @@ class Jobs:
         return prefs.get("exec_mode") if prefs.get("exec_mode") in EXEC_MODES else "auto"
 
     def _approver(self, run_id: int, thread: dict, project: dict, emit, cancel: threading.Event, bot: dict | None = None,
-                  attended: bool = False):
+                  attended: bool = False, ask_tools: set | None = None):
         def approve(call) -> tuple[bool, str]:
             if bot:
                 from .bots import bot_denies
@@ -652,7 +688,7 @@ class Jobs:
             t = self.db.one("SELECT * FROM threads WHERE id=?", (thread["id"],)) or thread
             mode = self.exec_mode(t, project["user_id"])  # read live: the user may switch modes mid-run
             remembered = call.name in loads(t.get("allowed_tools"), []) and not call.name.endswith(ALWAYS_ASK)
-            if not needs_approval(mode, call.name) or remembered:
+            if (not needs_approval(mode, call.name) and call.name not in (ask_tools or ())) or remembered:
                 return True, ""
             pending = Approval(call.id)
             self.approvals[run_id] = pending

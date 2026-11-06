@@ -1111,7 +1111,7 @@ def _connector_view(user_id: int) -> list[dict]:
         out.append({
             "name": row["name"], "label": row["label"], "template": row["template"], "kind": row["kind"],
             "command": " ".join([row["command"], *loads(row["args"], [])]).strip(), "url": row["url"],
-            "enabled": bool(row["enabled"]), "tools": loads(row["tools"], []), "fields": fields,
+            "enabled": bool(row["enabled"]), "usage": row.get("usage") or "mention", "tools": loads(row["tools"], []), "fields": fields,
             "status": manager().status(user_id, cfg) if row["enabled"] else "off",
         })
     return out
@@ -1248,7 +1248,8 @@ def add_custom_connector(body: ConnectorCustom, user: dict = Depends(current_use
 
 
 class ConnectorPatch(BaseModel):
-    enabled: bool
+    enabled: bool | None = None
+    usage: str | None = Field(default=None, pattern="^(mention|auto|ask)$")
 
 
 @app.patch("/api/connectors/{name}")
@@ -1257,9 +1258,12 @@ def patch_connector(name: str, body: ConnectorPatch, user: dict = Depends(curren
 
     if not db.one("SELECT id FROM user_connectors WHERE user_id=? AND name=?", (user["id"], name)):
         raise HTTPException(404, "Conector no encontrado")
-    db.execute("UPDATE user_connectors SET enabled=? WHERE user_id=? AND name=?", (int(body.enabled), user["id"], name))
-    if not body.enabled:
-        manager().stop(user["id"], name)
+    if body.usage is not None:
+        db.execute("UPDATE user_connectors SET usage=? WHERE user_id=? AND name=?", (body.usage, user["id"], name))
+    if body.enabled is not None:
+        db.execute("UPDATE user_connectors SET enabled=? WHERE user_id=? AND name=?", (int(body.enabled), user["id"], name))
+        if not body.enabled:
+            manager().stop(user["id"], name)
     return {"ok": True}
 
 
@@ -1601,6 +1605,7 @@ class UserSettings(BaseModel):
     auto_harness_daily: int | None = Field(default=None, ge=1, le=50)
     auto_harness_min_steps: int | None = Field(default=None, ge=3, le=300)
     auto_harness_min_errors: int | None = Field(default=None, ge=1, le=50)
+    browser_usage: str | None = Field(default=None, pattern="^(mention|auto|ask)$")
 
 
 SETTINGS_DEFAULTS = {
@@ -1612,6 +1617,7 @@ SETTINGS_DEFAULTS = {
     "auto_harness_min_steps": 20,
     "auto_harness_min_errors": 3,
     "hidden_providers": ["mock"],
+    "browser_usage": "mention",
 }
 
 

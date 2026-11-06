@@ -478,6 +478,7 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 .mcp-icon.icon-word { background: #dde7f8; color: #2b579a; font-family: Georgia, serif; }
 .mcp-icon.icon-office { background: #fbe3dc; color: #d83b01; font-weight: 700; }
 .mcp-icon.icon-burp { background: #ffe4d6; color: #ff6633; font-weight: 700; }
+.mcp-icon.icon-virustotal { background: #e3e8ff; color: #394eff; font-weight: 700; }
 .mcp-icon.icon-microsoft { background: #e1effa; color: #0078d4; }
 .mcp-form { width: 100%; display: flex; flex-direction: column; gap: 8px; }
 .mcp-form label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
@@ -599,3 +600,4 @@ label.inline { display: flex; align-items: center; gap: 8px; flex-direction: row
 .bot-trigger-chip { font-size: 12.5px; padding: 3px 10px; border-radius: 99px; background: var(--accent-soft); color: var(--ink); }
 .bot-trigger-prompt summary { cursor: pointer; }
 .bot-trigger-prompt div { margin-top: 4px; white-space: pre-wrap; color: var(--ink-2); max-width: 600px; }
+.usage-select { font-size: 12.5px; padding: 3px 6px; border-radius: 7px; max-width: 190px; }
