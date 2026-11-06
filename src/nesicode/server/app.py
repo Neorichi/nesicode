@@ -614,11 +614,35 @@ async def config_import(request: Request, file: UploadFile = File(...), user: di
     except ConfigError as exc:
         raise HTTPException(422, str(exc)) from exc
     result = apply(db, user["id"], doc)
+    result["projects_updated"] = _apply_role_models(user, doc.get("role_models") or {})
     if doc.get("telegram"):
         telegram.restart(user["id"])
     for p in doc.get("providers", []):
         _refresh_limits_bg(user["id"], p["name"], p.get("models", []))
     return {"imported": result}
+
+
+def _model_works(spec: str, user: dict) -> bool:
+    ctx = auth.user_keys(db, user["id"])
+    try:
+        name, _ = split_any(spec, ctx)
+        return provider_available(name, ctx)
+    except LLMError:
+        return False
+
+
+def _apply_role_models(user: dict, roles: dict) -> list[str]:
+    """Imported models by role replace the ones in this user's projects (when the model is usable here)."""
+    from .config_io import ROLE_KEYS
+
+    usable = {k: v for k, v in roles.items() if k in ROLE_KEYS and v and _model_works(v, user)}
+    changed = []
+    for p in db.all("SELECT * FROM projects WHERE user_id=?", (user["id"],)):
+        upd = {k: v for k, v in usable.items() if p.get(k) != v}
+        if upd:
+            db.execute(f"UPDATE projects SET {', '.join(f'{k}=?' for k in upd)} WHERE id=?", (*upd.values(), p["id"]))
+            changed.append(p["name"])
+    return changed
 
 
 @app.get("/api/config/template")
@@ -1086,6 +1110,9 @@ def create_project(body: ProjectCreate, user: dict = Depends(current_user)):
                 setattr(body, k, tpl[k])
         if tpl.get("max_steps"):
             body.max_steps = int(tpl["max_steps"])
+    for k, v in (user_settings(user["id"]).get("role_models") or {}).items():
+        if hasattr(body, k) and not getattr(body, k) and v and _model_works(v, user):
+            setattr(body, k, v)
     ex = check_model(body.executor_model or default_model(user, settings.default_executor_model), user)
     im = check_model(body.improver_model or default_model(user, settings.default_improver_model), user)
     domain = re.sub(r"[^a-z0-9_-]+", "-", (body.domain or "general").strip().lower()).strip("-") or "general"

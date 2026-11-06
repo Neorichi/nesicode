@@ -689,4 +689,8 @@ const EN: Record<string, string> = {
   'Parar lo que está haciendo y enviar este mensaje ya': 'Stop what it is doing and send this message now',
   'Poner en cola (Enter) · ⌘/Ctrl+Enter: parar y enviar ya': 'Queue (Enter) · ⌘/Ctrl+Enter: stop and send now',
   'Ese mensaje ya no está en la cola': 'That message is no longer queued',
+  'modelos por función': 'models by role',
+  'aplicados a': 'applied to',
+  'Los modelos por función (Chat, Mejora, Visión, Crear imágenes, Transcripción) se copian siempre: del proyecto que elijas abajo o, si no eliges, del último que usaste.': 'Models by role (Chat, Improvement, Vision, Image generation, Transcription) are always included: from the project you choose below or, if none, the one you used last.',
+  'Los proveedores y conectores con el mismo nombre se sobrescriben; el resto se conserva. Las keys se vuelven a guardar en la bóveda cifrada de este equipo. Los modelos por función se aplican a tus proyectos y a los nuevos.': "Providers and connectors with the same name are overwritten; everything else is kept. Keys are re-saved in this computer's encrypted vault. Models by role are applied to your projects and to new ones.",
 }

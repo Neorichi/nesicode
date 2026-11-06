@@ -766,3 +766,21 @@ def test_send_now_jumps_the_queue(alice, project):
     order = [r["task"] for r in alice.get(f"/api/threads/{t['id']}").json()["runs"]]
     assert order.index("urgente") < order.index("primero")
     assert alice.post(f"/api/runs/{a['id']}/send-now").status_code == 409  # no longer queued
+
+
+def test_import_copies_models_by_role(alice, project):
+    alice.patch(f"/api/projects/{project['id']}", json={"vision_model": "mock/vision", "transcribe_model": "mock/whisper"})
+    r = alice.post("/api/config/export", json={"password": "frase-larga-1"}).json()  # no template chosen
+    assert r["summary"]["role_models"]["executor_model"] == "mock/demo"
+    assert r["summary"]["role_models"]["transcribe_model"] == "mock/whisper"
+    blob = alice.get(r["url"]).content
+
+    bob = TestClient(app)
+    assert bob.post("/api/auth/register", json={"email": f"bob{time.time_ns()}@x.com", "password": "secret123"}).status_code == 200
+    old = bob.post("/api/projects", json={"name": "ya existía", "executor_model": "mock/otro", "improver_model": "mock/otro"}).json()
+    ok = bob.post("/api/config/import", files={"file": ("c.nesicode", blob)}, data={"password": "frase-larga-1"}).json()
+    assert ok["imported"]["projects_updated"] == ["ya existía"]
+    p = bob.get(f"/api/projects/{old['id']}").json()
+    assert (p["executor_model"], p["vision_model"], p["transcribe_model"]) == ("mock/demo", "mock/vision", "mock/whisper")
+    new = bob.post("/api/projects", json={"name": "nuevo"}).json()  # no template: the imported roles are the defaults
+    assert (new["executor_model"], new["vision_model"], new["transcribe_model"]) == ("mock/demo", "mock/vision", "mock/whisper")

@@ -3,10 +3,20 @@ import { api, type Project } from '../api'
 import { t, useLang } from '../i18n'
 import { downloadFile } from './ImageViewer'
 
-type Summary = { providers: string[]; connectors: string[]; settings: string[]; project_template: string | null; telegram: boolean }
+type Summary = {
+  providers: string[]; connectors: string[]; settings: string[]; project_template: string | null; telegram: boolean
+  role_models?: Record<string, string>; projects_updated?: string[]
+}
+
+const ROLE_LABEL: Record<string, string> = {
+  executor_model: 'Chat', improver_model: 'Mejora', vision_model: 'Visión', image_model: 'Crear imágenes', transcribe_model: 'Transcripción',
+}
 
 function describe(s: Summary): string {
   const parts = [`${s.providers.length} ${t('proveedores')}`, `${s.connectors.length} ${t('conectores')}`, t('preferencias')]
+  const roles = Object.entries(s.role_models ?? {})
+  if (roles.length) parts.push(`${t('modelos por función')} (${roles.map(([k, v]) => `${t(ROLE_LABEL[k] ?? k)}: ${v}`).join(', ')})`)
+  if (s.projects_updated?.length) parts.push(`${t('aplicados a')} ${s.projects_updated.join(', ')}`)
   if (s.project_template) parts.push(`${t('plantilla de proyecto')} «${s.project_template}»`)
   if (s.telegram) parts.push(t('bot de Telegram'))
   return parts.join(' · ')
@@ -48,6 +58,7 @@ export function ConfigExport({ projects }: { projects: Project[] }) {
         <input type="password" placeholder={t('Contraseña (mín. 8)')} value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" />
         <input type="password" placeholder={t('Repite la contraseña')} value={repeat} onChange={(e) => setRepeat(e.target.value)} autoComplete="new-password" />
       </div>
+      <p className="muted small">{t('Los modelos por función (Chat, Mejora, Visión, Crear imágenes, Transcripción) se copian siempre: del proyecto que elijas abajo o, si no eliges, del último que usaste.')}</p>
       <label>
         {t('Incluir plantilla de proyecto (modelos por rol, comando de verificación y harness)')}
         <select value={projectId} onChange={(e) => setProjectId(e.target.value)}>
@@ -105,7 +116,7 @@ export function ConfigImport({ onDone, compact }: { onDone?: (s: Summary) => voi
           onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); run() } }} />
         <button type="button" className="btn primary" disabled={busy || !file || !password} onClick={run}>{busy ? t('Importando…') : t('Importar')}</button>
       </div>
-      {!compact && <p className="muted small">{t('Los proveedores y conectores con el mismo nombre se sobrescriben; el resto se conserva. Las keys se vuelven a guardar en la bóveda cifrada de este equipo.')}</p>}
+      {!compact && <p className="muted small">{t('Los proveedores y conectores con el mismo nombre se sobrescriben; el resto se conserva. Las keys se vuelven a guardar en la bóveda cifrada de este equipo. Los modelos por función se aplican a tus proyectos y a los nuevos.')}</p>}
       {msg && <div className={msg.ok ? 'ok-box' : 'error-box'}>{msg.text}</div>}
     </div>
   )

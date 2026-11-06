@@ -23,6 +23,7 @@ from .vault import Vault
 FORMAT = "nesicode-config"
 VERSION = 1
 N, R, P = 2**15, 8, 1
+ROLE_KEYS = ("executor_model", "improver_model", "vision_model", "image_model", "transcribe_model")
 
 
 class ConfigError(ValueError):
@@ -72,6 +73,13 @@ def build(db: DB, user_id: int, *, project_id: int | None, include_telegram: boo
                           | {"args": loads(c["args"], []), "fields": fields, "secrets": secrets_})
     row = db.one("SELECT settings FROM users WHERE id=?", (user_id,))
     doc: dict = {"providers": providers, "connectors": connectors, "settings": loads(row["settings"], {}) if row else {}}
+    # Models by role always travel: from the chosen project, else the one used most recently.
+    src = db.one("SELECT * FROM projects WHERE id=? AND user_id=?", (project_id, user_id)) if project_id else None
+    src = src or db.one(
+        "SELECT p.* FROM projects p LEFT JOIN threads t ON t.project_id=p.id WHERE p.user_id=? "
+        "GROUP BY p.id ORDER BY MAX(COALESCE(t.updated_at, p.created_at)) DESC LIMIT 1", (user_id,))
+    if src:
+        doc["role_models"] = {k: src.get(k) or "" for k in ROLE_KEYS} | {"from": src["name"]}
     if project_id:
         p = db.one("SELECT * FROM projects WHERE id=? AND user_id=?", (project_id, user_id))
         if p:
@@ -97,6 +105,7 @@ def summary(doc: dict) -> dict:
         "settings": sorted(doc.get("settings", {}).keys()),
         "project_template": (t or {}).get("from"),
         "telegram": bool(doc.get("telegram")),
+        "role_models": {k: v for k, v in (doc.get("role_models") or {}).items() if v and k in ROLE_KEYS},
     }
 
 
@@ -129,6 +138,8 @@ def apply(db: DB, user_id: int, doc: dict) -> dict:
     settings = {**(loads(row["settings"], {}) if row else {}), **(doc.get("settings") or {})}
     if doc.get("project_template"):
         settings["project_template"] = doc["project_template"]
+    if doc.get("role_models"):
+        settings["role_models"] = {k: v for k, v in doc["role_models"].items() if k in ROLE_KEYS and v}
     db.execute("UPDATE users SET settings=? WHERE id=?", (json.dumps(settings), user_id))
     if doc.get("telegram", {}).get("token"):
         v.put(user_id, "telegram:bot", doc["telegram"]["token"])
