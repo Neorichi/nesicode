@@ -6,6 +6,7 @@ import { useApp } from '../App'
 
 const I = {
   plug: <path d="M7 3v4M13 3v4M5 7h10v3a5 5 0 0 1-10 0zM10 15v3" />,
+  bot: <path d="M4 8h12v8H4zM10 8V4.5M8 3.5h4M7.5 12h.01M12.5 12h.01M2 11v2.5M18 11v2.5" />,
   key: <path d="M12.5 3.5a4 4 0 1 1-3.2 6.4L4 15.2V17h2v-1.5h1.5V14H9l1.3-1.3a4 4 0 0 1 2.2-9.2zM14 6.5h.01" />,
   plus: <path d="M10 4v12M4 10h12" />,
   chat: <path d="M4 5h12v8H8l-4 3z" />,
@@ -101,6 +102,7 @@ export default function Sidebar({ onNavigate }: { onNavigate: () => void }) {
       )}
 
       <nav className="nav nav-global">
+        <NavLink to="/bots"><Icon name="bot" /> {t('Bots')}</NavLink>
         <NavLink to="/connectors"><Icon name="plug" /> {t('Conectores (MCP)')}</NavLink>
         <NavLink to="/providers"><Icon name="key" /> {t('Proveedores')}</NavLink>
       </nav>

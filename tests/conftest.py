@@ -17,3 +17,4 @@ import base64 as _b64
 os.environ["NESICODE_VAULT_KEY"] = _b64.b64encode(b"t" * 32).decode()
 
 os.environ["NESICODE_NO_TELEGRAM"] = "1"  # tests drive the bot with a fake Telegram
+os.environ["NESICODE_NO_SCHEDULER"] = "1"  # tests call bots.tick() themselves

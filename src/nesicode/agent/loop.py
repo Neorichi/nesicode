@@ -117,6 +117,7 @@ class Agent:
         self.role = role
         self.cancel = cancel or threading.Event()
         self.ws.cancel = self.cancel  # running commands are killed as soon as the user presses Stop
+        self._fail_streak: dict[str, tuple[int, str]] = {}
         # Called before a tool runs; returns (allowed, reason). None = everything is allowed (auto mode).
         self.approve = approve
         self.depth = depth
@@ -248,6 +249,22 @@ class Agent:
         self.emit({"type": f"{kind}_delta", "text": delta}, persist=False)
 
     def _call_tool(self, call: ToolCall, usage: Usage) -> ToolResult:
+        """Run a tool; after 3 failures in a row of the same tool, stop offering it for this run (no retry loops)."""
+        streak, last = self._fail_streak.get(call.name, (0, ""))
+        if streak >= 3:
+            return ToolResult(call.id, f"Error: `{call.name}` failed {streak} times in a row with the same error and is now "
+                                       "disabled for this run. Stop retrying it: explain the error to the user and how to fix it.\n"
+                                       f"Last error: {last[:500]}", True)
+        res = self._call_tool_inner(call, usage)
+        if not res.is_error:
+            self._fail_streak.pop(call.name, None)
+        else:
+            sig = re.sub(r"\d+", "#", res.content[:160])  # same failure, whatever the arguments
+            n = streak + 1 if sig == re.sub(r"\d+", "#", last[:160]) else 1
+            self._fail_streak[call.name] = (3 if "NOT RETRYABLE" in res.content else n, res.content)
+        return res
+
+    def _call_tool_inner(self, call: ToolCall, usage: Usage) -> ToolResult:
         if call.parse_error:
             return ToolResult(call.id, f"Tool call rejected: {call.parse_error}", True)
         block, warnings = self.hooks.before(call.name, call.arguments)

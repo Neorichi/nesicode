@@ -16,6 +16,7 @@ dependencies = [
     "python-multipart>=0.0.33",
     "python-pptx>=1.0.2",
     "uvicorn[standard]>=0.54.0",
+    "tzdata>=2025.2; sys_platform == 'win32'",
 ]
 
 [project.scripts]

@@ -38,6 +38,8 @@ HELP = (
     "/new [texto] – empezar una conversación nueva\n"
     "/current – dónde estoy\n"
     "/stop – detener la respuesta en curso\n"
+    "/bots – tus bots (pulsa uno para lanzarlo)\n"
+    "/bot <nombre> [texto] – lanzar un bot ahora, con una instrucción opcional\n"
     "/help – esta ayuda\n\n"
     "También puedes enviarme fotos y archivos: los adjunto a la conversación."
 )
@@ -48,6 +50,7 @@ COMMANDS = [
     {"command": "attach", "description": "Attach to a chat by id"},
     {"command": "detach", "description": "Detach from the current chat"},
     {"command": "current", "description": "Current project and chat"},
+    {"command": "bots", "description": "Your bots: run one now"},
     {"command": "stop", "description": "Stop the running answer"},
     {"command": "help", "description": "Help"},
 ]
@@ -212,6 +215,13 @@ class TelegramBridge:
             return self._current(chat_id)
         if cmd == "/stop":
             return self._stop(chat_id)
+        if cmd == "/bots":
+            return self._bots(chat_id)
+        if cmd == "/bot":
+            if not rest:
+                return self._bots(chat_id)
+            name, _, text = rest.partition(" ")
+            return self._run_bot(chat_id, name, text)
         if cmd:
             return self.send(chat_id, "No conozco ese comando. /help")
         return self._message(chat_id, text, msg)
@@ -319,6 +329,9 @@ class TelegramBridge:
         elif data.startswith("t:"):
             self._attach(chat_id, int(data[2:]))
             answer = "Anclado"
+        elif data.startswith("b:"):
+            self._run_bot(chat_id, data[2:], "")
+            answer = "Lanzado"
         elif data.startswith("ap:"):
             _, run_id, decision, call_id = data.split(":", 3)
             ok = self.jobs.decide(int(run_id), call_id, decision)
@@ -373,7 +386,7 @@ class TelegramBridge:
         threading.Thread(target=self._follow, args=(chat_id, run["id"], project, thread, status.get("message_id")),
                          daemon=True).start()
 
-    def _follow(self, chat_id: int, run_id: int, project: dict, thread: dict, status_id: int | None) -> None:
+    def _follow(self, chat_id: int, run_id: int, project: dict, thread: dict, status_id: int | None, bot_name: str = "") -> None:
         """Mirror a run to Telegram: progress, approvals, images, files and the final answer."""
         from ..agent.workspace import Workspace
 
@@ -409,7 +422,48 @@ class TelegramBridge:
         if status_id:
             self.edit(chat_id, status_id, f"✓ Hecho en {steps} pasos" if run["status"] in ("done", "max_steps")
                       else f"Estado: {run['status']}")
-        self.send(chat_id, run["final_text"] or run["error"] or f"(terminado: {run['status']})")
+        final = run["final_text"] or run["error"] or f"(terminado: {run['status']})"
+        if bot_name:
+            if run["status"] == "done" and final.strip().upper().startswith("NOTHING_NEW"):
+                return  # the bot had nothing to report: stay silent
+            if run["status"] == "cancelled":
+                return
+            final = f"🤖 {bot_name}" + ("" if run["status"] in ("done", "max_steps") else f" · {run['status']}") + f"\n\n{final}"
+        self.send(chat_id, final)
+
+    def follow_bot(self, bot: dict, run_id: int, project: dict, thread: dict) -> None:
+        chat_id = self.link().get("chat_id")
+        if not chat_id or run_id in self.followed:
+            return
+        self.followed.add(run_id)
+        threading.Thread(target=self._follow, args=(chat_id, run_id, project, thread, None, bot["name"]),
+                         daemon=True, name="nesi-tg-bot").start()
+
+    def _bots(self, chat_id: int) -> None:
+        rows = self.db.all("SELECT id, name, enabled FROM bots WHERE user_id=? ORDER BY name", (self.user_id,))
+        if not rows:
+            return self.send(chat_id, "No tienes bots. Créalos en la app (Bots) o pídeselo al agente: «hazme un bot que…».")
+        buttons = [[{"text": ("▶ " if r["enabled"] else "⏸ ") + r["name"][:50], "callback_data": f"b:{r['id']}"}] for r in rows]
+        self.send(chat_id, "🤖 Tus bots — pulsa uno para lanzarlo ahora, o escribe /bot <nombre> <instrucción>:", buttons)
+
+    def _run_bot(self, chat_id: int, name_or_id: str, text: str) -> None:
+        bots = getattr(self.jobs, "bots", None)
+        if not bots:
+            return self.send(chat_id, "Los bots no están disponibles.")
+        q = name_or_id.strip().lower()
+        rows = self.db.all("SELECT * FROM bots WHERE user_id=?", (self.user_id,))
+        bot = next((b for b in rows if str(b["id"]) == q or b["name"].lower() == q), None) or \
+            next((b for b in rows if b["name"].lower().startswith(q)), None)
+        if not bot:
+            return self.send(chat_id, "No encuentro ese bot. /bots")
+        run = bots.fire(bot["id"], "telegram", text or "Haz tu tarea ahora.", force=True)
+        if not run:
+            return self.send(chat_id, f"No he podido lanzar «{bot['name']}».")
+        self.send(chat_id, f"▶ Lanzado «{bot['name']}»" + (" (en cola)" if run["status"] == "waiting" else "") + "…")
+        if bot["notify"] != "telegram":  # still show the answer here: the user asked from Telegram
+            project = self.db.one("SELECT * FROM projects WHERE id=?", (bot["project_id"],))
+            thread = self.db.one("SELECT * FROM threads WHERE id=?", (run["thread_id"],))
+            self.follow_bot(bot, run["id"], project, thread)
 
     def _send_file(self, chat_id: int, ws, rel: str, caption: str, photo: bool) -> None:
         try:
@@ -458,3 +512,17 @@ class TelegramManager:
         b = self.bridges.pop(user_id, None)
         if b:
             b.close()
+
+    # ------------------------------------------------------------ for bots
+    def notify(self, user_id: int, text: str) -> bool:
+        b = self.bridges.get(user_id)
+        chat_id = b.link().get("chat_id") if b else None
+        if not chat_id:
+            return False
+        b.send(chat_id, text[:4000])
+        return True
+
+    def follow_bot_run(self, bot: dict, run_id: int, project: dict, thread: dict) -> None:
+        b = self.bridges.get(bot["user_id"])
+        if b:
+            b.follow_bot(bot, run_id, project, thread)

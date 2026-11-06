@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
 import { t, useLang } from '../i18n'
 import { downloadFile } from './ImageViewer'
+import { fileManager } from '../api'
 
 type Field = { key: string; label: string; secret?: boolean; help?: string; default?: string }
 type CatalogItem = {
@@ -209,7 +210,7 @@ function YourChrome() {
                 ⬇ {t('Descargar la extensión (.zip)')}
               </button>
               {st.local_mode && (
-                <button className="btn small" onClick={install}>{t('Instalar en Documentos y mostrar en Finder')}</button>
+                <button className="btn small" onClick={install}>{t('Instalar en Documentos y mostrar en {fm}', { fm: fileManager() })}</button>
               )}
             </div>
             {path ? (

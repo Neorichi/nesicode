@@ -289,11 +289,11 @@ APPROVAL_TIMEOUT = 30 * 60
 WRITE_TOOLS = {"write_file", "edit_file", "generate_image"}
 
 
-ALWAYS_ASK = ("__burp_scan",)  # active attacks against a target: the user approves each one, in every mode
+ALWAYS_ASK = ("__burp_scan", "create_bot")  # active attacks against a target: the user approves each one, in every mode
 
 
 def needs_approval(mode: str, tool: str) -> bool:
-    if tool.endswith(ALWAYS_ASK):
+    if tool.endswith(ALWAYS_ASK) or tool == "create_bot":
         return True
     if tool.startswith(("mcp__", "chrome_")):  # act outside the cage (the user's real browser, accounts…)
         return mode in ("ask_bash", "ask_all")
@@ -327,6 +327,8 @@ class Jobs:
         self.live: dict[int, Live] = {}
         self.approvals: dict[int, Approval] = {}  # run_id -> the tool call waiting for the user
         self.project_locks: dict[int, threading.Lock] = {}
+        self.on_finish: list = [self._auto_title]  # callbacks(run_id) after any run ends (bots use it too)
+        self.bots = None  # BotManager, set by the app
         self._lock = threading.Lock()
         db.execute(
             "UPDATE runs SET status='interrupted', finished_at=? WHERE status IN ('queued', 'running')",
@@ -369,9 +371,56 @@ class Jobs:
         )
         self.cancels.pop(run_id, None)
         self.live.pop(run_id, None)
+        for cb in list(self.on_finish):
+            try:
+                cb(run_id)
+            except Exception as exc:
+                print("nesicode: on_finish hook failed:", exc)
         row = self.db.one("SELECT thread_id, kind FROM runs WHERE id=?", (run_id,))
         if row and row["kind"] == "chat" and row["thread_id"]:
             self.advance(row["thread_id"])
+
+    # ------------------------------------------------------------ titles
+    TITLE_AT = (1, 3)  # retitle after the 1st and 3rd answered turn (more context by then)
+
+    def _auto_title(self, run_id: int) -> None:
+        run = self.db.one("SELECT id, thread_id, kind, status, bot_id, project_id FROM runs WHERE id=?", (run_id,))
+        if not run or run["kind"] != "chat" or run["status"] not in ("done", "max_steps") or run["bot_id"] or not run["thread_id"]:
+            return
+        thread = self.db.one("SELECT * FROM threads WHERE id=?", (run["thread_id"],))
+        if not thread or thread.get("title_locked") or thread["title"].startswith("🤖"):
+            return
+        n = self.db.one("SELECT COUNT(*) AS n FROM runs WHERE thread_id=? AND kind='chat' AND status IN ('done', 'max_steps')",
+                        (thread["id"],))["n"]
+        if n not in self.TITLE_AT:
+            return
+        threading.Thread(target=self._make_title, args=(thread["id"], run["project_id"]), daemon=True, name="nesi-title").start()
+
+    def _make_title(self, thread_id: int, project_id: int) -> None:
+        from ..llm import ModelOptions, get_provider
+
+        try:
+            project = self.db.one("SELECT * FROM projects WHERE id=?", (project_id,))
+            spec = project["executor_model"]
+            if spec.startswith("mock/"):
+                return
+            turns = self.db.all("SELECT task, final_text FROM runs WHERE thread_id=? AND kind='chat' AND status IN ('done', 'max_steps') "
+                                "ORDER BY created_at, id LIMIT 4", (thread_id,))
+            convo = "\n\n".join(f"User: {t['task'][:1500]}\nAssistant: {(t['final_text'] or '')[:1500]}" for t in turns)
+            provider, model = get_provider(spec, user_keys(self.db, project["user_id"]))
+            text, _ = provider.complete(
+                model, "You name conversations.",
+                "Write a short title (3 to 7 words) for this conversation, in the same language the user writes in. "
+                "It must say what the conversation is about (the topic or goal), not quote the first message. "
+                "Reply with the title only: no quotes, no trailing period, no emoji.\n\n" + convo,
+                ModelOptions(effort="low", role="titler", max_tokens=60),
+            )
+            title = re.sub(r"\s+", " ", text.strip().splitlines()[0] if text.strip() else "").strip(" \"'«»*#.")[:80]
+            if len(title) >= 3:
+                # the user may have renamed it meanwhile: only replace an unlocked title
+                self.db.execute("UPDATE threads SET title=? WHERE id=? AND title_locked=0", (title, thread_id))
+        except Exception as exc:  # a title is never worth an error
+            print("nesicode: auto-title failed:", exc)
 
     # ------------------------------------------------------------ per-conversation queue
     def enqueue_chat(self, run_id: int, thread_id: int) -> str:
@@ -470,18 +519,29 @@ class Jobs:
             attachments = loads(run["attachments"], [])
             if attachments:
                 task += "\n\n" + attachments_note(ws, attachments, vision, keys, emit)
+            harness = current_harness(db, project)
+            bot = db.one("SELECT * FROM bots WHERE id=?", (run["bot_id"],)) if run.get("bot_id") else None
+            tools = self.connector_tools(project["user_id"], emit)
+            tools.update(self.chat_tools(project, emit))
+            model, steps, system_base = project["executor_model"], project["max_steps"], None
+            if bot and self.bots:
+                tools.update(self.bots.agent_tools(bot, run_id))
+                model = bot["model"] or model
+                steps = min(steps, bot["max_steps"])
+                system_base = harness.get("system_prompt.md", "").strip() + "\n\n" + self.bots.system_section(bot, run.get("trigger") or "")
             agent = Agent(
-                model=project["executor_model"],
-                harness=current_harness(db, project),
+                model=model,
+                harness=harness,
                 workspace=ws,
                 emit=emit,
                 user_keys=keys,
-                max_steps=project["max_steps"],
+                max_steps=steps,
                 cancel=cancel,
-                approve=self._approver(run_id, thread, project, emit, cancel),
+                approve=self._approver(run_id, thread, project, emit, cancel, bot, attended=run.get("trigger") == "chat"),
                 vision_model=vision,
                 image_model=image,
-                extra_tools=self.connector_tools(project["user_id"], emit),
+                system_base=system_base,
+                extra_tools=tools,
                 context_limit=lim["context"],
                 output_limit=lim["output"],
                 on_limit=lambda n: learn_limit(db, project["user_id"], project["executor_model"], n),
@@ -489,7 +549,8 @@ class Jobs:
             )
             res = agent.run(task, history)
         try:
-            self._auto_improve(run, project, thread, res, emit)
+            if not bot:  # unattended bot runs never trigger the auto-improver
+                self._auto_improve(run, project, thread, res, emit)
         except Exception as exc:  # never break the chat because of the auto-improver
             emit({"type": "auto_harness_error", "text": f"{type(exc).__name__}: {exc}"})
         self._finish(
@@ -499,6 +560,53 @@ class Jobs:
         db.execute("UPDATE threads SET updated_at=? WHERE id=?", (time.time(), run["thread_id"]))
 
     # ----------------------------------------------------------- connectors
+    def chat_tools(self, project: dict, emit) -> dict:
+        """Tools every conversation gets from the app itself (not from connectors)."""
+        if not self.bots:
+            return {}
+        from ..llm import ToolSpec
+
+        bots = self.bots
+
+        def create_bot(args: dict, agent) -> str:
+            from ..agent.workspace import ToolError
+
+            data = {k: args.get(k) for k in ("name", "description", "instructions", "policy", "notify", "max_steps", "daily_cap")}
+            data["project_id"] = project["id"]
+            data["triggers"] = args.get("triggers") or []
+            try:
+                bot = bots.save(project["user_id"], data)
+            except (ValueError, ToolError) as exc:
+                raise ToolError(f"no se pudo crear el bot: {exc}") from exc
+            agent.emit({"type": "bot_created", "bot_id": bot["id"], "name": bot["name"]})
+            nxt = self.db.one("SELECT MIN(next_at) AS t FROM bot_triggers WHERE bot_id=? AND next_at IS NOT NULL", (bot["id"],))["t"]
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(nxt)) if nxt else "solo a mano / Telegram / webhook"
+            return f"Bot «{bot['name']}» creado (id {bot['id']}). Próxima ejecución: {when}. Se gestiona en la página Bots."
+
+        trig = {"type": "object", "properties": {
+            "kind": {"type": "string", "enum": ["cron", "interval", "url"]},
+            "spec": {"type": "string", "description": "cron: 5 fields 'min hour dom mon dow' (e.g. '0 8 * * 1-5'); "
+                                                       "interval: minutes or 2h/1d (min 5 min); url: the page to watch"},
+            "tz": {"type": "string", "description": "IANA time zone for cron, e.g. Europe/Madrid (default: this computer's)"},
+            "prompt": {"type": "string", "description": "what to do on each firing (optional)"},
+            "config": {"type": "object", "description": "url: {every: minutes between checks}"}}, "required": ["kind", "spec"]}
+        spec = ToolSpec(
+            "create_bot",
+            "Create a Nesicode bot: a standing instruction the agent runs on its own on a schedule (cron/interval), when "
+            "a web page changes (url), from Telegram (/bot <name>) or by hand. Use it when the user asks for something "
+            "recurring or automatic ('every morning…', 'tell me when…'). The user approves it before it is created. "
+            "Write `instructions` as a complete, self-contained brief (what to check, how to report, what counts as news). "
+            "policy: ask (default: asks the user before writing files, running commands or using connectors), readonly, auto.",
+            {"type": "object", "properties": {
+                "name": {"type": "string"}, "description": {"type": "string"}, "instructions": {"type": "string"},
+                "triggers": {"type": "array", "items": trig},
+                "policy": {"type": "string", "enum": ["ask", "readonly", "auto"]},
+                "notify": {"type": "string", "enum": ["telegram", "none"]},
+                "max_steps": {"type": "integer"}, "daily_cap": {"type": "integer"}},
+             "required": ["name", "instructions"]},
+        )
+        return {"create_bot": (spec, create_bot)}
+
     def connector_tools(self, user_id: int, emit) -> dict:
         """Tools of the user's enabled MCP connectors, as agent tools named mcp__<connector>__<tool>."""
         from ..connectors import catalog_entry, manager, tool_name
@@ -532,8 +640,15 @@ class Jobs:
         prefs = loads((self.db.one("SELECT settings FROM users WHERE id=?", (user_id,)) or {}).get("settings"), {})
         return prefs.get("exec_mode") if prefs.get("exec_mode") in EXEC_MODES else "auto"
 
-    def _approver(self, run_id: int, thread: dict, project: dict, emit, cancel: threading.Event):
+    def _approver(self, run_id: int, thread: dict, project: dict, emit, cancel: threading.Event, bot: dict | None = None,
+                  attended: bool = False):
         def approve(call) -> tuple[bool, str]:
+            if bot:
+                from .bots import bot_denies
+
+                # the user talking to the bot in its conversation is there to approve: read-only binds unattended runs
+                if reason := bot_denies("ask" if attended else bot["policy"], call.name):
+                    return False, reason
             t = self.db.one("SELECT * FROM threads WHERE id=?", (thread["id"],)) or thread
             mode = self.exec_mode(t, project["user_id"])  # read live: the user may switch modes mid-run
             remembered = call.name in loads(t.get("allowed_tools"), []) and not call.name.endswith(ALWAYS_ASK)

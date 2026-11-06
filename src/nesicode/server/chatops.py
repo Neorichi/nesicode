@@ -49,11 +49,12 @@ def save_attachment(project: dict, thread: dict, name: str, data: bytes) -> dict
     return {"name": f.name, "path": f"{ATTACHMENTS_DIR}/{candidate}", "kind": kind, "size": len(data)}
 
 
-def post_message(db: DB, jobs: Jobs, project: dict, thread: dict, text: str, attachments: list[dict]) -> dict:
+def post_message(db: DB, jobs: Jobs, project: dict, thread: dict, text: str, attachments: list[dict],
+                 bot_id: int | None = None, trigger: str = "") -> dict:
     rid = db.insert(
-        "INSERT INTO runs (project_id, thread_id, kind, task, status, created_at, attachments) "
-        "VALUES (?, ?, 'chat', ?, 'waiting', ?, ?)",
-        (project["id"], thread["id"], text, time.time(), json.dumps(attachments)),
+        "INSERT INTO runs (project_id, thread_id, kind, task, status, created_at, attachments, bot_id, trigger) "
+        "VALUES (?, ?, 'chat', ?, 'waiting', ?, ?, ?, ?)",
+        (project["id"], thread["id"], text, time.time(), json.dumps(attachments), bot_id, trigger),
     )
     db.execute("UPDATE threads SET updated_at=? WHERE id=?", (time.time(), thread["id"]))
     jobs.enqueue_chat(rid, thread["id"])

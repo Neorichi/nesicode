@@ -26,6 +26,14 @@ const TOOL_LABEL = (): Record<string, string> => ({
   chrome_screenshot: 'Chrome · screenshot',
   chrome_close: 'Chrome · close',
   generate_image: t('Crear imagen'),
+  create_bot: t('Crear bot'),
+  http_fetch: t('Consultar web'),
+  bot_memory_get: t('Leer memoria'),
+  bot_memory_set: t('Guardar en memoria'),
+  bot_memory_list: t('Ver memoria'),
+  bot_memory_delete: t('Olvidar'),
+  bot_notify: t('Avisar'),
+  bot_schedule_once: t('Programar seguimiento'),
   show_image: t('Mostrar imagen'),
 })
 
@@ -235,6 +243,10 @@ export default function Transcript({
       out.push(<div key={i} className="auto-note muted">🧹 {t('Contexto aligerado: {n} tokens de salidas antiguas apartados (siguen guardados en disco).', { n: Number(e.freed).toLocaleString() })}</div>)
     } else if (e.type === 'compacted') {
       out.push(<Compacted key={i} e={e} />)
+    } else if (e.type === 'notify') {
+      out.push(<div key={i} className="auto-note">📣 {e.sent ? t('Aviso enviado por Telegram') : t('Aviso')}: {e.text}</div>)
+    } else if (e.type === 'bot_created') {
+      out.push(<div key={i} className="auto-note">🤖 {t('Bot creado')}: <Link to={`/bots/${e.bot_id}`}><b>{e.name}</b></Link> — {t('gestiónalo en la página Bots')}</div>)
     } else if (e.type === 'connector_error') {
       out.push(<div key={i} className="auto-note muted">{t('El conector {c} no arrancó', { c: e.connector })}: {e.text}</div>)
     } else if (e.type === 'file') {

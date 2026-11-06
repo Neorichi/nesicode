@@ -90,6 +90,15 @@ def build(db: DB, user_id: int, *, project_id: int | None, include_telegram: boo
                                          "transcribe_model", "check_command", "max_steps", "domain")},
                 "harness": loads(h["files"], {}) if h else {},
             }
+    doc["bots"] = []
+    for b in db.all("SELECT b.*, p.name AS project_name FROM bots b JOIN projects p ON p.id=b.project_id WHERE b.user_id=?", (user_id,)):
+        trig = db.all("SELECT kind, spec, tz, prompt, config FROM bot_triggers WHERE bot_id=? AND kind IN ('cron', 'interval', 'url')",
+                      (b["id"],))
+        doc["bots"].append({k: b[k] for k in ("name", "description", "instructions", "model", "policy", "max_steps",
+                                              "daily_cap", "notify", "project_name")}
+                           | {"enabled": bool(b["enabled"]),
+                              "triggers": [{**t, "config": loads(t["config"], {})} for t in trig],
+                              "memory": db.all("SELECT key, value FROM bot_memory WHERE bot_id=?", (b["id"],))})
     if include_telegram:
         token = v.get(user_id, "telegram:bot")
         if token:
@@ -106,6 +115,7 @@ def summary(doc: dict) -> dict:
         "project_template": (t or {}).get("from"),
         "telegram": bool(doc.get("telegram")),
         "role_models": {k: v for k, v in (doc.get("role_models") or {}).items() if v and k in ROLE_KEYS},
+        "bots": [b["name"] for b in doc.get("bots") or []],
     }
 
 
@@ -140,6 +150,8 @@ def apply(db: DB, user_id: int, doc: dict) -> dict:
         settings["project_template"] = doc["project_template"]
     if doc.get("role_models"):
         settings["role_models"] = {k: v for k, v in doc["role_models"].items() if k in ROLE_KEYS and v}
+    if doc.get("bots"):  # created by the app once a project exists (see import_bots)
+        settings["pending_bots"] = doc["bots"]
     db.execute("UPDATE users SET settings=? WHERE id=?", (json.dumps(settings), user_id))
     if doc.get("telegram", {}).get("token"):
         v.put(user_id, "telegram:bot", doc["telegram"]["token"])
@@ -149,3 +161,31 @@ def apply(db: DB, user_id: int, doc: dict) -> dict:
             (user_id, now),
         )
     return summary(doc)
+
+
+def import_bots(db: DB, bots, user_id: int) -> list[str]:
+    """Create the bots waiting in settings['pending_bots'] (same project name if it exists, else the first project)."""
+    row = db.one("SELECT settings FROM users WHERE id=?", (user_id,))
+    settings = loads(row["settings"], {}) if row else {}
+    pending = settings.get("pending_bots") or []
+    projects = db.all("SELECT id, name FROM projects WHERE user_id=? ORDER BY id", (user_id,))
+    if not pending or not projects or bots is None:
+        return []
+    created = []
+    for b in pending:
+        project = next((p for p in projects if p["name"] == b.get("project_name")), projects[0])
+        existing = db.one("SELECT id FROM bots WHERE user_id=? AND name=?", (user_id, b["name"]))
+        data = {k: b.get(k) for k in ("name", "description", "instructions", "model", "policy", "max_steps", "daily_cap", "notify")}
+        data |= {"project_id": project["id"], "enabled": b.get("enabled", True), "triggers": b.get("triggers") or []}
+        try:
+            saved = bots.save(user_id, data, existing["id"] if existing else None)
+        except Exception as exc:  # a bad trigger must not block the rest
+            print("nesicode: could not import bot", b.get("name"), exc)
+            continue
+        for m in b.get("memory") or []:
+            db.execute("INSERT INTO bot_memory (bot_id, key, value, updated_at) VALUES (?, ?, ?, ?) "
+                       "ON CONFLICT(bot_id, key) DO UPDATE SET value=excluded.value", (saved["id"], m["key"], m["value"], time.time()))
+        created.append(saved["name"])
+    settings.pop("pending_bots", None)
+    db.execute("UPDATE users SET settings=? WHERE id=?", (json.dumps(settings), user_id))
+    return created

@@ -45,6 +45,10 @@ export default function Chat() {
     const id = setInterval(async () => {
       try {
         const data = await api.get<{ thread: Thread; runs: Run[] }>(`/api/threads/${tid}`)
+        if (data.thread.title !== thread?.title) {
+          setThread(data.thread)
+          refreshThreads()
+        }
         if (data.runs.map((r) => `${r.id}:${r.status}`).join(',') !== statusSig) {
           setRuns(data.runs)
           setThread(data.thread)
@@ -54,7 +58,7 @@ export default function Chat() {
       }
     }, 4000)
     return () => clearInterval(id)
-  }, [activeId, tid, statusSig])
+  }, [activeId, tid, statusSig, thread?.title])
 
   useEffect(() => {
     if (!activeId) return
@@ -81,6 +85,7 @@ export default function Chat() {
         setLive('')
         await load()
         refreshThreads()
+        setTimeout(() => { load().then(refreshThreads).catch(() => {}) }, 6000) // the auto-title arrives a few seconds later
       },
     })
     return close
@@ -150,7 +155,7 @@ export default function Chat() {
   return (
     <div className="chat">
       <header className="chat-head">
-        <div className="chat-title">{thread?.title ?? '…'}</div>
+        <ThreadTitle thread={thread} onSaved={(th) => { setThread(th); refreshThreads() }} />
         <div className="row">
           {thread && (
             <span className={`cage ${thread.isolated ? 'on' : 'off'}`} title={thread.isolated ? t('Esta conversación trabaja en su propia carpeta aislada; no ve el proyecto ni otras conversaciones.') : t('Esta conversación trabaja directamente sobre la carpeta del proyecto (configuración global).')}>
@@ -195,6 +200,7 @@ export default function Chat() {
           )}
         </div>
       </header>
+      {thread?.bot && <BotBar bot={thread.bot} onRun={async () => { await api.post(`/api/bots/${thread.bot.id}/run`, { text: '' }); load() }} />}
       <div
         className="chat-scroll"
         onScroll={(e) => {
@@ -205,6 +211,13 @@ export default function Chat() {
         <div className="chat-col">
           {shown.map((r) => (
             <div key={r.id} className="exchange">
+              {r.bot_id && r.trigger && r.trigger !== 'chat' ? (
+                <div className="bot-trigger">
+                  <span className="bot-trigger-chip">{triggerLabel(r.trigger)}</span>
+                  <span className="muted small">{new Date(r.created_at * 1000).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}</span>
+                  <details className="bot-trigger-prompt"><summary className="muted small">{t('instrucción')}</summary><div className="small">{r.task}</div></details>
+                </div>
+              ) : (
               <div className="user-msg">
                 {r.attachments && r.attachments.length > 0 && (
                   <div className="att-row in-msg">
@@ -213,6 +226,7 @@ export default function Chat() {
                 )}
                 {r.task}
               </div>
+              )}
               <Transcript
                 events={r.events ?? []}
                 status={r.status}
@@ -396,5 +410,61 @@ function ContextMeter({ runs, live }: { runs: Run[]; live: { used: number; limit
       <span className="ctx-bar"><span style={{ width: `${pct}%` }} /></span>
       {fmtK(c.used)} / {fmtK(c.limit)}
     </span>
+  )
+}
+
+function ThreadTitle({ thread, onSaved }: { thread: Thread | null; onSaved: (t: Thread) => void }) {
+  const [editing, setEditing] = useState(false)
+  const [value, setValue] = useState('')
+  useLang()
+  if (!thread) return <div className="chat-title">…</div>
+  const save = async () => {
+    const title = value.trim()
+    setEditing(false)
+    if (!title || title === thread.title) return
+    onSaved({ ...thread, ...(await api.patch<Thread>(`/api/threads/${thread.id}`, { title })) })
+  }
+  return editing ? (
+    <input
+      className="chat-title-input"
+      value={value}
+      autoFocus
+      maxLength={120}
+      onChange={(e) => setValue(e.target.value)}
+      onBlur={save}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') { e.preventDefault(); save() }
+        if (e.key === 'Escape') setEditing(false)
+      }}
+    />
+  ) : (
+    <button className="chat-title editable" title={t('Cambiar el título')} onClick={() => { setValue(thread.title); setEditing(true) }}>
+      {thread.title} <span className="edit-pencil">✎</span>
+    </button>
+  )
+}
+
+function triggerLabel(trigger: string): string {
+  const kind = trigger.split('#')[0]
+  return ({ cron: `⏰ ${t('Tarea programada')}`, interval: `⏰ ${t('Tarea periódica')}`, once: `⏰ ${t('Seguimiento')}`,
+    url: `🌐 ${t('Cambio en una web')}`, webhook: `🔗 Webhook`, telegram: `✈ Telegram`, manual: `▶ ${t('Lanzada a mano')}` } as Record<string, string>)[kind] ?? kind
+}
+
+function BotBar({ bot, onRun }: { bot: any; onRun: () => void }) {
+  useLang()
+  const next = bot.next_at ? new Date(bot.next_at * 1000).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' }) : null
+  return (
+    <div className="bot-bar">
+      <div className="bot-bar-main">
+        <b>🤖 {bot.name}</b>
+        <span className="muted small">{bot.description || t('Bot')}</span>
+      </div>
+      <div className="bot-bar-meta small">
+        {bot.enabled ? (next ? <span>{t('Próxima tarea')}: <b>{next}</b></span> : <span>{t('Sin horario')}</span>) : <span className="warn">⏸ {t('En pausa')}</span>}
+        <button className="btn small" onClick={onRun}>▶ {t('Ejecutar tarea ahora')}</button>
+        <Link className="btn small ghost" to={`/bots/${bot.id}`}>{t('Tareas y ajustes')}</Link>
+      </div>
+      <div className="muted small bot-bar-hint">{t('Lo que escribas aquí lo recibe el bot, con sus instrucciones y su memoria. Puedes darle instrucciones nuevas («a partir de ahora…») y las recordará.')}</div>
+    </div>
   )
 }

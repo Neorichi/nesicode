@@ -188,7 +188,23 @@ class OpenAICompatProvider(Provider):
     def generate_image(self, model: str, prompt: str) -> tuple[bytes, str]:
         import base64
 
-        data = self.post("/images/generations", {"model": model, "prompt": prompt, "n": 1, "response_format": "b64_json"})
+        body = {"model": model, "prompt": prompt, "n": 1, "response_format": "b64_json"}
+        for attempt in range(3):
+            try:
+                data = self.post("/images/generations", body)
+                break
+            except LLMError as exc:
+                text = str(exc).lower()
+                wrong_backend = "language model" in text or "not available on this endpoint" in text or "does not support image" in text
+                if not wrong_backend:
+                    raise
+                if attempt == 2:  # a load-balanced group keeps landing on a text-only model
+                    raise LLMError(
+                        f"NOT RETRYABLE — the image model '{model}' of {self.name} is answering with a text-only model "
+                        "(it cannot create images). Do not try again with other prompts: tell the user to choose another "
+                        "model in Project settings → Models by role → Image generation (e.g. an xAI grok-imagine or "
+                        "OpenAI gpt-image model), or to fix that model group at the provider."
+                    ) from exc
         try:
             item = data["data"][0]
         except (KeyError, IndexError, TypeError) as exc:

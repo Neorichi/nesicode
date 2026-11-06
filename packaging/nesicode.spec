@@ -20,7 +20,8 @@ hidden = (
     + (["Speech", "AVFoundation"] if sys.platform == "darwin" else [])
 )
 datas = [(str(WEB), "web_dist"), (str(ROOT / "extension"), "chrome_extension")] + collect_data_files("webview") + collect_data_files("anthropic") \
-    + collect_data_files("docx") + collect_data_files("pptx") + collect_data_files("openpyxl")
+    + collect_data_files("docx") + collect_data_files("pptx") + collect_data_files("openpyxl") \
+    + (collect_data_files("tzdata") if sys.platform == "win32" else [])
 
 a = Analysis(
     [str(ROOT / "packaging" / "launcher.py")],

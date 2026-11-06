@@ -14,6 +14,7 @@ import ProjectSettings from './pages/ProjectSettings'
 import Account from './pages/Account'
 import NewProject from './pages/NewProject'
 import { ConnectorsPage, ProvidersPage } from './pages/Integrations'
+import BotsPage, { BotDetail } from './pages/Bots'
 
 type Ctx = {
   user: User
@@ -116,6 +117,8 @@ export default function App() {
             <Route path="/" element={<Home />} />
             <Route path="/new" element={<NewProject />} />
             <Route path="/account" element={<Account />} />
+            <Route path="/bots" element={<BotsPage />} />
+            <Route path="/bots/:bid" element={<BotDetail />} />
             <Route path="/connectors" element={<ConnectorsPage />} />
             <Route path="/providers" element={<ProvidersPage />} />
             <Route path="/p/:pid" element={<NewChat />} />

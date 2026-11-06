@@ -197,7 +197,7 @@ def main() -> None:
             elif os.name == "nt":
                 subprocess.Popen(["explorer", "/select,", path])
             else:
-                subprocess.Popen(["xdg-open", os.path.dirname(path)])
+                subprocess.Popen(["xdg-open", path if os.path.isdir(path) else os.path.dirname(path)])
             return True
 
         def open_external(self, url: str):

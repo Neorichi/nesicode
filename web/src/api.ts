@@ -18,7 +18,7 @@ export type Project = {
   transcribe_model?: string
 }
 
-export type Thread = { id: number; project_id: number; title: string; isolated: number; exec_mode?: string; effective_mode?: string; telegram?: { linked: boolean; attached: boolean }; created_at: number; updated_at: number }
+export type Thread = { id: number; project_id: number; title: string; isolated: number; exec_mode?: string; effective_mode?: string; telegram?: { linked: boolean; attached: boolean }; bot?: any; created_at: number; updated_at: number }
 
 export type Attachment = { name: string; path: string; kind: 'image' | 'text' | 'binary'; size: number }
 
@@ -43,6 +43,8 @@ export type Run = {
   finished_at: number | null
   params: Record<string, any>
   attachments?: Attachment[]
+  bot_id?: number | null
+  trigger?: string
   summary?: Record<string, any>
   result?: Record<string, any>
   events?: RunEvent[]
@@ -176,4 +178,12 @@ export async function transcribeAudio(projectId: number | string, wav: Blob): Pr
   fd.append('lang', getLang())
   const r = await api.post<{ text: string }>(`/api/projects/${projectId}/transcribe`, fd)
   return r.text
+}
+
+/** The computer this page runs on (labels like Finder / Explorer). */
+export const OS: 'mac' | 'win' | 'linux' = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)
+  ? 'mac' : /Win/.test(navigator.platform || navigator.userAgent) ? 'win' : 'linux'
+
+export function fileManager(): string {
+  return OS === 'mac' ? 'Finder' : OS === 'win' ? t('el Explorador de archivos') : t('el gestor de archivos')
 }

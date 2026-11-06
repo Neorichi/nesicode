@@ -135,6 +135,48 @@ CREATE TABLE IF NOT EXISTS telegram_links (
     update_offset INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS bots (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    instructions TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    policy TEXT NOT NULL DEFAULT 'ask',
+    max_steps INTEGER NOT NULL DEFAULT 30,
+    daily_cap INTEGER NOT NULL DEFAULT 24,
+    notify TEXT NOT NULL DEFAULT 'telegram',
+    thread_id INTEGER,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    fail_streak INTEGER NOT NULL DEFAULT 0,
+    paused_reason TEXT NOT NULL DEFAULT '',
+    last_run_at REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS bot_triggers (
+    id INTEGER PRIMARY KEY,
+    bot_id INTEGER NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    spec TEXT NOT NULL DEFAULT '',
+    tz TEXT NOT NULL DEFAULT '',
+    prompt TEXT NOT NULL DEFAULT '',
+    config TEXT NOT NULL DEFAULT '{}',
+    next_at REAL,
+    last_at REAL,
+    last_hash TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS bot_triggers_due ON bot_triggers(enabled, next_at);
+CREATE TABLE IF NOT EXISTS bot_memory (
+    bot_id INTEGER NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (bot_id, key)
+);
 CREATE TABLE IF NOT EXISTS model_limits (
     user_id INTEGER NOT NULL,
     spec TEXT NOT NULL,
@@ -174,6 +216,11 @@ MIGRATIONS = [
     ("projects", "image_model", "TEXT NOT NULL DEFAULT ''"),
     # speech-to-text model for the microphone button ('' = macOS built-in recognizer when available)
     ("projects", "transcribe_model", "TEXT NOT NULL DEFAULT ''"),
+    # runs started by a bot (and what woke it up)
+    ("runs", "bot_id", "INTEGER"),
+    ("runs", "trigger", "TEXT NOT NULL DEFAULT ''"),
+    # 1 = the user renamed the conversation: never retitle it automatically
+    ("threads", "title_locked", "INTEGER NOT NULL DEFAULT 0"),
     # per-conversation execution mode ('' = the user's default) and tools allowed "always" in it
     ("threads", "exec_mode", "TEXT NOT NULL DEFAULT ''"),
     # main folder picked by the user on disk ('' = nesicode keeps the files in its data dir)

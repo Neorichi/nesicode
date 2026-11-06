@@ -92,8 +92,8 @@ DESKTOP_COOKIE = "nesi_desktop"
 async def desktop_guard(request: Request, call_next):
     """Desktop mode has no login, so a random per-launch token (handed to the app window in the
     first URL, then kept as an HttpOnly cookie) stops other local programs from using the API."""
-    if not DESKTOP_TOKEN:
-        return await call_next(request)
+    if not DESKTOP_TOKEN or (request.url.path.startswith("/hooks/") and request.method == "POST"):
+        return await call_next(request)  # bot webhooks carry their own secret
     if request.query_params.get("token") == DESKTOP_TOKEN:
         resp = RedirectResponse(request.url.path or "/")
         resp.set_cookie(DESKTOP_COOKIE, DESKTOP_TOKEN, httponly=True, samesite="strict", path="/")
@@ -161,6 +161,7 @@ def check_model(spec: str, user: dict | None = None) -> str:
 def run_view(run: dict, *, full: bool = False) -> dict:
     out = {k: run[k] for k in ("id", "project_id", "thread_id", "kind", "task", "status", "final_text",
                                 "error", "harness_version", "created_at", "finished_at")}
+    out["bot_id"], out["trigger"] = run.get("bot_id"), run.get("trigger") or ""
     out["params"] = loads(run["params"], {})
     out["attachments"] = loads(run.get("attachments"), [])
     result = loads(run["result"], {}) or {}
@@ -615,6 +616,9 @@ async def config_import(request: Request, file: UploadFile = File(...), user: di
         raise HTTPException(422, str(exc)) from exc
     result = apply(db, user["id"], doc)
     result["projects_updated"] = _apply_role_models(user, doc.get("role_models") or {})
+    from .config_io import import_bots
+
+    result["bots_created"] = import_bots(db, bots, user["id"])  # waits for a project if there is none yet
     if doc.get("telegram"):
         telegram.restart(user["id"])
     for p in doc.get("providers", []):
@@ -657,7 +661,261 @@ from .telegram import TelegramManager  # noqa: E402
 telegram = TelegramManager(db, jobs)
 if not os.environ.get("NESICODE_NO_TELEGRAM"):
     threading.Thread(target=telegram.start_all, daemon=True, name="nesi-telegram-start").start()
-    threading.Thread(target=jobs.resume_waiting, daemon=True, name="nesi-resume-queue").start()
+threading.Thread(target=jobs.resume_waiting, daemon=True, name="nesi-resume-queue").start()
+
+from .bots import BotManager, CronError, local_tz, next_runs  # noqa: E402
+
+bots = BotManager(db, jobs, telegram)
+jobs.bots = bots
+bots.start()  # scheduler thread (off with NESICODE_NO_SCHEDULER)
+
+
+# ------------------------------------------------------------------------ bots
+def _bot_view(b: dict, full: bool = False) -> dict:
+    trig = db.all("SELECT * FROM bot_triggers WHERE bot_id=? ORDER BY id", (b["id"],))
+    last = db.one("SELECT id, status, trigger, created_at, finished_at FROM runs WHERE bot_id=? ORDER BY id DESC LIMIT 1", (b["id"],))
+    project = db.one("SELECT name FROM projects WHERE id=?", (b["project_id"],))
+    nxt = min((t["next_at"] for t in trig if t["next_at"] and t["kind"] in ("cron", "interval", "once", "url") and t["enabled"]),
+              default=None)
+    out = {**{k: b[k] for k in ("id", "project_id", "name", "description", "instructions", "model", "policy", "max_steps",
+                               "daily_cap", "notify", "thread_id", "fail_streak", "paused_reason", "last_run_at",
+                               "created_at", "updated_at")},
+           "enabled": bool(b["enabled"]), "project": project["name"] if project else "", "next_at": nxt if b["enabled"] else None,
+           "last_run": last, "webhook": any(t["kind"] == "webhook" for t in trig),
+           "triggers": [{k: t[k] for k in ("id", "kind", "spec", "tz", "prompt", "next_at", "last_at", "enabled")}
+                        | {"config": loads(t["config"], {})} for t in trig if t["kind"] != "webhook"]}
+    if full:
+        out["memory"] = db.all("SELECT key, value, updated_at FROM bot_memory WHERE bot_id=? ORDER BY key", (b["id"],))
+        out["runs"] = db.all("SELECT id, status, trigger, created_at, finished_at, substr(final_text, 1, 300) AS summary, result "
+                             "FROM runs WHERE bot_id=? ORDER BY id DESC LIMIT 30", (b["id"],))
+        for r in out["runs"]:
+            r["usage"] = (loads(r.pop("result"), {}) or {}).get("usage")
+        out["windows"] = os.name == "nt"
+    return out
+
+
+def _bot(user: dict, bot_id: int) -> dict:
+    b = bots.bot(bot_id, user["id"])
+    if not b:
+        raise HTTPException(404, "Bot no encontrado")
+    return b
+
+
+class TriggerIn(BaseModel):
+    kind: str = Field(pattern="^(cron|interval|url)$")
+    spec: str = Field(max_length=2000)
+    tz: str = Field(default="", max_length=64)
+    prompt: str = Field(default="", max_length=4000)
+    config: dict = Field(default_factory=dict)
+
+
+class BotIn(BaseModel):
+    project_id: int | None = None
+    name: str | None = Field(default=None, max_length=60)
+    description: str | None = Field(default=None, max_length=300)
+    instructions: str | None = Field(default=None, max_length=20_000)
+    model: str | None = Field(default=None, max_length=200)
+    policy: str | None = Field(default=None, pattern="^(ask|readonly|auto)$")
+    notify: str | None = Field(default=None, pattern="^(telegram|none)$")
+    max_steps: int | None = Field(default=None, ge=3, le=200)
+    daily_cap: int | None = Field(default=None, ge=1, le=500)
+    enabled: bool | None = None
+    triggers: list[TriggerIn] | None = None
+
+
+def _save_bot(user: dict, body: BotIn, bot_id: int | None = None) -> dict:
+    from ..agent.workspace import ToolError
+
+    data = body.model_dump(exclude_none=True)
+    if "triggers" in data:
+        data["triggers"] = [t for t in data["triggers"]]
+    if data.get("model"):
+        check_model(data["model"], user)
+    try:
+        b = bots.save(user["id"], data, bot_id)
+    except (ValueError, CronError, ToolError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return _bot_view(b, full=True)
+
+
+@app.get("/api/bots")
+def list_bots(user: dict = Depends(current_user)):
+    return {"bots": [_bot_view(b) for b in db.all("SELECT * FROM bots WHERE user_id=? ORDER BY name", (user["id"],))],
+            "tz": local_tz(), "telegram": bool(telegram.bridges.get(user["id"]) and telegram.bridges[user["id"]].link().get("chat_id"))}
+
+
+@app.post("/api/bots")
+def create_bot_api(body: BotIn, user: dict = Depends(current_user)):
+    if not body.project_id or not body.name:
+        raise HTTPException(422, "Faltan el nombre y el proyecto")
+    return _save_bot(user, body)
+
+
+@app.get("/api/bots/{bot_id}")
+def get_bot(bot_id: int, user: dict = Depends(current_user)):
+    return _bot_view(_bot(user, bot_id), full=True)
+
+
+@app.patch("/api/bots/{bot_id}")
+def patch_bot(bot_id: int, body: BotIn, user: dict = Depends(current_user)):
+    _bot(user, bot_id)
+    return _save_bot(user, body, bot_id)
+
+
+@app.delete("/api/bots/{bot_id}")
+def delete_bot(bot_id: int, user: dict = Depends(current_user)):
+    b = _bot(user, bot_id)
+    for r in db.all("SELECT id FROM runs WHERE bot_id=? AND status IN ('waiting', 'queued', 'running')", (bot_id,)):
+        jobs.cancel(r["id"])
+        db.execute("UPDATE runs SET status='cancelled', finished_at=? WHERE id=? AND status='waiting'", (time.time(), r["id"]))
+    vault.delete(user["id"], f"bot:{bot_id}:webhook")
+    db.execute("UPDATE runs SET bot_id=NULL WHERE bot_id=?", (b["id"],))  # ids can be reused: detach the history
+    db.execute("DELETE FROM bots WHERE id=?", (b["id"],))  # triggers and memory cascade; its conversation stays
+    return {"ok": True}
+
+
+class BotRun(BaseModel):
+    text: str = Field(default="", max_length=20_000)
+
+
+@app.post("/api/bots/{bot_id}/run")
+def run_bot(bot_id: int, body: BotRun, user: dict = Depends(current_user)):
+    b = _bot(user, bot_id)
+    run = bots.fire(b["id"], "manual", body.text, force=True)
+    if not run:
+        raise HTTPException(409, "No se pudo lanzar el bot")
+    return run_view(run)
+
+
+@app.delete("/api/bots/{bot_id}/memory/{key}")
+def delete_bot_memory(bot_id: int, key: str, user: dict = Depends(current_user)):
+    _bot(user, bot_id)
+    db.execute("DELETE FROM bot_memory WHERE bot_id=? AND key=?", (bot_id, key))
+    return {"ok": True}
+
+
+class CronPreview(BaseModel):
+    kind: str = Field(pattern="^(cron|interval)$")
+    spec: str = Field(max_length=200)
+    tz: str = Field(default="", max_length=64)
+
+
+@app.post("/api/bots/preview")
+def preview_schedule(body: CronPreview, user: dict = Depends(current_user)):
+    try:
+        return {"next": next_runs(body.kind, body.spec, body.tz or local_tz(), 3)}
+    except CronError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+class BotDraft(BaseModel):
+    project_id: int
+    description: str = Field(min_length=3, max_length=4000)
+
+
+@app.post("/api/bots/draft")
+def draft_bot(body: BotDraft, user: dict = Depends(current_user)):
+    """Turn 'every morning at 8 tell me…' into a bot config (name, instructions, triggers) the user then reviews."""
+    from ..llm import ModelOptions
+    from .bots import validate_trigger
+
+    p = get_project(user, body.project_id)
+    tz = local_tz() or "local"
+    prompt = (
+        "Turn the user's request into a JSON bot configuration for Nesicode. Reply with ONLY a JSON object:\n"
+        '{"name": short name, "description": one line, "instructions": complete self-contained brief for an unattended '
+        'agent (what to check, how to report, when to stay silent by answering NOTHING_NEW), written in the user\'s language, '
+        '"triggers": [{"kind": "cron", "spec": "min hour dom mon dow", "tz": "' + tz + '"} | {"kind": "interval", "spec": "30" (minutes) or "2h"} '
+        '| {"kind": "url", "spec": "https://…", "config": {"every": 30}}] (empty list if it should only run on demand), '
+        '"policy": "readonly" if it only needs to read/fetch/report, else "ask"}\n\nUser request:\n' + body.description
+    )
+    try:
+        provider, model = get_provider(p["executor_model"], auth.user_keys(db, user["id"]))
+        stop = threading.Event()
+        timer = threading.Timer(40, stop.set)  # a slow or hung model must not block the form: fall back after 40 s
+        timer.start()
+        try:
+            text, _ = provider.complete(model, "You produce strict JSON configs.", prompt,
+                                        ModelOptions(effort="low", role="drafter", max_tokens=2000, cancel=stop))
+        finally:
+            timer.cancel()
+        m = re.search(r"\{.*\}", text, re.S)
+        draft = json.loads(m.group(0)) if m else {}
+    except Exception:
+        draft = {}
+    triggers = []
+    for t in draft.get("triggers") or []:
+        try:
+            triggers.append(validate_trigger(t))
+        except Exception:
+            continue
+    words = re.sub(r"\s+", " ", body.description).strip()
+    return {
+        "project_id": p["id"],
+        "name": str(draft.get("name") or words[:40]).strip()[:60],
+        "description": str(draft.get("description") or words[:120])[:300],
+        "instructions": str(draft.get("instructions") or body.description),
+        "triggers": triggers,
+        "policy": draft.get("policy") if draft.get("policy") in ("ask", "readonly", "auto") else "ask",
+        "notify": "telegram",
+        "ai": bool(draft),
+    }
+
+
+# --- webhook: POST /hooks/{bot_id} with header X-Nesicode-Token (or /hooks/{bot_id}/{token})
+_hook_hits: dict[int, list[float]] = {}
+
+
+@app.post("/api/bots/{bot_id}/webhook")
+def enable_webhook(bot_id: int, request: Request, user: dict = Depends(current_user)):
+    """Create (or rotate) the bot's webhook secret. It is shown only now."""
+    b = _bot(user, bot_id)
+    token = secrets.token_urlsafe(32)
+    vault.put(user["id"], f"bot:{b['id']}:webhook", token)
+    if not db.one("SELECT id FROM bot_triggers WHERE bot_id=? AND kind='webhook'", (b["id"],)):
+        db.execute("INSERT INTO bot_triggers (bot_id, kind, created_at) VALUES (?, 'webhook', ?)", (b["id"], time.time()))
+    base = f"{request.url.scheme}://{request.url.netloc}"
+    return {"url": f"{base}/hooks/{b['id']}", "token": token, "url_with_token": f"{base}/hooks/{b['id']}/{token}"}
+
+
+@app.delete("/api/bots/{bot_id}/webhook")
+def disable_webhook(bot_id: int, user: dict = Depends(current_user)):
+    b = _bot(user, bot_id)
+    vault.delete(user["id"], f"bot:{b['id']}:webhook")
+    db.execute("DELETE FROM bot_triggers WHERE bot_id=? AND kind='webhook'", (b["id"],))
+    return {"ok": True}
+
+
+async def _hook(bot_id: int, token: str, request: Request):
+    host = (request.headers.get("host") or "").split(":")[0].strip("[]")
+    if DESKTOP_TOKEN and host not in ("127.0.0.1", "localhost", "::1"):
+        raise HTTPException(403, "host no permitido")  # DNS-rebinding guard for the desktop app
+    b = db.one("SELECT * FROM bots WHERE id=?", (bot_id,))
+    expected = vault.get(b["user_id"], f"bot:{bot_id}:webhook") if b else None
+    if not b or not expected or not token or not secrets.compare_digest(token, expected):
+        raise HTTPException(404, "not found")
+    now = time.time()
+    hits = [t for t in _hook_hits.get(bot_id, []) if now - t < 60]
+    if len(hits) >= 10:
+        raise HTTPException(429, "demasiadas llamadas: máx. 10 por minuto")
+    _hook_hits[bot_id] = hits + [now]
+    body = await request.body()
+    if len(body) > 64 * 1024:
+        raise HTTPException(413, "cuerpo demasiado grande (máx. 64 KB)")
+    run = bots.fire(bot_id, "webhook", "", payload=body.decode("utf-8", "replace"))
+    if not run:
+        raise HTTPException(409, "el bot está en pausa, ocupado o sin ejecuciones disponibles hoy")
+    return JSONResponse({"run_id": run["id"], "status": run["status"]}, status_code=202)
+
+
+@app.post("/hooks/{bot_id}")
+async def hook(bot_id: int, request: Request):
+    return await _hook(bot_id, request.headers.get("x-nesicode-token", ""), request)
+
+
+@app.post("/hooks/{bot_id}/{token}")
+async def hook_with_token(bot_id: int, token: str, request: Request):
+    return await _hook(bot_id, token, request)
 
 
 def _telegram_view(user_id: int) -> dict:
@@ -885,7 +1143,12 @@ def _start_and_list(user: dict, name: str) -> list[str]:
             try:
                 tools = [t.name for t in manager().tools(user["id"], cfg, timeout=150)]
             except Exception as exc:
-                raise HTTPException(422, f"No se pudo arrancar {row['label']}: {exc}") from exc
+                msg = f"No se pudo arrancar {row['label']}: {exc}"
+                if row["template"] == "burp" and re.search(r"not found|404|405|refused|connect", str(exc), re.I):
+                    msg += (". En esa dirección no responde el MCP de Burp: comprueba en Burp → pestaña MCP que está "
+                            "activado y qué puerto usa (Advanced options). Si otro programa ocupa ese puerto, cámbialo en "
+                            "Burp (p. ej. 9877) y pon aquí la misma dirección.")
+                raise HTTPException(422, msg) from exc
             db.execute("UPDATE user_connectors SET tools=? WHERE id=?", (json.dumps(tools), row["id"]))
             return tools
     raise HTTPException(404, "Conector no encontrado")
@@ -1148,6 +1411,9 @@ def create_project(body: ProjectCreate, user: dict = Depends(current_user)):
             db.execute("DELETE FROM projects WHERE id=?", (pid,))
             shutil.rmtree(ws, ignore_errors=True)
             raise HTTPException(422, f"git clone falló: {proc.stderr[-500:]}")
+    from .config_io import import_bots
+
+    import_bots(db, bots, user["id"])  # bots imported before any project existed land here
     return project_view(p)
 
 
@@ -1416,8 +1682,10 @@ def read_thread(thread_id: int, user: dict = Depends(current_user)):
         view["events"] = [{"seq": s, **e} for s, e in db.events_after(r["id"], 0, limit=5000)]
         msgs.append(view)
     tg = db.one("SELECT chat_id, active_thread FROM telegram_links WHERE user_id=?", (user["id"],)) or {}
+    b = db.one("SELECT * FROM bots WHERE thread_id=? AND user_id=?", (thread_id, user["id"]))
     return {"thread": {**thread_out(t), "effective_mode": jobs.exec_mode(t, user["id"]),
-                       "telegram": {"linked": bool(tg.get("chat_id")), "attached": tg.get("active_thread") == t["id"]}},
+                       "telegram": {"linked": bool(tg.get("chat_id")), "attached": tg.get("active_thread") == t["id"]},
+                       "bot": _bot_view(b) if b else None},
             "runs": msgs}
 
 
@@ -1431,7 +1699,7 @@ class ThreadPatch(BaseModel):
 def patch_thread(thread_id: int, body: ThreadPatch, user: dict = Depends(current_user)):
     get_thread(user, thread_id)
     if body.title is not None:
-        db.execute("UPDATE threads SET title=? WHERE id=?", (body.title.strip() or "Conversación", thread_id))
+        db.execute("UPDATE threads SET title=?, title_locked=1 WHERE id=?", (body.title.strip() or "Conversación", thread_id))
     if body.exec_mode is not None:
         db.execute("UPDATE threads SET exec_mode=? WHERE id=?", (body.exec_mode, thread_id))
     if body.reset_allowed:
@@ -1568,10 +1836,11 @@ def send_message(thread_id: int, body: MessageCreate, user: dict = Depends(curre
             raise HTTPException(422, f"El adjunto ya no existe: {rel}")
         atts.append(_attachment_meta(f, rel))
     first = db.one("SELECT COUNT(*) AS n FROM runs WHERE thread_id=?", (thread_id,))["n"] == 0
+    bot = db.one("SELECT id FROM bots WHERE thread_id=? AND user_id=?", (thread_id, user["id"]))
     rid = db.insert(
-        "INSERT INTO runs (project_id, thread_id, kind, task, status, created_at, attachments) "
-        "VALUES (?, ?, 'chat', ?, 'waiting', ?, ?)",
-        (p["id"], thread_id, body.text, time.time(), json.dumps(atts)),
+        "INSERT INTO runs (project_id, thread_id, kind, task, status, created_at, attachments, bot_id, trigger) "
+        "VALUES (?, ?, 'chat', ?, 'waiting', ?, ?, ?, ?)",
+        (p["id"], thread_id, body.text, time.time(), json.dumps(atts), bot["id"] if bot else None, "chat" if bot else ""),
     )
     if first and t["title"] == "Nueva conversación":
         title = re.sub(r"\s+", " ", body.text).strip()[:60]

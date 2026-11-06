@@ -423,3 +423,77 @@ def test_stop_kills_running_command_and_hung_request(tmp_path):
         prov.post("/chat/completions", {"model": "x"}, cancel=cancel)
     assert _t.monotonic() - t0 < 5
     srv.close()
+
+
+def test_bot_cron_parser_and_schedule():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from nesicode.server.bots import CronError, cron_next, interval_seconds, next_runs
+
+    mad = ZoneInfo("Europe/Madrid")
+    start = datetime(2026, 11, 6, 9, 30, tzinfo=mad).timestamp()  # a Friday
+    nxt = datetime.fromtimestamp(cron_next("0 8 * * 1-5", "Europe/Madrid", start), mad)
+    assert (nxt.weekday(), nxt.hour, nxt.minute) == (0, 8, 0)  # next weekday 08:00 is Monday
+    nxt = datetime.fromtimestamp(cron_next("*/15 * * * *", "Europe/Madrid", start), mad)
+    assert (nxt.hour, nxt.minute) == (9, 45)
+    nxt = datetime.fromtimestamp(cron_next("30 7 1 * *", "Europe/Madrid", start), mad)
+    assert (nxt.month, nxt.day, nxt.hour, nxt.minute) == (12, 1, 7, 30)
+    nxt = datetime.fromtimestamp(cron_next("0 9 * * sun", "Europe/Madrid", start), mad)
+    assert nxt.weekday() == 6
+    # DST change (last Sunday of March): 08:00 local still means 08:00 local
+    nxt = datetime.fromtimestamp(cron_next("0 8 * * *", "Europe/Madrid", datetime(2027, 3, 28, 1, 0, tzinfo=mad).timestamp()), mad)
+    assert (nxt.day, nxt.hour) == (28, 8)
+    assert interval_seconds("2h") == 7200 and len(next_runs("interval", "30", "", 3)) == 3
+    for bad in ("0 8 * *", "61 * * * *", "0 25 * * *", "x * * * *"):
+        with pytest.raises(CronError):
+            cron_next(bad, "Europe/Madrid", start)
+    with pytest.raises(CronError):
+        interval_seconds("1")  # below the 5-minute minimum
+
+
+def test_bot_fetch_blocks_local_network():
+    import httpx
+
+    from nesicode.server.bots import check_public_url, page_text, safe_fetch
+
+    for url in ("http://127.0.0.1:47821/api/projects", "http://localhost/", "http://192.168.1.1/", "http://169.254.169.254/",
+                "file:///etc/passwd", "http://[::1]/"):
+        with pytest.raises(ToolError):
+            check_public_url(url)
+    hops = []
+
+    def handler(req):
+        hops.append(str(req.url))
+        if req.url.path == "/start":
+            return httpx.Response(302, headers={"Location": "/end"})
+        return httpx.Response(200, text="<html><script>x()</script><h1>Hola</h1><p>mundo &amp; más</p></html>",
+                              headers={"content-type": "text/html"})
+
+    status, ctype, body = safe_fetch("https://example.test/start", transport=httpx.MockTransport(handler))
+    assert status == 200 and len(hops) == 2
+    assert page_text(ctype, body) == "Hola \n mundo & más" or "Hola" in page_text(ctype, body) and "x()" not in page_text(ctype, body)
+
+
+def test_bot_unattended_rules(monkeypatch):
+    from nesicode.server import bots as botmod
+
+    assert botmod.bot_denies("readonly", "bash") and botmod.bot_denies("readonly", "write_file")
+    assert botmod.bot_denies("readonly", "mcp__office__word_write")
+    assert not botmod.bot_denies("readonly", "read_file") and not botmod.bot_denies("readonly", "http_fetch")
+    assert not botmod.bot_denies("ask", "bash")
+    monkeypatch.setattr(botmod.os, "name", "nt")
+    assert botmod.bot_denies("auto", "bash")  # Windows: no sandbox → no commands for bots
+
+
+def test_same_tool_error_three_times_stops_the_loop(tmp_path):
+    from nesicode.llm.base import ToolCall, Usage
+
+    agent = Agent(model="mock/demo", harness=base_harness(), workspace=Workspace(tmp_path))
+    agent.extra_tools = {"flaky": (None, lambda args, ag: (_ for _ in ()).throw(ToolError("backend says 400 for request 17")))}
+    outs = [agent._call_tool(ToolCall(f"c{i}", "flaky", {"n": i}), Usage()) for i in range(4)]
+    assert all(o.is_error for o in outs) and "disabled for this run" in outs[3].content
+    # different errors don't count as a loop
+    agent2 = Agent(model="mock/demo", harness=base_harness(), workspace=Workspace(tmp_path / "b"))
+    outs = [agent2._call_tool(ToolCall(f"r{i}", "read_file", {"path": f"nope{i}-{'x' * i}.txt"}), Usage()) for i in range(4)]
+    assert "disabled" not in outs[3].content
