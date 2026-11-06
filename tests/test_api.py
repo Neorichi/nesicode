@@ -965,3 +965,46 @@ def test_connector_usage_modes(alice, project):
     alice.patch(f"/api/connectors/{c['name']}", json={"usage": "auto"})
     assert any(n.startswith("mcp__office") for n in jobs.connector_tools(me["id"], lambda e: None, context="hola", info={}))
     assert db.one("SELECT usage FROM user_connectors WHERE name=? AND user_id=?", (c["name"], me["id"]))["usage"] == "auto"
+
+
+def test_project_profiles(alice):
+    profiles = {p["id"]: p for p in alice.get("/api/profiles").json()}
+    assert {"general", "security", "webdev", "data", "docs"} <= set(profiles)
+    p = alice.post("/api/projects", json={"name": "Pentest", "profile": "security",
+                                          "executor_model": "mock/demo", "improver_model": "mock/demo"}).json()
+    assert p["profile"] == "security" and p["domain"] == "security"
+    files = alice.get(f"/api/projects/{p['id']}/harness").json()["files"]
+    assert "Profile: offensive security" in files["system_prompt.md"] and "skills/web-audit/SKILL.md" in files
+    assert "take precedence over the general guardrails" in files["system_prompt.md"]
+    # the project learns something, then switches profile: the learned rule stays, the security block goes
+    files["guardrails.md"] += "- Regla aprendida del proyecto.\n"
+    assert alice.post(f"/api/projects/{p['id']}/harness", json={"files": files}).status_code == 200
+    r = alice.post(f"/api/projects/{p['id']}/profile", json={"profile": "docs"}).json()
+    files = alice.get(f"/api/projects/{p['id']}/harness").json()["files"]
+    assert r["profile"] == "docs" and "Regla aprendida del proyecto." in files["guardrails.md"]
+    assert "offensive security" not in files["system_prompt.md"] and "skills/web-audit/SKILL.md" not in files
+    assert "skills/doc-style/SKILL.md" in files and "documents and office" in files["system_prompt.md"]
+    assert alice.post(f"/api/projects/{p['id']}/profile", json={"profile": "nope"}).status_code == 422
+    g = alice.post("/api/projects", json={"name": "Normal", "executor_model": "mock/demo", "improver_model": "mock/demo"}).json()
+    assert g["profile"] == "general"
+
+
+def test_html_deliverables_and_downloads(alice, project):
+    from nesicode.server.app import db, thread_ws
+
+    t = alice.post(f"/api/projects/{project['id']}/threads", json={}).json()
+    proj = db.one("SELECT * FROM projects WHERE id=?", (project["id"],))
+    ws = thread_ws(proj, db.one("SELECT * FROM threads WHERE id=?", (t["id"],)))
+    (ws / "informe.html").write_text("<h1>Informe</h1><img src='grafico.png'><img src='../../../../x.png'><script>fetch('/api/projects')</script>")
+    (ws / "grafico.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 20)
+    (ws / "datos.docx").write_bytes(b"PK\x03\x04\x00binary-docx")
+    url = f"/api/threads/{t['id']}/file?path="
+    r = alice.get(url + "informe.html&view=1")
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/html")
+    assert "data:image/png;base64," in r.text and "../../../../x.png" in r.text  # local image inlined, outside one untouched
+    csp = r.headers["content-security-policy"]
+    assert csp.startswith("sandbox allow-scripts") and "allow-same-origin" not in csp and "connect-src 'none'" in csp
+    d = alice.get(url + "datos.docx&download=1")  # a real file, not JSON
+    assert d.status_code == 200 and d.content.startswith(b"PK") and "attachment" in d.headers["content-disposition"]
+    assert alice.get(url + "datos.docx&view=1").json()["binary"] is True  # view only applies to html/svg
+    assert alice.get(url + "../../../etc/passwd&download=1").status_code in (400, 403, 404)

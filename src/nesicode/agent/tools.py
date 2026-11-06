@@ -290,7 +290,11 @@ SHOW_IMAGE = ToolSpec(
 SHARE_FILE = ToolSpec(
     "share_file",
     "Give the user a file you created (presentation, spreadsheet, document, PDF, chart, zip...) as a "
-    "download card in the chat. Use it for every deliverable file the user asked for.",
+    "download card in the chat. Use it for every deliverable file the user asked for. "
+    "HTML files (.html) are shown as a live page right inside the chat: when the user asks for a report, a summary, "
+    "a dashboard, a table, a landing or anything visual without naming a file format, write ONE self-contained "
+    "HTML file (inline CSS and JS, data embedded; it cannot fetch anything at runtime — libraries only via <script src> "
+    "from cdn.jsdelivr.net, cdnjs.cloudflare.com or unpkg.com) with a clean, readable design, then share_file it.",
     {"type": "object", "properties": {
         "path": {"type": "string"},
         "caption": {"type": "string", "description": "One line about what the file is."},

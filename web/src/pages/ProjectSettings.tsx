@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { api } from '../api'
+import { api, type Profile } from '../api'
 import { useApp, useProject } from '../App'
 import ProvidersSection, { RolePicker } from '../components/Providers'
 import ConnectorsSection from '../components/Connectors'
@@ -84,6 +84,8 @@ export default function ProjectSettings() {
         <button className="btn primary">{t('Guardar')}</button>
       </form>
 
+      <ProfileCard projectId={project.id} current={project.profile || 'general'} onChanged={() => refreshProjects()} />
+
       <div className="card form">
         <h3>{t('Modelos por función')}</h3>
         <RolePicker label={t('Chat')} hint={t('el agente que trabaja en las conversaciones')} value={form.executor_model} onChange={set('executor_model')} />
@@ -122,6 +124,43 @@ export default function ProjectSettings() {
         <h3>{t('Zona peligrosa')}</h3>
         <button className="btn danger" onClick={remove}>{t('Eliminar proyecto')}</button>
       </div>
+    </div>
+  )
+}
+
+function ProfileCard({ projectId, current, onChanged }: { projectId: number; current: string; onChanged: () => void }) {
+  useLang()
+  const [profiles, setProfiles] = useState<Profile[]>([])
+  const [pick, setPick] = useState(current)
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState('')
+  useEffect(() => { api.get<Profile[]>('/api/profiles').then(setProfiles).catch(() => {}) }, [])
+  useEffect(() => setPick(current), [current])
+  const apply = async () => {
+    setBusy(true); setMsg('')
+    try {
+      const r = await api.post<{ harness_version: number }>(`/api/projects/${projectId}/profile`, { profile: pick })
+      setMsg(t('Perfil aplicado: nueva versión del harness v{v} (lo que el proyecto ya había aprendido se conserva).', { v: r.harness_version }))
+      onChanged()
+    } catch (e) { setMsg((e as Error).message) } finally { setBusy(false) }
+  }
+  return (
+    <div className="card form">
+      <h3>{t('Perfil')}</h3>
+      <p className="muted small">{t('Define el tono, las reglas y las skills del agente en este proyecto.')}</p>
+      <div className="profile-grid">
+        {profiles.map((p) => (
+          <button type="button" key={p.id} className={`profile-card ${pick === p.id ? 'on' : ''}`} onClick={() => setPick(p.id)}>
+            <span className="profile-icon">{p.icon}</span>
+            <b>{t(p.label)}{p.id === current ? ` · ${t('actual')}` : ''}</b>
+            <span className="muted small">{t(p.description)}</span>
+          </button>
+        ))}
+      </div>
+      <div className="row">
+        <button className="btn primary" disabled={busy || pick === current} onClick={apply}>{busy ? '…' : t('Cambiar perfil')}</button>
+      </div>
+      {msg && <div className="ok-box small">{msg}</div>}
     </div>
   )
 }

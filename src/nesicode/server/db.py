@@ -223,6 +223,8 @@ MIGRATIONS = [
     ("threads", "title_locked", "INTEGER NOT NULL DEFAULT 0"),
     # when the agent may use a connector: mention (only if the user names it) | auto | ask (approve every use)
     ("user_connectors", "usage", "TEXT NOT NULL DEFAULT 'mention'"),
+    # project profile: general | security | webdev | data | docs (a harness overlay, see harness/profiles.py)
+    ("projects", "profile", "TEXT NOT NULL DEFAULT 'general'"),
     # per-conversation execution mode ('' = the user's default) and tools allowed "always" in it
     ("threads", "exec_mode", "TEXT NOT NULL DEFAULT ''"),
     # main folder picked by the user on disk ('' = nesicode keeps the files in its data dir)

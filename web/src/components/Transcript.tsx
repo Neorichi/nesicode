@@ -140,12 +140,49 @@ function ApprovalCard({ req, runId, decision, live }: { req: RunEvent; runId?: n
 
 const FILE_ICON: Record<string, string> = { pptx: '▤', ppt: '▤', key: '▤', xlsx: '▦', xls: '▦', csv: '▦', docx: '¶', doc: '¶', pdf: '◧', zip: '◫', png: '▣', jpg: '▣', jpeg: '▣', svg: '▣' }
 
+function HtmlPreview({ path, name, src }: { path: string; name: string; src: string }) {
+  const { tid } = useParams()
+  const [big, setBig] = useState(false)
+  const [key, setKey] = useState(0)
+  const view = `/api/threads/${tid}/file?path=${encodeURIComponent(path)}&view=1`
+  const frame = (cls: string) => (
+    // sandboxed: the generated page cannot read the app, its cookies or its API
+    <iframe key={key} className={cls} src={view} title={name} sandbox="allow-scripts allow-popups allow-modals allow-downloads" />
+  )
+  return (
+    <div className="html-preview">
+      <div className="html-preview-bar">
+        <span className="file-icon ext-html">{'</>'}</span>
+        <b className="html-preview-name">{name}</b>
+        <span className="row">
+          <button className="btn small ghost" title={t('Recargar')} onClick={() => setKey((k) => k + 1)}>↻</button>
+          <button className="btn small" onClick={() => setBig(true)}>⤢ {t('Abrir en grande')}</button>
+          <button className="btn small" onClick={() => downloadFile(src, name)}>{t('Descargar')}</button>
+        </span>
+      </div>
+      {frame('html-frame')}
+      {big && (
+        <div className="html-modal" onClick={() => setBig(false)}>
+          <div className="html-modal-inner" onClick={(e) => e.stopPropagation()}>
+            <div className="html-preview-bar">
+              <b className="html-preview-name">{name}</b>
+              <button className="btn small" onClick={() => setBig(false)}>✕ {t('Cerrar')}</button>
+            </div>
+            {frame('html-frame big')}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function FileCard({ path, size, caption }: { path: string; size?: number; caption?: string }) {
   const { tid } = useParams()
   const src = `/api/threads/${tid}/file?path=${encodeURIComponent(path)}&download=1`
   const name = path.split('/').pop() || path
   const ext = name.split('.').pop()?.toLowerCase() ?? ''
   const kb = size ? (size < 1024 * 1024 ? `${Math.max(1, Math.round(size / 1024))} KB` : `${(size / 1024 / 1024).toFixed(1)} MB`) : ''
+  if (ext === 'html' || ext === 'htm') return <HtmlPreview path={path} name={name} src={src} />
   return (
     <div className="file-card">
       <span className={`file-icon ext-${ext}`}>{FILE_ICON[ext] ?? '◆'}</span>

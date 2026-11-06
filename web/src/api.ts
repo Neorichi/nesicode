@@ -16,6 +16,7 @@ export type Project = {
   vision_model: string
   image_model: string
   transcribe_model?: string
+  profile?: string
 }
 
 export type Thread = { id: number; project_id: number; title: string; isolated: number; exec_mode?: string; effective_mode?: string; telegram?: { linked: boolean; attached: boolean }; bot?: any; created_at: number; updated_at: number }
@@ -187,3 +188,5 @@ export const OS: 'mac' | 'win' | 'linux' = /Mac|iPhone|iPad/.test(navigator.plat
 export function fileManager(): string {
   return OS === 'mac' ? 'Finder' : OS === 'win' ? t('el Explorador de archivos') : t('el gestor de archivos')
 }
+
+export type Profile = { id: string; label: string; icon: string; description: string; domain: string }

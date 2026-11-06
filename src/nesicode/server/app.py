@@ -1300,6 +1300,7 @@ class ProjectCreate(BaseModel):
     transcribe_model: str = Field(default="", max_length=200)
     folder: str = Field(default="", max_length=1000)  # an existing folder on this machine (local mode only)
     use_template: bool = False  # start from the imported project template (models, check command, harness)
+    profile: str = Field(default="general", pattern="^[a-z0-9_-]{1,30}$")
 
 
 class ProjectPatch(BaseModel):
@@ -1382,6 +1383,10 @@ def create_project(body: ProjectCreate, user: dict = Depends(current_user)):
             setattr(body, k, v)
     ex = check_model(body.executor_model or default_model(user, settings.default_executor_model), user)
     im = check_model(body.improver_model or default_model(user, settings.default_improver_model), user)
+    if body.domain in ("", "general") and body.profile not in ("", "general"):
+        from ..harness.profiles import PROFILES as _P
+
+        body.domain = (_P.get(body.profile) or {}).get("domain", "general")
     domain = re.sub(r"[^a-z0-9_-]+", "-", (body.domain or "general").strip().lower()).strip("-") or "general"
     vm = check_model(body.vision_model.strip(), user) if body.vision_model.strip() else default_model(user, "", "vision_model")
     gm = check_model(body.image_model.strip(), user) if body.image_model.strip() else ""
@@ -1393,13 +1398,18 @@ def create_project(body: ProjectCreate, user: dict = Depends(current_user)):
         (user["id"], body.name.strip(), domain, ex, im, body.check_command.strip(), body.max_steps, time.time(), vm, gm,
          folder, tm),
     )
-    harness, note = base_harness(), "Harness base de nesicode"
+    from ..harness.profiles import PROFILES, detect_profile, profile_harness
+
+    profile = body.profile if body.profile in PROFILES else "general"
+    harness, note = profile_harness(profile), f"Harness base de nesicode · perfil {PROFILES[profile]['label']}"
     if tpl and tpl.get("harness") and not validate(tpl["harness"]):
         harness, note = tpl["harness"], f"Importado de «{tpl.get('from', 'otro equipo')}»"
+        profile = detect_profile(harness)
     db.execute(
         "INSERT INTO harness_versions (project_id, version, files, source, note, created_at) VALUES (?, 1, ?, 'base', ?, ?)",
         (pid, json.dumps(harness), note, time.time()),
     )
+    db.execute("UPDATE projects SET profile=? WHERE id=?", (profile, pid))
     p = db.one("SELECT * FROM projects WHERE id=?", (pid,))
     ws = project_ws(p)
     ws.mkdir(parents=True, exist_ok=True)
@@ -1437,6 +1447,37 @@ def patch_project(project_id: int, body: ProjectPatch, user: dict = Depends(curr
         sets = ", ".join(f"{k}=?" for k in fields)
         db.execute(f"UPDATE projects SET {sets} WHERE id=?", (*fields.values(), project_id))
     return project_view(get_project(user, project_id))
+
+
+@app.get("/api/profiles")
+def list_profiles(user: dict = Depends(current_user)):
+    from ..harness.profiles import profile_list
+
+    return profile_list()
+
+
+class ProfileChange(BaseModel):
+    profile: str = Field(pattern="^[a-z0-9_-]{1,30}$")
+
+
+@app.post("/api/projects/{project_id}/profile")
+def change_profile(project_id: int, body: ProfileChange, user: dict = Depends(current_user)):
+    """Switch the project's profile: a new harness version with the new profile's blocks and skills
+    (everything else the harness learned is kept; older versions stay in the history)."""
+    from ..harness.profiles import PROFILES, apply_profile
+
+    p = get_project(user, project_id)
+    if body.profile not in PROFILES:
+        raise HTTPException(422, "Perfil desconocido")
+    files = apply_profile(current_harness(db, p), body.profile)
+    errors = validate(files)
+    if errors:
+        raise HTTPException(422, "; ".join(errors))
+    v = save_harness_version(db, project_id, files, "manual", f"Perfil: {PROFILES[body.profile]['label']}")
+    db.execute("UPDATE projects SET profile=? WHERE id=?", (body.profile, project_id))
+    if p.get("domain") in ("general", "", None) or p.get("domain") == (PROFILES.get(p.get("profile") or "general") or {}).get("domain"):
+        db.execute("UPDATE projects SET domain=? WHERE id=?", (PROFILES[body.profile]["domain"], project_id))
+    return {**project_view(get_project(user, project_id)), "harness_version": v}
 
 
 @app.delete("/api/projects/{project_id}")
@@ -1762,12 +1803,57 @@ def thread_tree(thread_id: int, user: dict = Depends(current_user)):
     return out
 
 
+def _inline_local_images(body: bytes, page: Path, root: Path) -> bytes:
+    """<img src="chart.png"> next to the page → data: URI, so a sandboxed page still shows its local images."""
+    import base64 as _b64
+
+    html = body.decode("utf-8", "replace")
+
+    def repl(m):
+        quote, ref = m.group(2), m.group(3)
+        if re.match(r"^(https?:|data:|blob:|#|/)", ref):
+            return m.group(0)
+        try:
+            target = (page.parent / ref.split("?")[0]).resolve()
+            target.relative_to(root.resolve())  # never outside the conversation's workspace
+        except (ValueError, OSError):
+            return m.group(0)
+        mime = image_mime(target.name)
+        if not mime or not target.is_file() or target.stat().st_size > 5 * 1024 * 1024:
+            return m.group(0)
+        return f"{m.group(1)}{quote}data:{mime};base64,{_b64.b64encode(target.read_bytes()).decode()}{quote}"
+
+    return re.sub(r"""(<img\b[^>]*?\bsrc=)(["'])([^"']+)\2""", repl, html, flags=re.I).encode()
+
+
+HTML_SANDBOX_CSP = (
+    # generated pages run in an opaque origin: no cookies, no access to the app or its API, no network calls
+    "sandbox allow-scripts allow-popups allow-modals allow-downloads; default-src 'none'; "
+    "script-src 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://unpkg.com; "
+    "style-src 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; font-src data: https://fonts.gstatic.com; "
+    "img-src data: blob: https:; media-src data: blob:; connect-src 'none'; frame-ancestors 'self'"
+)
+
+
 @app.get("/api/threads/{thread_id}/file")
-def thread_file(thread_id: int, path: str, user: dict = Depends(current_user)):
+def thread_file(thread_id: int, path: str, download: int = 0, view: int = 0, user: dict = Depends(current_user)):
     t, p = get_thread(user, thread_id)
     f = _in(thread_ws(p, t), path)
     if not f.is_file():
         raise HTTPException(404, "Fichero no encontrado")
+    if download:
+        import mimetypes
+
+        return FileResponse(f, media_type=mimetypes.guess_type(f.name)[0] or "application/octet-stream", filename=f.name)
+    if view and f.suffix.lower() in (".html", ".htm", ".svg"):
+        if f.stat().st_size > 15 * 1024 * 1024:
+            raise HTTPException(413, "Demasiado grande para verlo aquí: descárgalo")
+        body = f.read_bytes()
+        if f.suffix.lower() in (".html", ".htm"):
+            body = _inline_local_images(body, f, thread_ws(p, t))
+        return Response(body, media_type="image/svg+xml" if f.suffix.lower() == ".svg" else "text/html; charset=utf-8",
+                        headers={"Content-Security-Policy": HTML_SANDBOX_CSP, "X-Content-Type-Options": "nosniff",
+                                 "Cache-Control": "no-store"})
     if image_mime(f.name):
         return FileResponse(f, media_type=image_mime(f.name))
     data = f.read_bytes()[:300_000]

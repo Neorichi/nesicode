@@ -87,7 +87,7 @@ def build(db: DB, user_id: int, *, project_id: int | None, include_telegram: boo
             doc["project_template"] = {
                 "from": p["name"],
                 **{k: p.get(k) for k in ("executor_model", "improver_model", "vision_model", "image_model",
-                                         "transcribe_model", "check_command", "max_steps", "domain")},
+                                         "transcribe_model", "check_command", "max_steps", "domain", "profile")},
                 "harness": loads(h["files"], {}) if h else {},
             }
     doc["bots"] = []

@@ -601,3 +601,21 @@ label.inline { display: flex; align-items: center; gap: 8px; flex-direction: row
 .bot-trigger-prompt summary { cursor: pointer; }
 .bot-trigger-prompt div { margin-top: 4px; white-space: pre-wrap; color: var(--ink-2); max-width: 600px; }
 .usage-select { font-size: 12.5px; padding: 3px 6px; border-radius: 7px; max-width: 190px; }
+
+/* profiles */
+.profile-pick { display: flex; flex-direction: column; gap: 6px; }
+.profile-pick-label { font-size: 13.5px; font-weight: 500; color: var(--ink-2); }
+.profile-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 8px; }
+.profile-card { display: flex; flex-direction: column; gap: 4px; text-align: left; padding: 10px 12px; border: 1px solid var(--line-2); border-radius: 10px; background: var(--panel); color: var(--ink); cursor: pointer; font: inherit; }
+.profile-card:hover { border-color: var(--accent); }
+.profile-card.on { border-color: var(--accent); background: var(--accent-soft); }
+.profile-icon { font-size: 18px; line-height: 1; }
+
+/* HTML deliverables shown live in the chat */
+.html-preview { border: 1px solid var(--line-2); border-radius: 12px; overflow: hidden; margin: 10px 0; background: var(--panel); }
+.html-preview-bar { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+.html-preview-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13.5px; }
+.html-frame { display: block; width: 100%; height: 460px; border: 0; background: #fff; resize: vertical; }
+.html-modal { position: fixed; inset: 0; z-index: 1000; background: rgba(0, 0, 0, .55); display: grid; place-items: center; padding: 24px; }
+.html-modal-inner { width: min(1400px, 100%); height: 100%; display: flex; flex-direction: column; background: var(--panel); border-radius: 12px; overflow: hidden; }
+.html-frame.big { flex: 1; height: auto; resize: none; }

@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { api, type Project } from '../api'
+import { api, type Profile, type Project } from '../api'
 import { useApp } from '../App'
 import { t, useLang } from '../i18n'
 import '../components/ImageViewer'
@@ -19,6 +19,9 @@ export default function NewProject() {
   const [busy, setBusy] = useState(false)
   const native = !!window.pywebview?.api?.pick_folder
   const [tpl, reloadTpl] = useProjectTemplate()
+  const [profiles, setProfiles] = useState<Profile[]>([])
+  const [profile, setProfile] = useState('general')
+  useEffect(() => { api.get<Profile[]>('/api/profiles').then(setProfiles).catch(() => {}) }, [])
   const [useTpl, setUseTpl] = useState(true)
   const [showImport, setShowImport] = useState(false)
 
@@ -35,7 +38,7 @@ export default function NewProject() {
     setBusy(true)
     setError('')
     try {
-      const p = await api.post<Project>('/api/projects', { name: name.trim() || baseName(folder) || t('Proyecto'), folder, use_template: !!tpl && useTpl })
+      const p = await api.post<Project>('/api/projects', { name: name.trim() || baseName(folder) || t('Proyecto'), folder, use_template: !!tpl && useTpl, profile })
       await refreshProjects()
       navigate(`/p/${p.id}`)
     } catch (err) {
@@ -81,6 +84,21 @@ export default function NewProject() {
             placeholder={baseName(folder) || t('mi-proyecto')}
           />
         </label>
+
+        {profiles.length > 0 && !(tpl && useTpl) && (
+          <div className="profile-pick">
+            <div className="profile-pick-label">{t('Perfil')}</div>
+            <div className="profile-grid">
+              {profiles.map((p) => (
+                <button type="button" key={p.id} className={`profile-card ${profile === p.id ? 'on' : ''}`} onClick={() => setProfile(p.id)}>
+                  <span className="profile-icon">{p.icon}</span>
+                  <b>{t(p.label)}</b>
+                  <span className="muted small">{t(p.description)}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
 
         {tpl && (
           <label className="check">
