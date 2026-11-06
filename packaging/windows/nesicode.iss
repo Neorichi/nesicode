@@ -1,7 +1,7 @@
 ; Inno Setup script: builds dist\nesicode-<version>-windows-x64-setup.exe from dist\nesicode\ (PyInstaller)
 ; Per-user install: no administrator rights needed.
 #ifndef AppVersion
-  #define AppVersion "0.2.0"
+  #define AppVersion "0.3.0"
 #endif
 
 [Setup]
