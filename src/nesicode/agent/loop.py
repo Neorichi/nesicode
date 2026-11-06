@@ -141,6 +141,7 @@ class Agent:
         self._compactions = 0
         self._compact_mark = 0
         self._masked_at = 0
+        self._display = 0
         self.events: list[dict] = []
         try:
             self.hooks = Hooks(harness_hooks(harness))
@@ -176,12 +177,15 @@ class Agent:
         """Keep the most recent earlier turns that fit in ~30% of the context window."""
         if not self.context_limit:
             return history[-20:]
-        budget = int(self.context_limit * 0.3) - len(system) // 3
+        budget = int(self.context_limit * 0.3) - len(system) // 4
         kept: list[tuple[str, str]] = []
         for u, a in reversed(history[-20:]):
-            cost = (len(u) + len(a)) // 3
+            cost = (len(u) + len(a)) // 4
+            if cost > budget and len(a) > 3_000:  # too big: keep its head and tail instead of dropping everything older
+                a = a[:1_500] + "\n[... middle of this earlier turn omitted; search_history has it ...]\n" + a[-1_500:]
+                cost = (len(u) + len(a)) // 4
             if cost > budget:
-                break
+                continue
             budget -= cost
             kept.append((u, a))
         return list(reversed(kept))
@@ -397,10 +401,17 @@ class Agent:
             options.max_tokens = out_budget
             used = 0
             conv = provider.conversation(model, system, self.tool_specs(), options)
-            for user_text, assistant_text in self._fit_history(history or [], system):
+            fitted = self._fit_history(history or [], system)
+            for user_text, assistant_text in fitted:
                 conv.add_user(user_text)
                 conv.add_assistant_text(assistant_text)
             conv.add_user(task)
+            # Context meter: starts from what this message really sends, then only grows within the turn
+            # (it drops only when masking/compaction frees room, and says so).
+            self._display = (len(system) + sum(len(u) + len(a) for u, a in fitted) + len(task)) // 4
+            if self.context_limit:
+                self.emit({"type": "context", "used": self._display, "limit": self.context_limit, "reason": "new_message"},
+                          persist=False)
             compactions = 0  # kept for the learned-limit path
             self.emit({"type": "start", "model": self.model_spec, "task": task[:4000]})
             nudged = False
@@ -451,7 +462,8 @@ class Agent:
                     return AgentResult(final_text, "refusal", steps, usage, self.events)
                 if not turn.tool_calls or nudged:
                     status = "max_steps" if nudged else "done"
-                    ctx = {"used": turn.usage.input_tokens + turn.usage.output_tokens, "limit": self.context_limit}
+                    self._display = max(self._display, turn.usage.input_tokens + _visible(turn) // 4)
+                    ctx = {"used": self._display, "limit": self.context_limit}
                     self.emit({"type": "done", "status": status, "steps": steps, "usage": usage.to_dict(), "context": ctx})
                     return AgentResult(final_text, status, steps, usage, self.events)
                 results = []
@@ -466,22 +478,29 @@ class Agent:
                     })
                     results.append(res)
                 conv.add_tool_results(results)
-                used = turn.usage.input_tokens + turn.usage.output_tokens + sum(len(r.content) for r in results) // 3
+                # what the NEXT request will carry: this prompt + the visible reply (reasoning is not sent back)
+                # + the new tool results (~4 chars per token)
+                used = turn.usage.input_tokens + (_visible(turn) + sum(len(r.content) for r in results)) // 4
+                reason = ""
                 if self.context_limit:
                     lim = self.context_limit
                     # Layer 1: mask old tool outputs (no LLM), in batches, with hysteresis.
                     if used > ctxm.MASK_AT * lim and used - self._masked_at > ctxm.min_freed_tokens(lim):
                         freed = conv.mask_tool_results(ctxm.KEEP_RESULTS, self._marker)
                         if freed // 3 >= ctxm.min_freed_tokens(lim) // 2:
-                            used -= freed // 3
-                            self.emit({"type": "masked", "freed": freed // 3, "used": used, "limit": lim})
+                            used -= freed // 4
+                            reason = "masked"
+                            self.emit({"type": "masked", "freed": freed // 4, "used": used, "limit": lim})
                         self._masked_at = used
                     # Layer 2: structured summary.
                     if used > ctxm.SUMMARY_AT * lim and self._compactions < ctxm.MAX_COMPACTIONS:
                         conv = self._compact(provider, model, system, options, task, used)
-                        used = 0
+                        used = (len(system) + len(self._summary or "")) // 4
+                        reason = "compacted"
                         self._masked_at = 0
-                    self.emit({"type": "context", "used": used, "limit": lim}, persist=False)
+                    self._display = used if reason else max(self._display, used)
+                    self.emit({"type": "context", "used": self._display, "limit": lim, **({"reason": reason} if reason else {})},
+                              persist=False)
                 if steps >= self.max_steps:
                     conv.add_user(FINAL_NUDGE)
                     nudged = True
@@ -501,6 +520,11 @@ class Agent:
             msg = f"{type(exc).__name__}: {exc}"
             self.emit({"type": "error", "text": msg})
             return AgentResult(final_text, "error", steps, usage, self.events, error=msg)
+
+
+def _visible(turn) -> int:
+    """Characters of a reply that go back into the conversation (text + tool calls; not the reasoning)."""
+    return len(turn.text or "") + sum(len(json.dumps(c.arguments, ensure_ascii=False)) + len(c.name) for c in turn.tool_calls)
 
 
 def trajectory_text(events: list[dict], max_chars: int = 30_000) -> str:

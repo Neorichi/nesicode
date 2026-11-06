@@ -13,6 +13,7 @@ Nothing is lost: transcripts and outputs live in .nesicode/, searchable with `se
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from pathlib import Path
@@ -221,22 +222,100 @@ def search_history(ws: Workspace, args: dict, archive: str = ".nesicode") -> str
         rx = re.compile(query, re.I)
     except re.error:
         rx = re.compile(re.escape(query), re.I)
-    hits = []
     base = ws.resolve(archive)  # only THIS conversation's archive
+    hits = _search(ws, base, rx)
+    if hits:
+        return hits
+    # nothing verbatim: any of the words (4+ letters), then close spellings ("ckeifor" → "ckeditor")
+    words = [w for w in re.findall(r"[\w./-]{4,}", query.lower())]
+    if not words:
+        return "no matches in this conversation's history"
+    hits = _search(ws, base, re.compile("|".join(re.escape(w) for w in words), re.I))
+    if hits:
+        return "(no exact match; lines with any of the words)\n" + hits
+    import difflib
+
+    vocab = set()
+    for f in _archive_files(base):
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace").lower()
+            vocab.update(re.findall(r"[a-z]{4,}|[a-z0-9_]{4,}", text)[:300_000])
+        except OSError:
+            continue
+    terms = {t for w in words for t in re.findall(r"[a-z]{4,}|[a-z0-9_]{4,}", w)}
+    close = {m for w in terms for m in difflib.get_close_matches(w, vocab, n=3, cutoff=0.75)}
+    if close:
+        hits = _search(ws, base, re.compile("|".join(re.escape(w) for w in sorted(close)), re.I))
+        if hits:
+            return f"(no exact match; similar words: {', '.join(sorted(close))})\n" + hits
+    return "no matches in this conversation's history"
+
+
+def _archive_files(base):
     for sub in ("context", "outputs"):
         d = base / sub
-        if not d.is_dir():
+        if d.is_dir():
+            yield from sorted((f for f in d.rglob("*") if f.is_file()), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _search(ws, base, rx) -> str:
+    hits = []
+    for f in _archive_files(base):
+        try:
+            lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
             continue
-        for f in sorted(d.rglob("*"), key=lambda p: p.stat().st_mtime, reverse=True):
-            if not f.is_file():
-                continue
-            try:
-                lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
-                continue
-            for i, line in enumerate(lines, 1):
-                if rx.search(line):
-                    hits.append(f"{ws.rel(f)}:{i}: {line.strip()[:240]}")
-                    if len(hits) >= 80:
-                        return "\n".join(hits) + "\n... (more matches; refine the query)"
-    return "\n".join(hits) or "no matches in this conversation's history"
+        for i, line in enumerate(lines, 1):
+            if rx.search(line):
+                hits.append(f"{ws.rel(f)}:{i}: {redact(line.strip()[:240])}")
+                if len(hits) >= 80:
+                    return "\n".join(hits) + "\n... (more matches; refine the query)"
+    return "\n".join(hits)
+
+
+# ------------------------------------------------------------------ cross-turn continuity
+_SECRET_RX = re.compile(
+    r"(?i)((?:csrf[_-]?token|csrftoken|sessionid|session|token|access[_-]?token|refresh[_-]?token|api[_-]?key|apikey|"
+    r"secret|password|passwd|pwd|auth[a-z_]*|cookie|set-cookie|x-csrftoken|bearer)\s*[\"']?\s*[:=]\s*[\"']?\s*)"
+    r"([A-Za-z0-9._~+/=%-]{6,})")
+_BEARER_RX = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
+_HTTP_RX = re.compile(r"(?m)^(?:HTTP/[\d.]+\s+(\d{3})[^\n]*|.*\b(?:status(?:_code)?|code)[\"' :=]+(\d{3})\b.*)$")
+
+
+def redact(text: str) -> str:
+    """Hide credential/session values (header and cookie names stay) before text is carried between turns."""
+    text = _BEARER_RX.sub(r"\1<redacted>", text)  # first: "Authorization: Bearer <token>"
+    return _SECRET_RX.sub(lambda m: m.group(0) if m.group(2) == "<redacted>" or m.group(2).lower() == "bearer"
+                          else m.group(1) + "<redacted>", text)
+
+
+def run_digest(events: list[dict], max_chars: int = 4_000) -> str:
+    """What a turn did, without an LLM: commands run, key observations, URLs/HTTP codes, files and its last words.
+    Used so a stopped or finished turn's discoveries reach the next message."""
+    calls = [e for e in events if e.get("type") == "tool_call" and not e.get("depth")]
+    results = {e.get("id"): e for e in events if e.get("type") == "tool_result" and not e.get("depth")}
+    lines: list[str] = []
+    for c in calls[-10:]:
+        args = c.get("args") or {}
+        what = args.get("command") or args.get("path") or args.get("url") or json.dumps(args, ensure_ascii=False)
+        r = results.get(c.get("id")) or {}
+        out = (r.get("output") or "").strip()
+        status = " ".join(sorted({m.group(1) or m.group(2) for m in _HTTP_RX.finditer(out) if m.group(1) or m.group(2)})[:3])
+        first = next((ln for ln in out.splitlines() if ln.strip()), "")[:220]
+        tag = "ERROR" if r.get("is_error") else ("HTTP " + status if status else "")
+        lines.append(f"- {c.get('name')}: {str(what)[:300]}" + (f"\n  → {tag + ' · ' if tag else ''}{first}" if first or tag else ""))
+    text = "\n".join(e.get("text", "") for e in events if e.get("type") in ("assistant", "tool_call", "tool_result"))
+    anchors = extract_anchors(text + "\n" + "\n".join(str((e.get("args") or {})) for e in calls), limit=12)
+    parts = [f"Steps run: {len(calls)}."]
+    if lines:
+        parts.append("Last actions and what they returned:\n" + "\n".join(lines))
+    keep = {k: v for k, v in anchors.items() if k in ("urls", "files", "errors")}
+    if keep.get("errors"):
+        keep["errors"] = keep["errors"][-4:]
+    if keep:
+        parts.append(anchors_block(keep).replace("## Exact identifiers (extracted mechanically — use them verbatim)\n", "Identifiers seen:\n"))
+    said = [e.get("text", "") for e in events if e.get("type") == "assistant" and e.get("text") and not e.get("depth")]
+    if said:
+        parts.append("Its last words: " + said[-1].strip()[:600])
+    out = redact("\n".join(parts))
+    return out if len(out) <= max_chars else out[: max_chars - 40] + "\n[... digest cut ...]"

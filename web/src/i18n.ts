@@ -105,7 +105,7 @@ const EN: Record<string, string> = {
   'Contexto aligerado: {n} tokens de salidas antiguas apartados (siguen guardados en disco).': 'Context lightened: {n} tokens of old outputs set aside (still saved on disk).',
   'medido': 'measured',
   'El modelo indicó su límite real: {n} tokens. Guardado; compacto y sigo.': 'The model reported its real limit: {n} tokens. Saved; compacting and continuing.',
-  'Contexto usado en el último paso: {u} de {l} tokens. Al pasar del 75% se compacta automáticamente.': 'Context used in the last step: {u} of {l} tokens. Past 75% it is compacted automatically.',
+  'Contexto: {u} de {l} tokens. Al 49% se aligeran las salidas antiguas de herramientas y al 67% se resume la conversación (siempre queda todo en el archivo de la conversación).': 'Context: {u} of {l} tokens. At 49% old tool outputs are trimmed and at 67% the conversation is summarized (everything stays in the conversation archive).',
   'Contexto compactado ({u} de {l} tokens): el agente sigue con un resumen de lo hecho.': 'Context compacted ({u} of {l} tokens): the agent continues from a summary of the work so far.',
   'Ocultar resumen': 'Hide summary',
   'Ver resumen': 'Show summary',
@@ -842,4 +842,6 @@ const EN: Record<string, string> = {
   'Cambiar perfil': 'Change profile',
   'Recargar': 'Reload',
   'Abrir en grande': 'Open large',
+  'Blank': 'Blank',
+  'Totalmente limpio: sin instrucciones, sin reglas, sin tono y sin skills. Solo el modelo y sus herramientas.': 'Completely clean: no instructions, no rules, no tone and no skills. Just the model and its tools.',
 }

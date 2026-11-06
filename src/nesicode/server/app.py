@@ -672,6 +672,9 @@ bots.start()  # scheduler thread (off with NESICODE_NO_SCHEDULER)
 
 # ------------------------------------------------------------------------ bots
 def _bot_view(b: dict, full: bool = False) -> dict:
+    if not b.get("thread_id") or not db.one("SELECT id FROM threads WHERE id=?", (b["thread_id"],)):
+        bots.ensure_thread(b)  # its conversation was deleted earlier: give it a fresh one, never a dead link
+        b = db.one("SELECT * FROM bots WHERE id=?", (b["id"],))
     trig = db.all("SELECT * FROM bot_triggers WHERE bot_id=? ORDER BY id", (b["id"],))
     last = db.one("SELECT id, status, trigger, created_at, finished_at FROM runs WHERE bot_id=? ORDER BY id DESC LIMIT 1", (b["id"],))
     project = db.one("SELECT name FROM projects WHERE id=?", (b["project_id"],))
@@ -1773,6 +1776,11 @@ def delete_thread(thread_id: int, user: dict = Depends(current_user)):
     t, p = get_thread(user, thread_id)
     for r in db.all("SELECT id FROM runs WHERE thread_id=?", (thread_id,)):
         jobs.cancel(r["id"])
+    # a bot IS its conversation: deleting the conversation deletes the bot (triggers, memory, webhook secret)
+    for b in db.all("SELECT id FROM bots WHERE thread_id=? AND user_id=?", (thread_id, user["id"])):
+        vault.delete(user["id"], f"bot:{b['id']}:webhook")
+        db.execute("UPDATE runs SET bot_id=NULL WHERE bot_id=?", (b["id"],))
+        db.execute("DELETE FROM bots WHERE id=?", (b["id"],))
     db.execute("DELETE FROM threads WHERE id=?", (thread_id,))
     shutil.rmtree(thread_dir(p, thread_id), ignore_errors=True)
     return {"ok": True}

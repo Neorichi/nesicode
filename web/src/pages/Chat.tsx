@@ -60,6 +60,7 @@ export default function Chat() {
     return () => clearInterval(id)
   }, [activeId, tid, statusSig, thread?.title])
 
+  useEffect(() => { setCtxLive(null) }, [activeId]) // a new message rebuilds the context: never show the previous run's value
   useEffect(() => {
     if (!activeId) return
     const run = runs.find((r) => r.id === activeId)!
@@ -406,7 +407,7 @@ function ContextMeter({ runs, live }: { runs: Run[]; live: { used: number; limit
   if (!c || !c.limit) return null
   const pct = Math.min(100, Math.round((c.used / c.limit) * 100))
   return (
-    <span className={`ctx-meter ${pct >= 75 ? 'hi' : pct >= 50 ? 'mid' : ''}`} title={t('Contexto usado en el último paso: {u} de {l} tokens. Al pasar del 75% se compacta automáticamente.', { u: c.used.toLocaleString(), l: c.limit.toLocaleString() })}>
+    <span className={`ctx-meter ${pct >= 67 ? 'hi' : pct >= 49 ? 'mid' : ''}`} title={t('Contexto: {u} de {l} tokens. Al 49% se aligeran las salidas antiguas de herramientas y al 67% se resume la conversación (siempre queda todo en el archivo de la conversación).', { u: c.used.toLocaleString(), l: c.limit.toLocaleString() })}>
       <span className="ctx-bar"><span style={{ width: `${pct}%` }} /></span>
       {fmtK(c.used)} / {fmtK(c.limit)}
     </span>

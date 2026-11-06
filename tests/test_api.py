@@ -1010,3 +1010,19 @@ def test_html_deliverables_and_downloads(alice, project):
     assert d.status_code == 200 and d.content.startswith(b"PK") and "attachment" in d.headers["content-disposition"]
     assert alice.get(url + "datos.docx&view=1").json()["binary"] is True  # view only applies to html/svg
     assert alice.get(url + "../../../etc/passwd&download=1").status_code in (400, 403, 404)
+
+
+def test_deleting_bot_conversation_deletes_bot(alice, project):
+    from nesicode.server.app import db
+
+    b = alice.post("/api/bots", json=_bot_body(project)).json()
+    assert alice.delete(f"/api/threads/{b['thread_id']}").json()["ok"]
+    assert alice.get(f"/api/bots/{b['id']}").status_code == 404
+    assert not db.one("SELECT id FROM bot_triggers WHERE bot_id=?", (b["id"],))
+    # an orphan from before the fix gets a fresh conversation instead of "Conversación no encontrada"
+    b2 = alice.post("/api/bots", json=_bot_body(project, name="Huérfano")).json()
+    db.execute("DELETE FROM threads WHERE id=?", (b2["thread_id"],))
+    again = alice.get(f"/api/bots/{b2['id']}").json()
+    assert again["thread_id"]  # (SQLite may reuse the same id)
+    view = alice.get(f"/api/threads/{again['thread_id']}").json()
+    assert view["thread"]["title"].startswith("🤖") and view["thread"]["bot"]["id"] == b2["id"]

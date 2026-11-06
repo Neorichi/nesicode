@@ -223,6 +223,71 @@ def builtin_agent_tools(connector: str, label: str, which: str, cfg=None) -> dic
     return out
 
 
+FINISHED = ("done", "max_steps")
+STOPPED = ("cancelled", "error", "interrupted", "refusal")
+
+
+def conversation_history(db, run: dict) -> tuple[list[tuple[str, str]], dict | None]:
+    """Earlier turns of this conversation for the next message.
+
+    Finished turns bring their answer (+ a digest of their key steps for the last few that used tools);
+    stopped turns (Stop, error, app closed) bring a digest of what they did, so "continue" picks up the work;
+    the previous turn brings its full step trail. Returns (history, last turn if it was interrupted)."""
+    from ..agent.context import redact, run_digest
+    from ..agent.loop import trajectory_text
+
+    rows = db.all(
+        "SELECT id, task, final_text, status FROM runs WHERE thread_id=? AND id<>? AND kind='chat' AND created_at<=? "
+        f"AND status IN ({','.join('?' * (len(FINISHED) + len(STOPPED)))}) ORDER BY created_at, id",
+        (run["thread_id"], run["id"], run["created_at"], *FINISHED, *STOPPED),
+    )[-20:]
+    with_tools_done = 0
+    history: list[tuple[str, str]] = []
+    interrupted = None
+    for i, r in enumerate(rows):
+        events = [e for _, e in db.events_after(r["id"], 0, limit=4000)]
+        steps = sum(1 for e in events if e.get("type") == "tool_call" and not e.get("depth"))
+        last = i == len(rows) - 1
+        answer = (r["final_text"] or "").strip()
+        if r["status"] in STOPPED:
+            if not steps and not answer:
+                answer = f"[this turn was {r['status']} before doing any work]"
+            else:
+                answer = (f"[This turn was {r['status']} at step {steps} and did NOT finish. What it had done so far:]\n"
+                          + run_digest(events) + (f"\n[Partial answer] {answer[:800]}" if answer else ""))
+            if last:
+                interrupted = {"id": r["id"], "status": r["status"], "steps": steps}
+        elif steps and len(rows) - i <= 3:
+            with_tools_done += 1
+            answer += "\n\n[Key steps of this turn]\n" + run_digest(events, 2_500)
+        if last and steps:  # the previous turn travels with its full trail (bounded)
+            answer += "\n\n[PREVIOUS TURN — STEPS]\n" + redact(trajectory_text(events, 16_000))
+        history.append((r["task"], answer))
+    return history, interrupted
+
+
+def connector_context(db, run: dict, history: list[tuple[str, str]], bot: dict | None = None) -> str:
+    """Text that decides which 'only when I ask' connectors this message gets: the user's message, the last
+    turns (both sides) and the tools already used in this conversation's recent turns."""
+    used = {e.get("name", "") for r in db.all("SELECT id FROM runs WHERE thread_id=? AND id<>? ORDER BY created_at DESC LIMIT 5",
+                                              (run["thread_id"], run["id"]))
+            for _, e in db.events_after(r["id"], 0, limit=4000) if e.get("type") == "tool_call"}
+    return " ".join([run["task"]] + [h[0] + " " + h[1][:2000] for h in history[-3:]] + sorted(used)
+                    + ([bot["instructions"]] if bot else []))
+
+
+def continuity_note(thread_id: int, interrupted: dict | None) -> str:
+    note = ("# Earlier turns of this conversation\nThe messages above are this conversation's earlier turns (newest last), "
+            "including turns the user stopped. Their full steps and tool outputs are archived in "
+            f"`.nesicode/chats/{thread_id}/context/history.md` and `.nesicode/chats/{thread_id}/outputs/`: when the user says "
+            "continue / sigue / continúa, or mentions something you do not see above, call `search_history` (plain keywords; "
+            "typos are tolerated) BEFORE exploring files. Never claim to remember a finding that is not above or in a search result.")
+    if interrupted:
+        note += (f"\nThe previous turn was {interrupted['status']} at step {interrupted['steps']} without finishing: "
+                 "if the user asks to continue, resume from its digest and steps — do not start over.")
+    return note
+
+
 PATH_ARG = re.compile(r"(file|path|dir|folder|output|document|workbook|presentation|docx|xlsx|pptx)", re.I)
 
 
@@ -494,14 +559,7 @@ class Jobs:
         project = db.one("SELECT * FROM projects WHERE id=?", (run["project_id"],))
         cancel = self.cancels[run_id]
         emit = self.emitter(run_id)
-        history = [
-            (r["task"], r["final_text"])
-            for r in db.all(
-                "SELECT task, final_text FROM runs WHERE thread_id=? AND id<? AND kind='chat' "
-                "AND status IN ('done', 'max_steps') ORDER BY id",
-                (run["thread_id"], run_id),
-            )
-        ][-20:]
+        history, interrupted = conversation_history(db, run)
         thread = db.one("SELECT * FROM threads WHERE id=?", (run["thread_id"],))
         keys = user_keys(db, project["user_id"])
         vision = project.get("vision_model") or settings.vision_model
@@ -522,12 +580,14 @@ class Jobs:
             harness = current_harness(db, project)
             bot = db.one("SELECT * FROM bots WHERE id=?", (run["bot_id"],)) if run.get("bot_id") else None
             info: dict = {}
-            recent = " ".join([run["task"]] + [h[0] for h in history[-3:]] + ([bot["instructions"]] if bot else []))
+            # "only when I ask": the user's recent words, the agent's recent answers and the connectors already used in
+            # this conversation keep a connector available (no need to repeat its name every message)
+            recent = connector_context(db, run, history, bot)
             tools = self.connector_tools(project["user_id"], emit, context=recent, info=info)
             tools.update(self.chat_tools(project, emit))
-            note = ""
+            note = continuity_note(thread["id"], interrupted)
             if info["on_request"]:
-                note = ("# Connectors available on request\nThe user has these connectors but wants them used ONLY when they "
+                note += ("\n\n" if note else "") + ("# Connectors available on request\nThe user has these connectors but wants them used ONLY when they "
                         "explicitly ask for them by name: " + ", ".join(sorted(set(info["on_request"]))) + ". Do the task with "
                         "your other tools. If one of them would clearly help, say so at the end and suggest the user ask for it "
                         "(e.g. 'use Burp to …'); never pretend you used it.")

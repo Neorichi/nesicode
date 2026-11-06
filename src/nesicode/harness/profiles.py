@@ -142,7 +142,14 @@ description: Formatting conventions for professional documents — structure, he
 5. Final review: re-open the file, check page/slide count, headings order, typos, and that nothing is cut off.
 """
 
+BLANK_SYSTEM = "You are an AI agent working inside a project workspace."
+BLANK = {"system_prompt.md": BLANK_SYSTEM + "\n", "guardrails.md": "", "memory.md": "", "tool_guidance.md": "",
+         "plugins/hooks.json": '{\n  "pre_tool": [],\n  "post_tool": []\n}\n'}
+
 PROFILES: dict[str, dict] = {
+    "blank": {"label": "Blank", "icon": "○", "domain": "general", "blank": True,
+              "description": "Totalmente limpio: sin instrucciones, sin reglas, sin tono y sin skills. Solo el modelo y sus herramientas.",
+              "blocks": {}, "skills": {}},
     "general": {"label": "General", "icon": "✦", "domain": "general",
                 "description": "Agente de código para cualquier tarea: programar, arreglar, automatizar, documentar.",
                 "blocks": {}, "skills": {}},
@@ -167,8 +174,12 @@ PROFILES: dict[str, dict] = {
 ALL_PROFILE_SKILLS = {f"skills/{n}/SKILL.md" for p in PROFILES.values() for n in p["skills"]}
 
 
+ORDER = ("general", "security", "webdev", "data", "docs", "blank")
+
+
 def profile_list() -> list[dict]:
-    return [{"id": k, **{f: v[f] for f in ("label", "icon", "description", "domain")}} for k, v in PROFILES.items()]
+    ids = [k for k in ORDER if k in PROFILES] + [k for k in PROFILES if k not in ORDER]
+    return [{"id": k, **{f: PROFILES[k][f] for f in ("label", "icon", "description", "domain")}} for k in ids]
 
 
 def apply_profile(files: dict[str, str], profile: str) -> dict[str, str]:
@@ -176,6 +187,10 @@ def apply_profile(files: dict[str, str], profile: str) -> dict[str, str]:
     if profile not in PROFILES:
         raise ValueError(f"perfil desconocido: {profile}")
     p = PROFILES[profile]
+    if p.get("blank"):
+        return dict(BLANK)  # nothing at all (older versions stay in the harness history)
+    if is_blank(files):
+        files = base_harness()  # leaving Blank: start from the normal base
     out = {k: v for k, v in files.items() if k not in ALL_PROFILE_SKILLS}
     for name in OVERLAY_FILES:
         text = BLOCK_RX.sub("\n", out.get(name, "")).rstrip() + "\n"
@@ -201,6 +216,12 @@ def profile_harness(profile: str) -> dict[str, str]:
     return apply_profile(base_harness(), profile or "general")
 
 
+def is_blank(files: dict[str, str]) -> bool:
+    return files.get("system_prompt.md", "").strip() == BLANK_SYSTEM and not files.get("guardrails.md", "").strip()
+
+
 def detect_profile(files: dict[str, str]) -> str:
+    if is_blank(files):
+        return "blank"
     m = re.search(r"<!-- profile:([a-z0-9_-]+) -->", files.get("system_prompt.md", ""))
     return m.group(1) if m and m.group(1) in PROFILES else "general"

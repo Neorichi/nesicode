@@ -147,6 +147,45 @@ def vt_ip_report(args, ws, cfg):
     return "\n".join(lines), None
 
 
+RELATIONS = {
+    "domain": ("domains", ["subdomains", "siblings", "resolutions", "urls", "communicating_files", "referrer_files"]),
+    "ip": ("ip_addresses", ["resolutions", "urls", "communicating_files", "referrer_files"]),
+}
+
+
+def vt_relations(args, ws, cfg):
+    kind = str(args.get("type") or "domain").lower()
+    if kind not in RELATIONS:
+        raise ToolError("`type` es domain o ip")
+    target = _clean(str(args.get("target", "")), "target").lower()
+    target = re.sub(r"^https?://", "", target).split("/")[0]
+    coll, allowed = RELATIONS[kind]
+    rel = str(args.get("relation") or "subdomains")
+    if rel not in allowed:
+        raise ToolError(f"`relation` para {kind}: {', '.join(allowed)}")
+    limit = max(1, min(int(args.get("limit") or 40), 40))
+    cursor = str(args.get("cursor") or "")
+    params = {"limit": limit} | ({"cursor": cursor} if cursor else {})
+    data = _req(cfg, "GET", f"/{coll}/{target}/{rel}", params=params) or {}
+    items = data.get("data") or []
+    lines = [f"{rel} of {target}: {len(items)} shown" + (" (more available: pass cursor)" if data.get("meta", {}).get("cursor") else "")]
+    for it in items:
+        a = it.get("attributes") or {}
+        st = a.get("last_analysis_stats") or {}
+        flag = f" · {st.get('malicious', 0)} malicious" if st.get("malicious") else ""
+        if rel == "resolutions":
+            lines.append(f"- {a.get('host_name', '?')} → {a.get('ip_address', '?')} (seen {_date(a.get('date'))})")
+        elif rel in ("urls",):
+            lines.append(f"- {a.get('url', it.get('id'))}{flag}")
+        elif rel.endswith("files"):
+            lines.append(f"- {a.get('meaningful_name') or it.get('id')} ({a.get('type_description', '?')}){flag}")
+        else:
+            lines.append(f"- {it.get('id')}{flag}")
+    if data.get("meta", {}).get("cursor"):
+        lines.append(f"cursor: {data['meta']['cursor']}")
+    return "\n".join(lines), None
+
+
 # ------------------------------------------------------------------ submissions (shared with VirusTotal: always asked)
 def _wait_analysis(cfg, analysis_id: str, timeout: float = 90) -> dict:
     deadline = time.time() + timeout
@@ -202,6 +241,12 @@ TOOLS: dict[str, tuple[ToolSpec, object]] = {
                                   S({"domain": STR}, ["domain"])), vt_domain_report),
     "vt_ip_report": (ToolSpec("vt_ip_report", "VirusTotal report for an IP address: verdict, owner/ASN, country.",
                               S({"ip": STR}, ["ip"])), vt_ip_report),
+    "vt_relations": (ToolSpec("vt_relations", "VirusTotal relationships of a domain or IP: subdomains, sibling domains, "
+                              "DNS resolutions (passive DNS), URLs and related files. Paginate with `cursor`.",
+                              S({"type": {"type": "string", "enum": ["domain", "ip"]}, "target": STR,
+                                 "relation": {"type": "string", "enum": ["subdomains", "siblings", "resolutions", "urls",
+                                                                         "communicating_files", "referrer_files"]},
+                                 "limit": {"type": "integer"}, "cursor": STR}, ["target", "relation"])), vt_relations),
     "vt_scan_url": (ToolSpec("vt_scan_url", "Submit a URL to VirusTotal for a fresh scan. It is shared with VirusTotal: "
                              "the user approves every submission.", S({"url": STR}, ["url"])), vt_scan_url),
     "vt_scan_file": (ToolSpec("vt_scan_file", "Upload a workspace file (max 32 MB) to VirusTotal and wait for the verdict. "
