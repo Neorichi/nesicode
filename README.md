@@ -6,6 +6,38 @@ A coding agent that **improves its own harness** task by task, with a multi-user
 
 ▶ [Watch the quick-start video (MP4, 78 s)](docs/demo/nesicode-demo.mp4) — add your API key, pick a model for each role, chat, connectors and bots.
 
+## Quick tour
+
+<details open>
+<summary><b>1 · Create a project and add your provider + API key</b> (<a href="docs/demo/clips/1-setup.mp4">MP4</a>)</summary>
+
+![Create a project and add a provider](docs/demo/clips/1-setup.gif)
+</details>
+
+<details>
+<summary><b>2 · Pick a model for each role</b> — Chat, Improvement, Vision, Images, Transcription (<a href="docs/demo/clips/2-models.mp4">MP4</a>)</summary>
+
+![Models by role](docs/demo/clips/2-models.gif)
+</details>
+
+<details>
+<summary><b>3 · Ask for something</b> — it writes files and runs commands in its sandbox (<a href="docs/demo/clips/3-chat.mp4">MP4</a>)</summary>
+
+![Chat](docs/demo/clips/3-chat.gif)
+</details>
+
+<details>
+<summary><b>4 · Connectors</b> — Office, Burp Suite, VirusTotal, GitHub, your own Chrome… used only when you ask (<a href="docs/demo/clips/4-connectors.mp4">MP4</a>)</summary>
+
+![Connectors](docs/demo/clips/4-connectors.gif)
+</details>
+
+<details>
+<summary><b>5 · Bots</b> — tasks that run on their own (<a href="docs/demo/clips/5-bots.mp4">MP4</a>)</summary>
+
+![Bots](docs/demo/clips/5-bots.gif)
+</details>
+
 The model's weights never change: what gets optimized is the system around it (instructions, rules, memory,
 skills, sub-agents, scripts and hooks).
 
