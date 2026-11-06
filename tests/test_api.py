@@ -976,6 +976,7 @@ def test_project_profiles(alice):
     files = alice.get(f"/api/projects/{p['id']}/harness").json()["files"]
     assert "Profile: offensive security" in files["system_prompt.md"] and "skills/web-audit/SKILL.md" in files
     assert "take precedence over the general guardrails" in files["system_prompt.md"]
+    assert files["system_prompt.md"].startswith("You are Nesicode, an autonomous senior ethical hacker and software engineering agent")
     # the project learns something, then switches profile: the learned rule stays, the security block goes
     files["guardrails.md"] += "- Regla aprendida del proyecto.\n"
     assert alice.post(f"/api/projects/{p['id']}/harness", json={"files": files}).status_code == 200
@@ -984,6 +985,7 @@ def test_project_profiles(alice):
     assert r["profile"] == "docs" and "Regla aprendida del proyecto." in files["guardrails.md"]
     assert "offensive security" not in files["system_prompt.md"] and "skills/web-audit/SKILL.md" not in files
     assert "skills/doc-style/SKILL.md" in files and "documents and office" in files["system_prompt.md"]
+    assert files["system_prompt.md"].startswith("You are Nesicode, an autonomous software engineering agent")  # base intro back
     assert alice.post(f"/api/projects/{p['id']}/profile", json={"profile": "nope"}).status_code == 422
     g = alice.post("/api/projects", json={"name": "Normal", "executor_model": "mock/demo", "improver_model": "mock/demo"}).json()
     assert g["profile"] == "general"

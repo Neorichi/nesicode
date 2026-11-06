@@ -16,6 +16,7 @@ MARK = "<!-- profile:{id} -->"
 END = "<!-- /profile -->"
 BLOCK_RX = re.compile(r"\n*<!-- profile:[a-z0-9_-]+ -->.*?<!-- /profile -->\n*", re.S)
 OVERLAY_FILES = ("system_prompt.md", "guardrails.md", "tool_guidance.md")
+BASE_INTRO = "You are Nesicode, an autonomous software engineering agent working inside a project workspace."
 
 # ------------------------------------------------------------------ security
 SEC_SYSTEM = """## Profile: offensive security
@@ -146,6 +147,7 @@ PROFILES: dict[str, dict] = {
                 "description": "Agente de código para cualquier tarea: programar, arreglar, automatizar, documentar.",
                 "blocks": {}, "skills": {}},
     "security": {"label": "Hacking / Seguridad", "icon": "🛡", "domain": "security",
+                 "intro": "You are Nesicode, an autonomous senior ethical hacker and software engineering agent working inside a project workspace.",
                  "description": "Pentesting, bug bounty y CTF: reconocimiento, explotación y encadenado de vulnerabilidades dentro del alcance, e informe con CVSS. Tono técnico y directo.",
                  "blocks": {"system_prompt.md": SEC_SYSTEM, "guardrails.md": SEC_GUARD, "tool_guidance.md": SEC_TOOLS},
                  "skills": {"security-recon": SEC_RECON, "web-audit": SEC_WEB, "security-report": SEC_REPORT}},
@@ -180,6 +182,16 @@ def apply_profile(files: dict[str, str], profile: str) -> dict[str, str]:
         if p["blocks"].get(name):
             text = text.rstrip() + "\n\n" + MARK.format(id=profile) + "\n" + p["blocks"][name].strip() + "\n" + END + "\n"
         out[name] = text
+    # the opening line ("You are Nesicode, …") can be profile-specific; switching back restores the base one
+    intros = [BASE_INTRO] + [q["intro"] for q in PROFILES.values() if q.get("intro")]
+    sp = out.get("system_prompt.md", "")
+    for line in intros:
+        if sp.startswith(line):
+            sp = sp[len(line):]
+            break
+    else:
+        sp = "\n" + sp if sp and not sp.startswith("\n") else sp
+    out["system_prompt.md"] = p.get("intro", BASE_INTRO) + sp
     for n, body in p["skills"].items():
         out[f"skills/{n}/SKILL.md"] = body
     return out
