@@ -1,0 +1,8 @@
+nesicode
+Copyright 2026 Nesi Labs
+
+This product includes material adapted from Harness^2
+(https://github.com/google-research/harness2), Copyright 2026 Google LLC,
+licensed under the Apache License, Version 2.0 (see LICENSE-harness2).
+Adapted parts: the harnessing stage prompts (src/nesicode/harnessing/prompts.py)
+and the task-level recursion schedule (src/nesicode/harnessing/engine.py).

@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+.env
+web/node_modules/
+web/dist/
+.DS_Store
+build/
+dist/
+*.spec.bak
+
+# internal research (kept locally, not published)
+research_notes/
+reports/

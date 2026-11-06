@@ -1,0 +1,58 @@
+name: desktop
+
+# Builds the macOS .dmg (Apple Silicon) and the Windows installer.
+# Run it by hand from the Actions tab, or push a tag like v0.1.0 to also attach them to a release.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    strategy:
+      matrix:
+        os: [macos-15]   # arm64 (Apple Silicon)
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: uv run --group build python -c "print('ok')"
+      - run: uv run pytest -q
+      - run: packaging/build_macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nesicode-${{ matrix.os }}
+          path: dist/*.dmg
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Inno Setup
+        run: choco install innosetup -y --no-progress
+      - name: Build
+        shell: pwsh
+        run: packaging/windows/build.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nesicode-windows
+          path: dist/*-setup.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: out, merge-multiple: true }
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*

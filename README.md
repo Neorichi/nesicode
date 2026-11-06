@@ -1,0 +1,150 @@
+# Nesicode
+
+A coding agent that **improves its own harness** task by task, with a multi-user web interface and desktop apps.
+
+The model's weights never change: what gets optimized is the system around it (instructions, rules, memory,
+skills, sub-agents, scripts and hooks).
+
+## How it works
+
+**Harness**: 8 editable, versioned components per project.
+
+| File | What it is | When it is in context |
+|---|---|---|
+| `system_prompt.md` | role and procedure | always |
+| `guardrails.md` | permanent rules | always |
+| `memory.md` | project facts | always |
+| `tool_guidance.md` | how to use the tools | always |
+| `skills/<n>/SKILL.md` | reusable workflow | on demand (`load_skill`) |
+| `sub_agents/<n>/AGENT.md` | sub-agent with its own context | via `delegate` |
+| `scripts/<f>.py` | deterministic helper | via bash in `.nesicode/` |
+| `plugins/hooks.json` | declarative hooks (block, warn, add a hint, trim) | inside the loop |
+
+**Harnessing (Propose → Probe → Compose)** on a task, with a budget `k`:
+
+1. **Base**: `k` runs with the current harness, each in an isolated copy of the workspace.
+2. **Propose**: **INV** candidates (how the agent works) and **DOM** candidates (what it knows about the domain and the code).
+3. **Probe**: each candidate runs once on the same task. If you set a check command (tests), it runs after every attempt.
+4. **Compose**: a final harness is assembled from the contrasts between trajectories.
+5. **Select**: a blind selector picks the best result without knowing which harness produced it.
+6. **Reflect**: at most one transferable lesson is stored in the domain's library.
+
+**Parallel** mode (explores breadth) or **sequential** mode (refines depth). Both use 4k agent runs and 3k improvement stages.
+
+## Quick start
+
+```bash
+uv sync
+cd web && npm install && npm run build && cd ..
+cp .env.example .env            # add at least one API key
+uv run nesicode serve           # http://127.0.0.1:8420
+```
+
+Web development with hot reload: `uv run nesicode serve --reload` and, in another terminal, `cd web && npm run dev` (http://localhost:5173, proxies `/api` to the backend).
+
+Demo with no keys and no cost (`mock` provider):
+
+```bash
+uv run nesicode demo --k 1                                    # full harnessing in the terminal
+NESICODE_DATA_DIR=./data uv run python scripts/seed_dev.py    # test user and project for the web UI
+```
+
+CLI:
+
+```bash
+uv run nesicode run "fix the failing test" --workspace ./my-repo --model anthropic/claude-opus-5-5
+uv run nesicode harness "add pagination to /users" --workspace ./my-repo --k 2 --mode sequential --check "uv run pytest -q" --apply
+```
+
+## Desktop app (macOS and Windows)
+
+A single program: it starts the server on a private port and opens it in its own window (WebKit on Mac,
+WebView2 on Windows). No login, but a random token per launch so other programs on the computer cannot use
+its API. Data lives in `~/Library/Application Support/nesicode` (Mac) or `%APPDATA%\nesicode` (Windows);
+optional configuration goes in a `.env` inside that folder.
+
+- **macOS**: `packaging/build_macos.sh` → `dist/Nesicode.app` and `dist/Nesicode-<version>-macos-<arch>.dmg`.
+  Ad-hoc signed (no Apple Developer ID): the first time, right-click → Open.
+- **Windows**: `packaging/windows/build.ps1` (on Windows, with Inno Setup 6) → `dist\Nesicode-<version>-windows-x64-setup.exe`,
+  a per-user install with no admin rights. On Windows there is no OS cage unless you use Docker; the agent uses
+  Git for Windows' bash if installed, or PowerShell.
+- **GitHub Actions** (`.github/workflows/desktop.yml`): builds both (Mac Apple Silicon + Windows) on demand from
+  the Actions tab or when a `v*` tag is pushed, and attaches them to the release.
+- From source: `uv sync --extra desktop && uv run nesicode desktop`.
+
+Downloads are on the [Releases](../../releases) page.
+
+## Features
+
+- **Chat** with streaming, attachments and paste, image viewer, message queue (with × to remove queued
+  messages), instant stop, ↑ to recall previous messages, and **microphone dictation** (macOS built-in speech
+  recognition, or any Whisper-compatible model).
+- **Per-role models**: Chat, Improvement, Vision, Image generation and Transcription.
+- **Execution permissions**: auto, ask before commands, or ask before everything, with per-conversation approvals.
+- **Connectors (MCP)**: one-click gallery (Chrome DevTools, Playwright, GitHub, Microsoft 365 roadmap, Burp Suite)
+  plus custom stdio/HTTP servers, and built-in connectors that need nothing installed:
+  **Office** (Word, Excel with formulas and charts, PowerPoint) and **Burp Suite REST API** for older versions.
+- **Your own Chrome**: a Chrome extension lets the agent use only the tabs in a "Nesicode" tab group.
+- **Telegram**: drive your conversations from a Telegram bot (attach/detach chats, approvals, files).
+- **Context management** for long tasks: large outputs saved to disk, old tool results masked, structured
+  summaries, and a per-conversation archive searchable with `search_history`. Context limits are discovered
+  per model.
+- **Export / import configuration**: providers with their keys, connectors, preferences and a project template,
+  in a password-encrypted file, to move everything to another computer.
+- **English and Spanish** UI.
+
+## Models
+
+`provider/model` format, configurable per project:
+
+`nesilabs/nesi3` (api.nesilabs.com, default) · `anthropic/claude-opus-5-5` · `openai/<model>` · `openrouter/z-ai/glm-5` · `gemini/gemini-3.5-flash` · `zai/glm-5` ·
+`xai/<model>` · `deepseek/<model>` · `ollama/<model>` · `compat/<model>` (any OpenAI-compatible API) · `mock/demo`.
+
+Each user can store their own keys from the web UI (encrypted). Without them, the server's keys (`.env`) are used.
+Claude is called through the official SDK, with adaptive thinking and `fallbacks: "default"` on models that support it.
+
+## Providers, per-role models and vault
+
+- In **Project settings → Providers** each user adds their own: name, type (OpenAI-compatible or Anthropic), endpoint, API key and models. There are templates, "Test connection" and "Discover models".
+- In **Models by role** you pick provider and model for **Chat** (executor), **Improvement** (proposes, composes and selects harnesses; use your strongest model), **Vision** (reads images when the chat model cannot), **Image generation** and **Transcription**.
+- API keys go to a **vault**: AES-256-GCM envelope encryption (one data key per secret, wrapped with a master key), bound to user and provider. The master key is not in the database or in `data/`, but in `~/.nesicode/vault.key` (0600) or in `NESICODE_VAULT_KEY`. The API only returns a hint (`••••1234`).
+
+## Three isolation layers
+
+1. **User**: everything lives under `data/workspaces/<user>/`; the API checks ownership on every request.
+2. **Project**: `…/<project>/project/` is the base folder (or a folder of your choice).
+3. **Conversation**: each conversation works in its own cage `…/threads/<id>/ws/` (a copy of the project). Its changes only reach the project when you press "Apply". In Account you can share the project folder between conversations.
+
+Every bash command runs under the OS sandbox (macOS `sandbox-exec`; on Linux use `NESICODE_SANDBOX=docker`): only its cage is readable/writable; the home folder, `data/`, the repo (`.env`) and other processes stay out of reach.
+
+## Security (read before opening it to other users)
+
+- `NESICODE_SANDBOX=auto` (default) uses the macOS sandbox; on Linux without Docker there is no OS cage.
+- On multi-user servers set `NESICODE_ALLOW_PRIVATE_PROVIDERS=0` so provider endpoints cannot point at the internal network.
+- For several users use `NESICODE_SANDBOX=docker`: each command runs in a throwaway container, with no network and CPU, memory and process limits.
+- Harness hooks are declarative data, not code, so a proposed harness cannot run programs on the server through them. Harness scripts do run, but inside the sandbox.
+- **Login**: `NESICODE_AUTH=false` (default) logs in directly as the local user (`NESICODE_LOCAL_USER`, or the first account). Set `NESICODE_AUTH=true` for a login screen and multiple accounts; required if the server is reachable from outside your machine.
+- Behind HTTPS, set `NESICODE_COOKIE_SECURE=1` and `NESICODE_SECRET_KEY`. With `NESICODE_ALLOW_SIGNUP=0` only the first user can sign up.
+
+## Layout
+
+```
+src/nesicode/
+  llm/          providers (anthropic, openai-compatible, mock)
+  harness/      8-component tree, validation, base harness
+  agent/        agent loop, tools, hooks, isolated workspace, context management
+  harnessing/   Propose-Probe-Compose, selection, reflection
+  server/       FastAPI, SQLite, auth, job queue, SSE, vault, Telegram, connectors
+  office.py     built-in Office connector (Word, Excel, PowerPoint)
+  burp_rest.py  built-in Burp Suite REST API connector
+  speech.py     speech to text for the microphone button
+web/            React + Vite (chat, harness editor, harnessing pipeline, lessons, integrations)
+extension/      Chrome extension ("Nesicode" tab group)
+packaging/      macOS (.app/.dmg) and Windows (installer) builds
+tests/          uv run pytest
+```
+
+## Acknowledgements
+
+Thanks to the Google Research team for [Harness²](https://github.com/google-research/harness2), which inspired
+Nesicode's self-improvement method (Apache License 2.0; see `NOTICE`).

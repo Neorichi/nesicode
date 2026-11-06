@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root { --ink: #1c1b19; --muted: #8b877f; --line: #e3e0d9; --accent: #0e8f7e; --bg: #f8f7f4; --panel: #fff; --err: #b42318; }
+      @media (prefers-color-scheme: dark) { :root { --ink: #ecebe7; --muted: #85817a; --line: #34322e; --bg: #1b1a18; --panel: #232220; --accent: #2fbfa8; --err: #ff8a80; } }
+      body { width: 320px; margin: 0; font: 13px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--ink); }
+      header { display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+      header img { width: 22px; height: 22px; border-radius: 6px; }
+      header b { flex: 1; font-size: 14px; }
+      .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+      .dot.connected { background: #16794c; } .dot.error { background: var(--err); } .dot.connecting { background: #b4540a; }
+      main { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+      .muted { color: var(--muted); font-size: 12px; }
+      .err { color: var(--err); font-size: 12px; }
+      textarea { width: 100%; box-sizing: border-box; height: 64px; font: 11px ui-monospace, Menlo, monospace; border: 1px solid var(--line); border-radius: 8px; padding: 6px; background: var(--panel); color: var(--ink); resize: none; }
+      button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+      button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+      .share { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+      .tabs { display: flex; flex-direction: column; gap: 4px; max-height: 160px; overflow-y: auto; }
+      .tab { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .link { border: 0; background: none; color: var(--muted); padding: 0; font-size: 12px; text-decoration: underline; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <img src="icons/icon32.png" alt="" />
+      <b>Nesicode</b>
+      <span id="dot" class="dot"></span>
+    </header>
+    <main>
+      <div id="status" class="muted">…</div>
+      <button id="reconnect" class="primary" hidden>Reconnect</button>
+      <div id="pairBox" hidden>
+        <div class="muted">Paste the connection code from Nesicode (Connectors → Your Chrome):</div>
+        <textarea id="code" placeholder="NESI-…"></textarea>
+        <button id="pair" class="primary">Connect</button>
+      </div>
+      <div id="shareBox" class="share" hidden>
+        <div>
+          <div><b>This tab</b></div>
+          <div id="shareInfo" class="muted"></div>
+        </div>
+        <button id="share">Share</button>
+      </div>
+      <div id="tabsBox" hidden>
+        <div class="muted">Tabs in the “Nesicode” group (the only ones it can use):</div>
+        <div id="tabs" class="tabs"></div>
+      </div>
+      <div id="hint" class="muted" hidden>Tip: you can also drag any tab into or out of the “Nesicode” group.</div>
+      <button id="repair" class="link" hidden>Change connection code</button>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

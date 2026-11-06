@@ -1,0 +1,692 @@
+import { useSyncExternalStore } from 'react'
+
+/**
+ * Minimal i18n: the Spanish text is the source and the key; English comes from the EN dictionary.
+ * Components call useLang() (or useT()) so they re-render when the language changes.
+ */
+export type Lang = 'es' | 'en'
+
+const STORAGE_KEY = 'nesi:lang'
+
+function initialLang(): Lang {
+  try {
+    const v = localStorage.getItem(STORAGE_KEY)
+    if (v === 'es' || v === 'en') return v
+  } catch {
+    /* storage unavailable */
+  }
+  return 'es'
+}
+
+let current: Lang = initialLang()
+const subscribers = new Set<() => void>()
+
+function syncDocumentLang() {
+  if (typeof document !== 'undefined') document.documentElement.lang = current
+}
+syncDocumentLang()
+
+export function getLang(): Lang {
+  return current
+}
+
+export function setLang(l: Lang) {
+  try {
+    localStorage.setItem(STORAGE_KEY, l)
+  } catch {
+    /* storage unavailable */
+  }
+  if (l === current) return
+  current = l
+  syncDocumentLang()
+  subscribers.forEach((fn) => fn())
+}
+
+function subscribe(fn: () => void) {
+  subscribers.add(fn)
+  return () => void subscribers.delete(fn)
+}
+
+/** Current language plus its setter; re-renders the caller when the language changes. */
+export function useLang(): [Lang, (l: Lang) => void] {
+  const lang = useSyncExternalStore(subscribe, getLang, getLang)
+  return [lang, setLang]
+}
+
+/** Returns t(); same as calling useLang() and using the module-level t. */
+export function useT(): typeof t {
+  useLang()
+  return t
+}
+
+function interpolate(s: string, vars?: Record<string, string | number>): string {
+  if (!vars) return s
+  return s.replace(/\{(\w+)\}/g, (m, k: string) => (k in vars ? String(vars[k]) : m))
+}
+
+/** Translate a Spanish source string (the key) into the current language, then fill {placeholders}. */
+export function t(es: string, vars?: Record<string, string | number>): string {
+  const s = current === 'en' ? (EN[es] ?? es) : es
+  return interpolate(s, vars)
+}
+
+/** Patterns for dynamic server messages (Spanish → English). */
+const ERROR_PATTERNS: [RegExp, (...m: string[]) => string][] = [
+  [/^No se puede resolver (.+)$/s, (h) => `Can't resolve ${h}`],
+  [/^Ya tienes un proveedor llamado (.+)$/s, (n) => `You already have a provider named ${n}`],
+  [/^No se pudieron obtener los modelos: (.*)$/s, (e) => `Couldn't fetch the models: ${translateError(e)}`],
+  [/^git clone falló: (.*)$/s, (e) => `git clone failed: ${e}`],
+  [/^Ruta peligrosa en el ZIP: (.+)$/s, (p) => `Unsafe path in the ZIP: ${p}`],
+  [/^(.+): máximo 25 MB por archivo$/s, (f) => `${f}: 25 MB max per file`],
+  [/^Adjunto no válido: (.+)$/s, (p) => `Invalid attachment: ${p}`],
+  [/^El adjunto ya no existe: (.+)$/s, (p) => `The attachment no longer exists: ${p}`],
+  [/^límite diario alcanzado \((\d+)\)$/, (n) => `daily limit reached (${n})`],
+  [/^(\d+) errores de herramientas$/, (n) => `had ${n} tool errors`],
+  [/^necesitó (\d+) pasos$/, (n) => `took ${n} steps`],
+  [/^Restaurada la v(\d+)$/, (n) => `Restored v${n}`],
+  [/^Adoptado de la ejecución #(\d+)$/, (n) => `Adopted from run #${n}`],
+  [/^Harness² run #(\d+): adoptado `(.+)`$/s, (n, l) => `Harness² run #${n}: adopted \`${l}\``],
+  [/^no se pudo conectar: (.*)$/s, (e) => `couldn't connect: ${e}`],
+  [/^(.*): add it in Ajustes del proyecto → Proveedores$/s, (head) => `${head}: add it in Project settings → Providers`],
+]
+
+/** Translate a message coming from the server (errors, auto-harness reasons, version notes). */
+export function translateError(msg: string): string {
+  if (current !== 'en' || !msg) return msg
+  if (EN[msg]) return EN[msg]
+  for (const [re, fn] of ERROR_PATTERNS) {
+    const m = msg.match(re)
+    if (m) return fn(...m.slice(1))
+  }
+  return msg
+}
+
+const EN: Record<string, string> = {
+  'Contexto aligerado: {n} tokens de salidas antiguas apartados (siguen guardados en disco).': 'Context lightened: {n} tokens of old outputs set aside (still saved on disk).',
+  'medido': 'measured',
+  'El modelo indicó su límite real: {n} tokens. Guardado; compacto y sigo.': 'The model reported its real limit: {n} tokens. Saved; compacting and continuing.',
+  'Contexto usado en el último paso: {u} de {l} tokens. Al pasar del 75% se compacta automáticamente.': 'Context used in the last step: {u} of {l} tokens. Past 75% it is compacted automatically.',
+  'Contexto compactado ({u} de {l} tokens): el agente sigue con un resumen de lo hecho.': 'Context compacted ({u} of {l} tokens): the agent continues from a summary of the work so far.',
+  'Ocultar resumen': 'Hide summary',
+  'Ver resumen': 'Show summary',
+  'Contexto': 'Context',
+  'tokens': 'tokens',
+  'salida': 'output',
+  'según el proveedor': 'reported by the provider',
+  'valor conocido': 'known value',
+  'estimado': 'estimated',
+  'Gestiona tus conversaciones desde Telegram: ver, anclarte, crear nuevas, recibir respuestas y aprobar permisos.': 'Manage your chats from Telegram: browse, attach, start new ones, get answers and approve permissions.',
+  'Vinculado': 'Linked',
+  'No configurado': 'Not set up',
+  'En Telegram abre': 'In Telegram open',
+  ', envía /newbot y elige un nombre. Te dará un token (123456:ABC…).': ', send /newbot and pick a name. It gives you a token (123456:ABC…).',
+  'Pega aquí el token del bot': 'Paste the bot token here',
+  'Vincular mi Telegram': 'Link my Telegram',
+  'Abrir en Telegram': 'Open in Telegram',
+  'o envía al bot:': 'or send the bot:',
+  'caduca en 15 min': 'expires in 15 min',
+  'Vinculado con {name}. En Telegram usa /chats para ver tus conversaciones y anclarte a una, /new para empezar otra y /help para el resto. En cada conversación de la app tienes un botón 📌 Telegram para anclarla desde aquí.': 'Linked with {name}. In Telegram use /chats to see your chats and attach to one, /new to start another and /help for the rest. Every chat in the app has a 📌 Telegram button to attach it from here.',
+  'Desvincular': 'Unlink',
+  '¿Quitar el bot de Telegram?': 'Remove the Telegram bot?',
+  'Quitar el bot': 'Remove the bot',
+  'Anclada en Telegram: lo que escribas allí va aquí y ves allí lo que pasa. Pulsa para soltarla.': 'Attached in Telegram: what you write there comes here and you see there what happens. Click to detach.',
+  'Anclar esta conversación en Telegram': 'Attach this chat in Telegram',
+  'En Telegram': 'In Telegram',
+  'Actualizar la carpeta de la extensión': 'Update the extension folder',
+  'Si descargas el .zip, ábrelo para descomprimirlo: Chrome necesita la carpeta.': 'If you download the .zip, open it to unzip it: Chrome needs the folder.',
+  'Instalar en Documentos y mostrar en Finder': 'Install in Documents and show in Finder',
+  'Tu Chrome (extensión)': 'Your Chrome (extension)',
+  'Usa tu Chrome de siempre, con tus sesiones abiertas: solo las pestañas que abre Nesicode (grupo «Nesicode») o las que compartas tú.': 'Uses your everyday Chrome with your logged-in sessions: only the tabs Nesicode opens ("Nesicode" group) or that you share.',
+  'Conectado': 'Connected',
+  'No conectado': 'Not connected',
+  'Preparar la extensión': 'Prepare the extension',
+  'Lista en': 'Ready in',
+  'la copia en tu carpeta Documentos': 'copies it to your Documents folder',
+  'Descargar la extensión (.zip)': 'Download the extension (.zip)',
+  'En Chrome abre': 'In Chrome open',
+  'activa «Modo de desarrollador» (arriba a la derecha) y pulsa «Cargar descomprimida»; elige esa carpeta.': 'turn on "Developer mode" (top right) and click "Load unpacked"; choose that folder.',
+  'Generar código de conexión': 'Generate connection code',
+  'y pégalo en la extensión (icono de Nesicode en la barra de Chrome).': 'and paste it in the extension (Nesicode icon in the Chrome toolbar).',
+  'Copiado': 'Copied',
+  'Copiar': 'Copy',
+  'El agente ya puede usar tu Chrome. Para que vea una pestaña tuya, pulsa el icono de Nesicode en Chrome → «Compartir».': 'The agent can now use your Chrome. To let it see one of your tabs, click the Nesicode icon in Chrome → "Share".',
+  'Generar código nuevo': 'Generate a new code',
+  'Conectores (MCP)': 'Connectors (MCP)',
+  'Herramientas externas que el agente puede usar en todas tus conversaciones: tu Chrome, GitHub, Word… Los locales se ejecutan en tu equipo, fuera de la jaula; en los modos «pedir» cada uso te pide permiso.': 'External tools the agent can use in all your chats: your Chrome, GitHub, Word… Local ones run on your computer, outside the cage; in the "ask" modes every use asks for permission.',
+  '{label} conectado · {n} herramientas': '{label} connected · {n} tools',
+  'Solo en la app de escritorio / modo local': 'Only in the desktop app / local mode',
+  'Falta instalar: {x}': 'Needs installing: {x}',
+  'Local': 'Local',
+  'Remoto': 'Remote',
+  'Añadido': 'Added',
+  'Añadir': 'Add',
+  'Conectando… (la primera vez puede tardar)': 'Connecting… (the first time can take a while)',
+  'Conectar': 'Connect',
+  'Local (comando)': 'Local (command)',
+  'Remoto (URL)': 'Remote (URL)',
+  'Comando': 'Command',
+  'Token (opcional)': 'Token (optional)',
+  '{n} herramientas': '{n} tools',
+  'Activo': 'Active',
+  'Probar': 'Test',
+  '¿Quitar el conector {label}?': 'Remove the {label} connector?',
+  'Quitar': 'Remove',
+  'Otro servidor MCP': 'Other MCP server',
+  'Local o remoto': 'Local or remote',
+  'Cualquier servidor MCP: pega su comando o su URL.': 'Any MCP server: paste its command or its URL.',
+  'El conector {c} no arrancó': 'The {c} connector did not start',
+  'Controla un Chrome real: abrir páginas, hacer clic, rellenar formularios, leer la consola y la red, hacer capturas.': 'Controls a real Chrome: open pages, click, fill forms, read the console and network, take screenshots.',
+  'Un navegador automático con su propio perfil: navegar, clicar, escribir, extraer datos de webs.': 'An automated browser with its own profile: browse, click, type, extract data from websites.',
+  'Issues, pull requests, repositorios y código de tu cuenta de GitHub.': 'Issues, pull requests, repositories and code from your GitHub account.',
+  'Crear y editar documentos Word: texto, tablas, estilos, comentarios.': 'Create and edit Word documents: text, tables, styles, comments.',
+  'Token personal de GitHub': 'GitHub personal access token',
+  'github.com → Settings → Developer settings → Personal access tokens': 'github.com → Settings → Developer settings → Personal access tokens',
+  'Falta: {x}': 'Missing: {x}',
+  'Asignado automáticamente': 'Assigned automatically',
+  'Compartir archivo': 'Share file',
+  'Ampliar': 'Enlarge',
+  'Elige la carpeta principal del proyecto. Cada conversación trabaja en su propia copia y los cambios solo llegan a tu carpeta cuando los aplicas.': "Choose the project's main folder. Each chat works on its own copy, and changes only reach your folder when you apply them.",
+  'Cambiar carpeta…': 'Change folder…',
+  'Elegir carpeta…': 'Choose folder…',
+  'o escribe la ruta': 'or type the path',
+  '/ruta/a/tu/proyecto': '/path/to/your/project',
+  'mi-proyecto': 'my-project',
+  'Proyecto': 'Project',
+  'Sin carpeta: Nesicode crea una vacía para el proyecto.': 'No folder: Nesicode creates an empty one for the project.',
+  'Modelos, dominio y comando de verificación se configuran después en Ajustes del proyecto.': 'Models, domain and check command are set later in Project settings.',
+  'Elegir carpetas del disco solo está disponible en modo local (sin login)': 'Choosing folders on disk is only available in local mode (no login)',
+  'Esa carpeta es la de datos de Nesicode; elige otra': "That is Nesicode's data folder; choose another one",
+  'Elige una carpeta de proyecto, no la raíz del disco ni tu carpeta personal': 'Choose a project folder, not the disk root or your home folder',
+  'permitido siempre en esta conversación': 'always allowed in this chat',
+  'permitido': 'allowed',
+  'sin respuesta': 'no answer',
+  'denegado': 'denied',
+  'Nesicode quiere ejecutar': 'Nesicode wants to run',
+  'Permitir': 'Allow',
+  'Permitir siempre en esta conversación': 'Always allow in this chat',
+  'Denegar': 'Deny',
+  'La ejecución terminó sin respuesta.': 'The run ended without an answer.',
+  'Esa petición ya no está esperando respuesta': 'That request is no longer waiting for an answer',
+  'Qué necesita tu permiso en esta conversación': 'What needs your permission in this chat',
+  'Modo: por defecto': 'Mode: default',
+  'Modo: auto': 'Mode: auto',
+  'Modo: pedir para comandos': 'Mode: ask for commands',
+  'Modo: pedir para todo': 'Mode: ask for everything',
+  'pedir para todo': 'ask for everything',
+  'pedir para comandos': 'ask for commands',
+  'auto': 'auto',
+  'Permisos de ejecución': 'Execution permissions',
+  'Qué tiene que pedirte el agente antes de hacerlo. Es el modo por defecto de las conversaciones; cada una puede cambiarlo desde su cabecera. El harnessing siempre va en auto (en sus propias jaulas).': 'What the agent must ask you before doing it. This is the default for chats; each chat can change it from its header. Harnessing always runs in auto (in its own cages).',
+  'Auto': 'Auto',
+  'Ejecuta comandos y edita archivos sin preguntar (dentro de su jaula).': 'Runs commands and edits files without asking (inside its cage).',
+  'Pedir para comandos': 'Ask for commands',
+  'Te pide permiso antes de cada comando de terminal.': 'Asks before every terminal command.',
+  'Pedir para todo': 'Ask for everything',
+  'Te pide permiso antes de comandos, de escribir o editar archivos y de crear imágenes.': 'Asks before commands, writing or editing files, and creating images.',
+  'Cambios de la v{v}': 'Changes in v{v}',
+  'respecto a la versión anterior': 'compared with the previous version',
+  'Primera versión: no hay versión anterior con la que comparar.': 'First version: there is no previous version to compare with.',
+  'Crear imágenes': 'Create images',
+  'genera imágenes nuevas a partir de una descripción (p. ej. Grok Imagine, gpt-image)': 'generates new images from a description (e.g. Grok Imagine, gpt-image)',
+  'Crear imagen': 'Create image',
+  'Mostrar imagen': 'Show image',
+  'Descargar': 'Download',
+  // --- app shell / api
+  'Abrir menú': 'Open menu',
+  'El harness no es válido': 'The harness is not valid',
+  'ahora': 'just now',
+  'hace {n} min': '{n} min ago',
+  'hace {n} h': '{n} h ago',
+  'En cola': 'Queued',
+  'En curso': 'Running',
+  'Completado': 'Completed',
+  'Límite de pasos': 'Step limit',
+  'Error': 'Error',
+  'Cancelado': 'Cancelled',
+  'Interrumpido': 'Interrupted',
+  'Rechazado': 'Refused',
+
+  // --- Diff / Transcript
+  'Sin cambios': 'No changes',
+  'Listar': 'List',
+  'Leer': 'Read',
+  'Escribir': 'Write',
+  'Editar': 'Edit',
+  'Buscar': 'Search',
+  'Terminal': 'Terminal',
+  'Subagente': 'Subagent',
+  'Visión': 'Vision',
+  'en {path}': 'in {path}',
+  'Esta respuesta {reason}: se lanzó automáticamente un': 'This answer {reason}, so Nesicode automatically launched',
+  'para mejorar el harness.': 'to improve the harness.',
+  'Razonamiento': 'Reasoning',
+  'Auto-harnessing no lanzado ({reason}): {why}.': 'Auto-harnessing not launched ({reason}): {why}.',
+  'Cancelado.': 'Cancelled.',
+  '{n} pasos': '{n} steps',
+
+  // --- Composer
+  'Quitar {name}': 'Remove {name}',
+  'Mira los archivos adjuntos.': 'Look at the attached files.',
+  'Subiendo {n}…': 'Uploading {n}…',
+  'Adjuntar archivos (también puedes pegar o arrastrar)': 'Attach files (you can also paste or drag them)',
+  'Pide algo a Nesicode…': 'Ask Nesicode anything…',
+  'Detener': 'Stop',
+  'Enviar (Enter)': 'Send (Enter)',
+  'Suelta los archivos para adjuntarlos': 'Drop the files to attach them',
+
+  // --- Sidebar
+  '+ Nuevo proyecto…': '+ New project…',
+  'Nueva conversación': 'New chat',
+  'Lecciones': 'Lessons',
+  'Ajustes del proyecto': 'Project settings',
+  'Conversaciones': 'Conversations',
+  'Aún no hay conversaciones.': 'No conversations yet.',
+  'Eliminar': 'Delete',
+  'Cuenta y claves de API': 'Account and API keys',
+  'Idioma': 'Language',
+  'Cerrar sesión': 'Log out',
+
+  // --- Providers
+  '— ninguno —': '— none —',
+  'Elige proveedor…': 'Choose a provider…',
+  '{name} (no configurado)': '{name} (not configured)',
+  'nombre del modelo': 'model name',
+  'Otro…': 'Other…',
+  'El proveedor «{name}» no existe: añádelo abajo en Proveedores.': 'The provider “{name}” doesn’t exist: add it below under Providers.',
+  'Este proveedor no tiene API key guardada.': 'This provider has no saved API key.',
+  'Conexión correcta · {n} modelos disponibles': 'Connection OK · {n} models available',
+  'Nombre': 'Name',
+  'Identificador corto; los modelos se eligen como {name}/modelo.': 'Short identifier; models are picked as {name}/model.',
+  'nombre': 'name',
+  'Etiqueta': 'Label',
+  'Tipo de API': 'API type',
+  'Compatible con OpenAI': 'OpenAI-compatible',
+  'Endpoint (base URL)': 'Endpoint (base URL)',
+  'https://api.ejemplo.com/v1': 'https://api.example.com/v1',
+  'guardada {hint} (déjalo vacío para mantenerla)': 'saved {hint} (leave empty to keep it)',
+  'Nueva key (opcional)': 'New key (optional)',
+  'Se guarda cifrada en la bóveda; nunca se vuelve a mostrar.': 'Stored encrypted in the vault; it’s never shown again.',
+  'Modelos (uno por línea)': 'Models (one per line)',
+  'Probar conexión': 'Test connection',
+  'Descubrir modelos': 'Discover models',
+  'Cancelar': 'Cancel',
+  'Guardar': 'Save',
+  'Añadir proveedor': 'Add provider',
+  '{n} modelos': '{n} models',
+  'Cargando…': 'Loading…',
+  'servidor': 'server',
+  'sin key': 'no key',
+  'Actualizar modelos': 'Refresh models',
+  'Lo convierte en un proveedor tuyo (copia la key del servidor a tu bóveda) para poder editarlo o borrarlo':
+    'Turns it into your own provider (copies the server key into your vault) so you can edit or delete it',
+  'Ocultar': 'Hide',
+  '¿Eliminar el proveedor {name} y su API key de la bóveda?': 'Delete the provider {name} and its API key from the vault?',
+  'Ocultos:': 'Hidden:',
+  'mostrar': 'show',
+  '+ Añadir proveedor': '+ Add provider',
+
+  // --- Harnessing
+  'Base': 'Base',
+  'Selección': 'Selection',
+  'Reflexión': 'Reflection',
+  'Hecho': 'Done',
+  'INV · cómo trabaja': 'INV · how it works',
+  'DOM · qué sabe': 'DOM · what it knows',
+  'Composición': 'Composition',
+  'elegido': 'chosen',
+  'proponiendo…': 'proposing…',
+  'componentes': 'components',
+  'ejecutando agente…': 'running agent…',
+  'entregado': 'delivered',
+  'sin entrega': 'not delivered',
+  '{n} fich.': '{n} files',
+  'Cerrar': 'Close',
+  'Propuesta': 'Proposal',
+  'Trayectoria': 'Trajectory',
+  'Cambios en código': 'Code changes',
+  'Check': 'Check',
+  'Notas del proponente': 'Proposer notes',
+  'Componentes': 'Components',
+  'Sin rollout todavía.': 'No rollout yet.',
+  'El agente no cambió ficheros': 'The agent didn’t change any files',
+  'No hay comando de verificación configurado.': 'No check command configured.',
+  'Harness frente al base': 'Harness vs. base',
+  'Idéntico al harness base': 'Identical to the base harness',
+  'Candidatos (INV / DOM)': 'Candidates (INV / DOM)',
+  'Composiciones': 'Compositions',
+  'Harness adoptado como v{n}': 'Harness adopted as v{n}',
+  'Aplicados {n} cambios al proyecto': 'Applied {n} changes to the project',
+  'secuencial': 'sequential',
+  'paralelo': 'parallel',
+  'Lanzado automáticamente ({reason}) desde': 'Launched automatically ({reason}) from',
+  'Lanzado desde': 'Launched from',
+  'la conversación': 'the conversation',
+  'Elegido:': 'Chosen:',
+  'pendiente…': 'pending…',
+  'Lección aprendida': 'Lesson learned',
+  'Cuándo:': 'When:',
+  'Qué hacer:': 'What to do:',
+  'Resultado': 'Result',
+  'Adoptar el harness elegido': 'Adopt the chosen harness',
+  'El resultado elegido usa el harness base: no hay cambios que adoptar.': 'The chosen result uses the base harness: nothing to adopt.',
+  'Cambios de código aplicados al proyecto': 'Code changes applied to the project',
+  'Aplicar los cambios de código al proyecto': 'Apply the code changes to the project',
+  'Cambios en el harness': 'Harness changes',
+  'Sin cambios en el harness': 'No harness changes',
+  'Qué hizo cada edición': 'What each edit did',
+  'Nueva ejecución de Harness²': 'New Harness² run',
+  'Describe la tarea. El agente la resolverá varias veces con distintas versiones de su harness.':
+    'Describe the task. The agent will solve it several times with different versions of its harness.',
+  'Presupuesto k': 'Budget k',
+  'Paralelo · explora en anchura': 'Parallel · explores breadth-first',
+  'Secuencial · refina en profundidad': 'Sequential · refines in depth',
+  'Adoptar automáticamente el harness elegido': 'Automatically adopt the chosen harness',
+  'Aplicar al proyecto los cambios de código del resultado elegido': 'Apply the chosen result’s code changes to the project',
+  'Coste: {runs} ejecuciones del agente ({executor}) y {calls} llamadas al mejorador ({improver}).':
+    'Cost: {runs} agent runs ({executor}) and {calls} improver calls ({improver}).',
+  'Consejo: define un': 'Tip: set a',
+  'comando de verificación': 'check command',
+  '(tests) para dar mejor evidencia.': '(tests) to get better evidence.',
+  'Lanzar': 'Launch',
+  'Propose → Probe → Compose sobre una tarea: el agente prueba variantes de su propio harness, se queda con la mejor y guarda la lección para el dominio':
+    'Propose → Probe → Compose on a task: the agent tries variants of its own harness, keeps the best one and saves the lesson for the domain',
+  '+ Nueva ejecución': '+ New run',
+
+  // --- Project settings
+  'Guardado': 'Saved',
+  'Subiendo…': 'Uploading…',
+  '{n} fichero(s) añadidos al proyecto. Las conversaciones nuevas los verán.': '{n} file(s) added to the project. New conversations will see them.',
+  '¿Eliminar "{name}" con su carpeta, harness y conversaciones? No se puede deshacer.':
+    'Delete "{name}" along with its folder, harness and conversations? This can’t be undone.',
+  'Carpeta base:': 'Base folder:',
+  'General': 'General',
+  'Dominio': 'Domain',
+  'Los proyectos del mismo dominio comparten lecciones.': 'Projects in the same domain share lessons.',
+  'Comando de verificación': 'Check command',
+  'Máximo de pasos por respuesta': 'Max steps per answer',
+  'Modelos por función': 'Models by role',
+  'Chat': 'Chat',
+  'el agente que trabaja en las conversaciones': 'the agent that works in conversations',
+  'Mejora': 'Improver',
+  'propone, combina y elige harnesses (usa el más listo que tengas)': 'proposes, combines and picks harnesses (use the smartest one you have)',
+  'lee las imágenes adjuntas si el modelo de chat no puede': 'reads attached images if the chat model can’t',
+  'Guardar modelos': 'Save models',
+  'Proveedores': 'Providers',
+  'Tus proveedores de modelos (endpoint + API key). Son de tu cuenta y sirven para todos tus proyectos. Las API keys se guardan en la bóveda cifrada y nunca se muestran.':
+    'Your model providers (endpoint + API key). They belong to your account and work for all your projects. API keys are stored in the encrypted vault and never shown.',
+  'Archivos del proyecto': 'Project files',
+  'Sube un fichero o un .zip a la carpeta base. Cada conversación nueva empieza con una copia de esta carpeta.':
+    'Upload a file or a .zip to the base folder. Every new conversation starts with a copy of this folder.',
+  'Subir fichero o .zip': 'Upload file or .zip',
+  'Zona peligrosa': 'Danger zone',
+  'Eliminar proyecto': 'Delete project',
+
+  // --- Login
+  'Un agente de código que': 'A coding agent that',
+  'mejora su propio harness': 'improves its own harness',
+  'en cada tarea: propone cambios, los prueba, combina lo que funciona y recuerda la lección.':
+    'with every task: it proposes changes, tests them, combines what works and remembers the lesson.',
+  'ediciones al prompt, skills, hooks…': 'edits to the prompt, skills, hooks…',
+  'cada variante sobre la misma tarea': 'each variant on the same task',
+  'el harness final a partir de las diferencias': 'the final harness from the differences',
+  'Inicia sesión': 'Log in',
+  'Crea tu cuenta': 'Create your account',
+  'Email': 'Email',
+  'Contraseña': 'Password',
+  'Entrar': 'Log in',
+  'Crear cuenta': 'Create account',
+  '¿No tienes cuenta? Regístrate': 'Don’t have an account? Sign up',
+  '¿Ya tienes cuenta? Inicia sesión': 'Already have an account? Log in',
+
+  // --- Harness editor
+  'Siempre activo': 'Always on',
+  'Se envía en cada turno': 'Sent every turn',
+  'Se cargan bajo demanda': 'Loaded on demand',
+  'Subagentes': 'Subagents',
+  'Contexto propio': 'Own context',
+  'Ejecutables vía bash': 'Run via bash',
+  'Hooks dentro del bucle': 'Hooks inside the loop',
+  'manual': 'manual',
+  'restaurada': 'restored',
+  'Qué hace este skill y cuándo usarlo.': 'What this skill does and when to use it.',
+  'Paso uno': 'Step one',
+  'Paso dos': 'Step two',
+  'Para qué sirve este subagente.': 'What this subagent is for.',
+  'Nombre (minúsculas, dígitos, - o _):': 'Name (lowercase, digits, - or _):',
+  'Nombre no válido': 'Invalid name',
+  '¿Eliminar {path}?': 'Delete {path}?',
+  'El harness es válido': 'The harness is valid',
+  'Guardada la versión {n}': 'Saved version {n}',
+  'Restaurada la versión {n}': 'Restored version {n}',
+  'Todo lo que rodea al modelo: prompt, reglas, memoria, skills, subagentes, scripts y hooks. Se versiona en cada cambio, manual o de':
+    'Everything around the model: prompt, rules, memory, skills, subagents, scripts and hooks. Every change is versioned, whether manual or from',
+  'Editar versión actual (v{n})': 'Edit current version (v{n})',
+  'Viendo': 'Viewing',
+  'Ocultar cambios': 'Hide changes',
+  'Ver cambios': 'Show changes',
+  'Restaurar esta versión': 'Restore this version',
+  'Primera versión': 'First version',
+  'Modificado': 'Modified',
+  '+ subagente': '+ subagent',
+  'Este fichero no existe en esta versión.': 'This file doesn’t exist in this version.',
+  '(vacío)': '(empty)',
+  'Nota de la versión (opcional)': 'Version note (optional)',
+  'Validar': 'Validate',
+  'Descartar': 'Discard',
+  'Guardar versión': 'Save version',
+  'Problemas de validación': 'Validation problems',
+
+  // --- New chat
+  'Explícame la arquitectura de este proyecto': 'Explain this project’s architecture',
+  'Añade tests para el módulo principal y haz que pasen': 'Add tests for the main module and make them pass',
+  'Busca bugs evidentes y corrígelos': 'Find obvious bugs and fix them',
+  'Crea un README con instrucciones de instalación': 'Write a README with installation instructions',
+  'Buenos días': 'Good morning',
+  'Buenas tardes': 'Good afternoon',
+  'Buenas noches': 'Good evening',
+  '¿En qué trabajamos hoy?': 'What are we working on today?',
+  '¿Quieres que el agente mejore su forma de trabajar en una tarea concreta?': 'Want the agent to get better at a specific task?',
+  'Lanza un harnessing': 'Launch a harnessing run',
+
+  // --- Account
+  'Cuenta': 'Account',
+  'Aislamiento': 'Isolation',
+  '1 · Usuario': '1 · User',
+  'siempre activo. Tus proyectos, conversaciones y claves son solo tuyos.': 'always on. Your projects, conversations and keys are yours alone.',
+  '2 · Proyecto': '2 · Project',
+  'cada proyecto tiene su carpeta base, su harness y su historial.': 'each project has its own base folder, harness and history.',
+  '3 · Conversación': '3 · Conversation',
+  'cada conversación trabaja en su propia jaula (una copia del proyecto). No ve otras conversaciones ni el resto del disco, y sus cambios solo llegan al proyecto cuando pulsas «Aplicar».':
+    'each conversation works in its own sandbox (a copy of the project). It can’t see other conversations or the rest of the disk, and its changes only reach the project when you click “Apply”.',
+  'Compartir la carpeta del proyecto entre conversaciones (desactiva la capa 3 en las conversaciones nuevas)':
+    'Share the project folder between conversations (turns off layer 3 for new conversations)',
+  'Las conversaciones nuevas escribirán directamente en el proyecto y verán lo que hayan hecho las demás.':
+    'New conversations will write directly to the project and see what the others have done.',
+  'Auto-harnessing': 'Auto-harnessing',
+  'Si una respuesta del chat sale mal, Nesicode lanza solo un harnessing (k=1) con esa misma tarea para que el agente aprenda. Gasta unas 4 ejecuciones del agente cada vez.':
+    'If a chat answer goes badly, Nesicode launches a harnessing run (k=1) on that same task by itself so the agent learns. It costs about 4 agent runs each time.',
+  'Activar auto-harnessing': 'Enable auto-harnessing',
+  'Se lanza si usa al menos': 'Triggers if it uses at least',
+  'pasos': 'steps',
+  '…o tiene al menos': '…or has at least',
+  'errores de herramientas': 'tool errors',
+  'Máximo al día': 'Max per day',
+  'ejecuciones': 'runs',
+  'También se lanza si agota el límite de pasos. Nunca dos a la vez en el mismo proyecto.':
+    'It also triggers when the step limit is hit. Never two at once in the same project.',
+  'Proveedores y API keys': 'Providers and API keys',
+  'Se gestionan en': 'Managed in',
+  'Son de tu cuenta y valen para todos tus proyectos; las keys van a la bóveda cifrada.':
+    'They belong to your account and work for all your projects; keys go to the encrypted vault.',
+
+  // --- New project
+  'Nuevo proyecto': 'New project',
+  'Crea tu primer proyecto': 'Create your first project',
+  'Cada proyecto tiene su propio workspace, su harness versionado y sus conversaciones.':
+    'Each project has its own workspace, versioned harness and conversations.',
+  'mi-api': 'my-api',
+  'Repositorio git (opcional)': 'Git repository (optional)',
+  'https://github.com/usuario/repo': 'https://github.com/user/repo',
+  'Si lo dejas vacío empiezas con un workspace vacío; luego puedes subir un .zip en Archivos.':
+    'Leave it empty to start with an empty workspace; you can upload a .zip under Files later.',
+  'web-backend, data-pipelines…': 'web-backend, data-pipelines…',
+  'Agrupa las lecciones: los proyectos del mismo dominio comparten experiencia.': 'Groups lessons: projects in the same domain share experience.',
+  'Comando de verificación (opcional)': 'Check command (optional)',
+  'Se ejecuta tras cada intento del agente durante el harnessing.': 'Runs after every agent attempt during harnessing.',
+  'el agente que trabaja': 'the agent that does the work',
+  'propone y combina harnesses': 'proposes and combines harnesses',
+  'Puedes añadir proveedores (endpoints y API keys) en Ajustes del proyecto después de crearlo.':
+    'You can add providers (endpoints and API keys) in Project settings after creating it.',
+  'Creando…': 'Creating…',
+  'Crear proyecto': 'Create project',
+
+  // --- Chat
+  'Esta conversación trabaja en su propia carpeta aislada; no ve el proyecto ni otras conversaciones.':
+    'This conversation works in its own isolated folder; it can’t see the project or other conversations.',
+  'Esta conversación trabaja directamente sobre la carpeta del proyecto (configuración global).':
+    'This conversation works directly on the project folder (global setting).',
+  'Aislada': 'Isolated',
+  'Compartida': 'Shared',
+  'Modelo ejecutor · versión del harness': 'Executor model · harness version',
+  'Responde o pide otra cosa…': 'Reply or ask for something else…',
+  'Nesicode puede ejecutar comandos y modificar archivos del proyecto.': 'Nesicode can run commands and modify project files.',
+  '¿Copiar {n} cambio(s) de esta conversación a la carpeta del proyecto?': 'Copy {n} change(s) from this conversation to the project folder?',
+  'Aplicados: +{a} ~{m} −{r}': 'Applied: +{a} ~{m} −{r}',
+  'Archivos': 'Files',
+  '{n} cambios': '{n} changes',
+  'Cambios': 'Changes',
+  'Carpeta vacía.': 'Empty folder.',
+  '(binario)': '(binary)',
+  'Elige un fichero.': 'Pick a file.',
+  'La conversación trabaja en su propia jaula. Estos son los ficheros que ha cambiado desde que empezó (o desde la última vez que aplicaste). Solo llegan al proyecto si los aplicas.':
+    'This conversation works in its own sandbox. These are the files it has changed since it started (or since you last applied). They only reach the project if you apply them.',
+  'Sin cambios todavía': 'No changes yet',
+  'Aplicar al proyecto': 'Apply to project',
+  'Harnessing #{n} en marcha →': 'Harnessing #{n} running →',
+  'Lanza Harness² con esta misma petición para que el agente aprenda a hacerla mejor (cuesta unas 4 ejecuciones).':
+    'Runs Harness² on this same request so the agent learns to do it better (costs about 4 runs).',
+  'Mejorar harness con esta tarea': 'Improve harness with this task',
+
+  // --- Lessons
+  'La biblioteca de experiencia: cada harnessing deja como mucho una lección transferible. Las del dominio':
+    'The experience library: each harnessing run leaves at most one transferable lesson. Lessons from the domain',
+  'se dan como hipótesis a los proponentes de las siguientes tareas.': 'are given as hypotheses to the proposers of later tasks.',
+  'Todos los dominios': 'All domains',
+  'Todavía no hay lecciones. Aparecen tras una ejecución de': 'No lessons yet. They appear after a run of',
+  'ejecución #{n}': 'run #{n}',
+  'Olvidar': 'Forget',
+  'Evidencia:': 'Evidence:',
+  'Confianza:': 'Confidence:',
+
+  // --- Server messages (app.py / jobs.py / agent loop), exact matches for translateError()
+  'No has iniciado sesión': 'You are not logged in',
+  'Proyecto no encontrado': 'Project not found',
+  'Ejecución no encontrada': 'Run not found',
+  'El registro está desactivado': 'Sign-up is disabled',
+  'Email no válido': 'Invalid email',
+  'Ya existe una cuenta con ese email': 'An account with that email already exists',
+  'Email o contraseña incorrectos': 'Wrong email or password',
+  'El endpoint debe ser una URL http(s)://': 'The endpoint must be an http(s):// URL',
+  'Este servidor no permite endpoints en redes privadas': 'This server doesn’t allow endpoints on private networks',
+  'Nombre: minúsculas, dígitos, - o _ (sin espacios)': 'Name: lowercase, digits, - or _ (no spaces)',
+  'Proveedor no encontrado': 'Provider not found',
+  'Solo se pueden ocultar proveedores del servidor': 'Only server providers can be hidden',
+  'Solo en modo local (NESICODE_AUTH=false): crea un proveedor propio con tu key':
+    'Local mode only (NESICODE_AUTH=false): create your own provider with your key',
+  'Ya es tuyo': 'It’s already yours',
+  'Solo se admiten URLs git https://': 'Only https:// git URLs are supported',
+  'Fichero no encontrado': 'File not found',
+  'Máximo 200 MB': '200 MB max',
+  'ZIP no válido': 'Invalid ZIP',
+  'Versión no encontrada': 'Version not found',
+  'Conversación no encontrada': 'Conversation not found',
+  'Esta conversación ya trabaja directamente sobre el proyecto': 'This conversation already works directly on the project',
+  'Espera a que termine la respuesta en curso': 'Wait for the current answer to finish',
+  'Ya hay una respuesta en curso en esta conversación': 'There’s already an answer in progress in this conversation',
+  'Solo se puede mejorar a partir de una respuesta de chat terminada': 'You can only improve from a finished chat answer',
+  'Ya hay un harnessing en curso en este proyecto': 'There’s already a harnessing run in progress in this project',
+  'Rollout no encontrado': 'Rollout not found',
+  'Esta ejecución no tiene un harness adoptable': 'This run has no harness to adopt',
+  'Solo se pueden aplicar ejecuciones de harnessing terminadas': 'Only finished harnessing runs can be applied',
+  'proveedor desconocido': 'unknown provider',
+  'Edición manual': 'Manual edit',
+  // chat events
+  'agotó el límite de pasos': 'hit the step limit',
+  'ya hay un harnessing en curso en este proyecto': 'a harnessing run is already in progress in this project',
+  'El modelo rechazó la petición (refusal).': 'The model declined the request (refusal).',
+  // config export / import
+  'proveedores': 'providers',
+  'conectores': 'connectors',
+  'preferencias': 'preferences',
+  'plantilla de proyecto': 'project template',
+  'bot de Telegram': 'Telegram bot',
+  'La contraseña debe tener al menos 8 caracteres.': 'The password must be at least 8 characters.',
+  'Las contraseñas no coinciden.': 'The passwords do not match.',
+  'Exportado': 'Exported',
+  'Importado': 'Imported',
+  'Contraseña (mín. 8)': 'Password (min. 8)',
+  'Repite la contraseña': 'Repeat the password',
+  'Incluir plantilla de proyecto (modelos por rol, comando de verificación y harness)': 'Include a project template (models per role, check command and harness)',
+  'No incluir': "Don't include",
+  'Incluir el bot de Telegram (solo puede estar activo en un equipo a la vez)': 'Include the Telegram bot (it can only run on one computer at a time)',
+  'Cifrando…': 'Encrypting…',
+  'Exportar configuración': 'Export configuration',
+  'Importar configuración': 'Import configuration',
+  'Elegir archivo .nesicode…': 'Choose .nesicode file…',
+  'Contraseña del archivo': 'File password',
+  'Importando…': 'Importing…',
+  'Importar': 'Import',
+  'Los proveedores y conectores con el mismo nombre se sobrescriben; el resto se conserva. Las keys se vuelven a guardar en la bóveda cifrada de este equipo.': "Providers and connectors with the same name are overwritten; everything else is kept. Keys are re-saved in this computer's encrypted vault.",
+  'Guarda en un archivo tus proveedores (con sus API keys), conectores, preferencias y, si quieres, la plantilla de un proyecto, para llevarlos a otro equipo. El archivo va cifrado con la contraseña que elijas: sin ella no se puede leer.': 'Save your providers (with their API keys), connectors, preferences and, optionally, a project template to a file to take them to another computer. The file is encrypted with the password you choose: without it, it cannot be read.',
+  'Carga un archivo .nesicode exportado desde otro equipo.': 'Load a .nesicode file exported from another computer.',
+  'Usar la configuración importada de': 'Use the imported configuration from',
+  '(modelos, verificación y harness)': '(models, check command and harness)',
+  'Carga el archivo .nesicode que exportaste en tu otro equipo (Cuenta → Exportar configuración): proveedores con sus keys, conectores, preferencias y la plantilla de proyecto.': 'Load the .nesicode file you exported on your other computer (Account → Export configuration): providers with their keys, connectors, preferences and the project template.',
+  '¿Vienes de otro equipo? Importa tu configuración': 'Coming from another computer? Import your configuration',
+  'El archivo no es una configuración de Nesicode': 'The file is not a Nesicode configuration',
+  'Contraseña incorrecta o archivo dañado': 'Wrong password or damaged file',
+  'El enlace de exportación caducó: vuelve a exportar': 'The export link expired: export again',
+  'Archivo demasiado grande': 'File too large',
+  'Office (Word, Excel, PowerPoint)': 'Office (Word, Excel, PowerPoint)',
+  'Crear, leer y editar documentos Word, hojas de Excel (con fórmulas y gráficos) y presentaciones PowerPoint. Integrado en Nesicode: no hay que instalar nada.': 'Create, read and edit Word documents, Excel sheets (with formulas and charts) and PowerPoint presentations. Built into Nesicode: nothing to install.',
+  'Microsoft 365 roadmap y Azure': 'Microsoft 365 roadmap and Azure',
+  'Pregunta por novedades de Microsoft 365 (Teams, Outlook, Excel…) y de Azure: qué sale, cuándo y qué se retira. Servidor oficial de Microsoft, público y gratuito.': "Ask about what's new in Microsoft 365 (Teams, Outlook, Excel…) and Azure: what ships, when, and what is retired. Official Microsoft server, public and free.",
+  'Tu Burp Suite (Pro o Community): historial del proxy, Repeater, enviar peticiones, Collaborator (solo Pro), codificar/decodificar. Antes instala en Burp la extensión oficial «MCP Server» (BApp Store) y actívala en su pestaña MCP.': 'Your Burp Suite (Pro or Community): proxy history, Repeater, sending requests, Collaborator (Pro only), encode/decode. First install the official “MCP Server” extension in Burp (BApp Store) and enable it in its MCP tab.',
+  'Burp Suite DAST (antes Enterprise): sitios, escaneos e incidencias con los permisos de tu usuario de API.': "Burp Suite DAST (formerly Enterprise): sites, scans and issues with your API user's permissions.",
+  'Dirección de tu Burp Suite DAST (p. ej. dast.miempresa.com)': 'Your Burp Suite DAST address (e.g. dast.mycompany.com)',
+  'API key de un usuario de API': 'API key of an API user',
+  'Este conector solo está disponible en modo local (sin login)': 'This connector is only available in local mode (no login)',
+  'Dirección del servidor MCP de Burp': 'Burp MCP server address',
+  'La que muestra la pestaña MCP de Burp. Necesita Burp 2023 o posterior. Si otro programa usa el 9876, cambia el puerto en Burp y aquí.': "The one shown in Burp's MCP tab. Requires Burp 2023 or later. If another program uses 9876, change the port in Burp and here.",
+  'Burp Suite (REST API, versiones antiguas)': 'Burp Suite (REST API, older versions)',
+  'Para Burp Suite Professional antiguo (2.x, 2020–2022) que no puede usar la extensión MCP: lanzar escaneos activos, ver su progreso y las vulnerabilidades encontradas. En Burp: User options → Misc → REST API → «Service running» y crea una API key.': 'For older Burp Suite Professional (2.x, 2020–2022) that cannot run the MCP extension: start active scans, follow their progress and see the vulnerabilities found. In Burp: User options → Misc → REST API → “Service running”, and create an API key.',
+  'Dirección de la REST API de Burp': 'Burp REST API address',
+  'La «Service URL» de User options → Misc → REST API (sin la API key).': 'The “Service URL” from User options → Misc → REST API (without the API key).',
+  'API key de la REST API': 'REST API key',
+  'Créala en User options → Misc → REST API → API keys. Solo se ve al crearla.': 'Create it in User options → Misc → REST API → API keys. It is only shown when created.',
+  'Esperando turno': 'Waiting its turn',
+  'Esta acción se aprueba cada vez.': 'This action is approved each time.',
+  'Poner en cola (Enter)': 'Queue (Enter)',
+  'En cola · se envían solos cuando termine la respuesta en curso': 'Queued · sent automatically when the current reply finishes',
+  'Quitar de la cola': 'Remove from queue',
+  'Escribe y se pondrá en cola…': 'Type and it will be queued…',
+  'Deteniendo…': 'Stopping…',
+  'Sin permiso para el micrófono: actívalo en Ajustes del Sistema → Privacidad y seguridad → Micrófono.': 'No microphone permission: enable it in System Settings → Privacy & Security → Microphone.',
+  'Este navegador no permite grabar audio.': 'This browser cannot record audio.',
+  'No se pudo usar el micrófono: ': 'Could not use the microphone: ',
+  'No he oído nada. Prueba otra vez más cerca del micrófono.': "I didn't hear anything. Try again closer to the microphone.",
+  'Descartar grabación (Esc)': 'Discard recording (Esc)',
+  'Terminar y transcribir': 'Finish and transcribe',
+  'Transcribiendo…': 'Transcribing…',
+  'Dictar un mensaje': 'Dictate a message',
+  'Transcripción': 'Transcription',
+  'convierte en texto lo que dictas con el micrófono (p. ej. openai/whisper-1). Vacío = el reconocimiento de voz del Mac': "turns what you dictate into text (e.g. openai/whisper-1). Empty = the Mac's speech recognition",
+  'Audio demasiado largo (máx. 25 MB)': 'Audio too long (max. 25 MB)',
+  'No hay transcripción configurada: elige un modelo de «Transcripción» en Ajustes del proyecto (p. ej. openai/whisper-1 o groq/whisper-large-v3). En la app de Mac funciona sin configurar nada.': 'No transcription configured: choose a “Transcription” model in Project settings (e.g. openai/whisper-1 or groq/whisper-large-v3). In the Mac app it works with no setup.',
+  'macOS no deja a Nesicode usar el reconocimiento de voz: actívalo en Ajustes del Sistema → Privacidad y seguridad → Reconocimiento de voz': "macOS doesn't let Nesicode use speech recognition: enable it in System Settings → Privacy & Security → Speech Recognition",
+  'La transcripción tardó demasiado': 'Transcription took too long',
+  'Enviar ya': 'Send now',
+  'Parar lo que está haciendo y enviar este mensaje ya': 'Stop what it is doing and send this message now',
+  'Poner en cola (Enter) · ⌘/Ctrl+Enter: parar y enviar ya': 'Queue (Enter) · ⌘/Ctrl+Enter: stop and send now',
+  'Ese mensaje ya no está en la cola': 'That message is no longer queued',
+}
