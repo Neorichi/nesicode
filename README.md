@@ -4,12 +4,12 @@ A coding agent that **improves its own harness** task by task, with a multi-user
 
 ![Nesicode quick start: add a provider, pick models by role, chat, connectors and bots](docs/demo/nesicode-demo.gif)
 
-▶ [Watch the quick-start video (MP4, 78 s)](docs/demo/nesicode-demo.mp4) — add your API key, pick a model for each role, chat, connectors and bots.
+▶ [Watch the quick-start video (MP4, 104 s)](docs/demo/nesicode-demo.mp4) — pick a project profile, add your API key, choose a model for each role, chat, connectors and bots.
 
 ## Quick tour
 
 <details open>
-<summary><b>1 · Create a project and add your provider + API key</b> (<a href="docs/demo/clips/1-setup.mp4">MP4</a>)</summary>
+<summary><b>1 · Create a project, pick a profile (General, Security, Web, Data, Documents or Blank) and add your provider + API key</b> (<a href="docs/demo/clips/1-setup.mp4">MP4</a>)</summary>
 
 ![Create a project and add a provider](docs/demo/clips/1-setup.gif)
 </details>

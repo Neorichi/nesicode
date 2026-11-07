@@ -99,6 +99,12 @@ with sync_playwright() as p:
     cap("Create a project (any folder — every chat works in its own isolated copy)", 0.6)
     form = page.locator("form.new-project")
     type_in(form.locator("input").nth(1), "demo-app")
+    cap("Pick a profile: General, Security, Web, Data, Documents — or Blank", 0.3)
+    cards = page.locator(".profile-card")
+    for i in range(cards.count()):
+        move(cards.nth(i))
+        time.sleep(0.35)
+    click(cards.filter(has_text="General").first)
     click(page.get_by_role("button", name="Create project"))
     page.wait_for_url("**/p/*")
     time.sleep(1)
