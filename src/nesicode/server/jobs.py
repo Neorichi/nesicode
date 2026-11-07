@@ -421,6 +421,12 @@ class Jobs:
 
         return emit
 
+    def shutdown(self) -> None:
+        """Stop every run (and any pending approval) so worker threads end — used at exit and by the tests."""
+        for ev in list(self.cancels.values()):
+            ev.set()
+        self.pool.shutdown(wait=False, cancel_futures=True)
+
     def cancel(self, run_id: int) -> bool:
         ev = self.cancels.get(run_id)
         if ev:

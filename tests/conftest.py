@@ -18,3 +18,14 @@ os.environ["NESICODE_VAULT_KEY"] = _b64.b64encode(b"t" * 32).decode()
 
 os.environ["NESICODE_NO_TELEGRAM"] = "1"  # tests drive the bot with a fake Telegram
 os.environ["NESICODE_NO_SCHEDULER"] = "1"  # tests call bots.tick() themselves
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _stop_jobs_at_exit():
+    yield
+    from nesicode.server.app import jobs  # runs left waiting on an approval must not keep the interpreter alive
+
+    jobs.shutdown()

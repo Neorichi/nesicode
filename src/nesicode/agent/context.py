@@ -276,15 +276,21 @@ def _search(ws, base, rx) -> str:
 # ------------------------------------------------------------------ cross-turn continuity
 _SECRET_RX = re.compile(
     r"(?i)((?:csrf[_-]?token|csrftoken|sessionid|session|token|access[_-]?token|refresh[_-]?token|api[_-]?key|apikey|"
-    r"secret|password|passwd|pwd|auth[a-z_]*|cookie|set-cookie|x-csrftoken|bearer)\s*[\"']?\s*[:=]\s*[\"']?\s*)"
+    r"secret|secret[_-]?access[_-]?key|access[_-]?key(?:[_-]?id)?|private[_-]?key|client[_-]?secret|"
+    r"password|passwd|pwd|auth[a-z_]*|cookie|set-cookie|x-csrftoken|x-api-key|bearer)\s*[\"']?\s*[:=]\s*[\"']?\s*"
+    r"(?:(?:basic|token|digest|apikey)\s+)?)"
     r"([A-Za-z0-9._~+/=%-]{6,})")
 _BEARER_RX = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
+_URL_CRED_RX = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://[^/\s:@]+:)[^/\s@]+(@)")
+_JWT_RX = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
 _HTTP_RX = re.compile(r"(?m)^(?:HTTP/[\d.]+\s+(\d{3})[^\n]*|.*\b(?:status(?:_code)?|code)[\"' :=]+(\d{3})\b.*)$")
 
 
 def redact(text: str) -> str:
     """Hide credential/session values (header and cookie names stay) before text is carried between turns."""
     text = _BEARER_RX.sub(r"\1<redacted>", text)  # first: "Authorization: Bearer <token>"
+    text = _URL_CRED_RX.sub(r"\1<redacted>\2", text)  # https://user:pass@host
+    text = _JWT_RX.sub("<redacted-jwt>", text)
     return _SECRET_RX.sub(lambda m: m.group(0) if m.group(2) == "<redacted>" or m.group(2).lower() == "bearer"
                           else m.group(1) + "<redacted>", text)
 

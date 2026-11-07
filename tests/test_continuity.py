@@ -191,3 +191,18 @@ def test_virustotal_subdomains(tmp_path):
     finally:
         vt.transport = None
     assert "api.vulnbank.org" in out and "dev.vulnbank.org · 2 malicious" in out and "cursor: NEXT" in out
+
+
+def test_redact_common_credential_shapes():
+    from nesicode.agent.context import redact
+
+    cases = ["Authorization: Basic dXNlcjpwYXNzd29yZA==", "Authorization: Token 9944b09199c62bcf9418ad846dd0e4bb",
+             "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY", "https://admin:S3cretPass@vulnbank.org/x",
+             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ2dWxuYmFuayJ9.c2lnbmF0dXJlLXZhbHVl",
+             "Authorization: Bearer abcdefghijklmnop123"]
+    for c, secret in zip(cases, ["dXNlcjpw", "9944b0", "wJalrX", "S3cretPass", "c2lnbmF0", "abcdefgh"]):
+        out = redact(c)
+        assert secret not in out, out
+    assert "Authorization: Basic <redacted>" == redact(cases[0])
+    assert "https://admin:<redacted>@vulnbank.org/x" == redact(cases[3])
+    assert "HTTP/1.1 403 Forbidden" == redact("HTTP/1.1 403 Forbidden")

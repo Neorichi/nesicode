@@ -6,7 +6,7 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 ROOT = Path(SPECPATH).parent
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 WEB = ROOT / "web" / "dist"
 if not (WEB / "index.html").exists():
     raise SystemExit("Build the web first: cd web && npm ci && npm run build")

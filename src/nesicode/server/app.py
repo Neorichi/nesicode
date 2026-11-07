@@ -775,6 +775,7 @@ def delete_bot(bot_id: int, user: dict = Depends(current_user)):
         db.execute("UPDATE runs SET status='cancelled', finished_at=? WHERE id=? AND status='waiting'", (time.time(), r["id"]))
     vault.delete(user["id"], f"bot:{bot_id}:webhook")
     db.execute("UPDATE runs SET bot_id=NULL WHERE bot_id=?", (b["id"],))  # ids can be reused: detach the history
+    db.execute("UPDATE threads SET bot_id=NULL WHERE bot_id=?", (b["id"],))  # …and the conversation (a plain chat now)
     db.execute("DELETE FROM bots WHERE id=?", (b["id"],))  # triggers and memory cascade; its conversation stays
     return {"ok": True}
 

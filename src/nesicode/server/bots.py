@@ -247,6 +247,9 @@ class BotManager:
             else:
                 self.db.execute("UPDATE bots SET thread_id=NULL WHERE id=?", (b["id"],))
             fixed += 1
+        # conversations of a deleted bot (or one whose id was reused by a newer bot) are plain chats
+        self.db.execute("UPDATE threads SET bot_id=NULL WHERE bot_id IS NOT NULL AND NOT EXISTS "
+                        "(SELECT 1 FROM bots b WHERE b.id=threads.bot_id AND b.thread_id=threads.id)")
         # runs that a reused thread id wrongly attributed to a bot are plain chat runs
         self.db.execute("UPDATE runs SET bot_id=NULL WHERE bot_id IS NOT NULL AND thread_id IS NOT NULL AND NOT EXISTS "
                         "(SELECT 1 FROM threads t WHERE t.id=runs.thread_id AND t.bot_id=runs.bot_id)")

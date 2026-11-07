@@ -1047,3 +1047,21 @@ def test_reused_thread_id_is_never_a_bot(alice, project):
     fresh = alice.get(f"/api/bots/{b['id']}").json()  # the bot gets its own new conversation, in its own project
     th = db.one("SELECT * FROM threads WHERE id=?", (fresh["thread_id"],))
     assert th["project_id"] == project["id"] and th["bot_id"] == b["id"] and fresh["thread_id"] != t["id"]
+
+
+def test_reused_bot_id_never_inherits_an_old_conversation(alice, project):
+    """Deleting a bot frees its id; the next bot must not take over the deleted bot's conversation."""
+    from nesicode.server.app import bots, db
+
+    b1 = alice.post("/api/bots", json=_bot_body(project, name="Vieja")).json()
+    old_tid = b1["thread_id"]
+    assert alice.delete(f"/api/bots/{b1['id']}").status_code == 200
+    assert db.one("SELECT bot_id FROM threads WHERE id=?", (old_tid,))["bot_id"] is None
+    b2 = alice.post("/api/bots", json=_bot_body(project, name="Nueva")).json()
+    assert b2["thread_id"] != old_tid
+    assert alice.get(f"/api/threads/{old_tid}").json()["thread"]["bot"] is None
+    # an old DB where the link was left behind is repaired at startup
+    db.execute("UPDATE threads SET bot_id=? WHERE id=?", (b2["id"], old_tid))
+    bots.repair_links()
+    assert db.one("SELECT bot_id FROM threads WHERE id=?", (old_tid,))["bot_id"] is None
+    assert db.one("SELECT bot_id FROM threads WHERE id=?", (b2["thread_id"],))["bot_id"] == b2["id"]
