@@ -1026,3 +1026,24 @@ def test_deleting_bot_conversation_deletes_bot(alice, project):
     assert again["thread_id"]  # (SQLite may reuse the same id)
     view = alice.get(f"/api/threads/{again['thread_id']}").json()
     assert view["thread"]["title"].startswith("🤖") and view["thread"]["bot"]["id"] == b2["id"]
+
+
+def test_reused_thread_id_is_never_a_bot(alice, project):
+    """The old bug: a bot's conversation was deleted, SQLite reused its id for a new chat in ANOTHER project,
+    and that chat showed the bot bar and ran the user's message as the bot."""
+    from nesicode.server.app import bots, db
+
+    b = alice.post("/api/bots", json=_bot_body(project, name="Post Diario")).json()
+    old_tid = b["thread_id"]
+    db.execute("DELETE FROM threads WHERE id=?", (old_tid,))  # what the old delete did (bot left pointing at it)
+    other = alice.post("/api/projects", json={"name": "Test2", "executor_model": "mock/demo", "improver_model": "mock/demo"}).json()
+    t = alice.post(f"/api/projects/{other['id']}/threads", json={}).json()
+    assert t["id"] == old_tid  # SQLite really reuses it
+    assert alice.get(f"/api/threads/{t['id']}").json()["thread"]["bot"] is None
+    run = alice.post(f"/api/threads/{t['id']}/messages", json={"text": "revisa el código"}).json()
+    assert run["bot_id"] is None and run["trigger"] == ""
+    bots.repair_links()
+    assert db.one("SELECT thread_id FROM bots WHERE id=?", (b["id"],))["thread_id"] is None
+    fresh = alice.get(f"/api/bots/{b['id']}").json()  # the bot gets its own new conversation, in its own project
+    th = db.one("SELECT * FROM threads WHERE id=?", (fresh["thread_id"],))
+    assert th["project_id"] == project["id"] and th["bot_id"] == b["id"] and fresh["thread_id"] != t["id"]

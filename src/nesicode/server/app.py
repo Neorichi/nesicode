@@ -667,12 +667,14 @@ from .bots import BotManager, CronError, local_tz, next_runs  # noqa: E402
 
 bots = BotManager(db, jobs, telegram)
 jobs.bots = bots
+bots.repair_links()  # links from before threads.bot_id existed
 bots.start()  # scheduler thread (off with NESICODE_NO_SCHEDULER)
 
 
 # ------------------------------------------------------------------------ bots
 def _bot_view(b: dict, full: bool = False) -> dict:
-    if not b.get("thread_id") or not db.one("SELECT id FROM threads WHERE id=?", (b["thread_id"],)):
+    linked = db.one("SELECT id FROM threads WHERE id=? AND bot_id=? AND project_id=?", (b.get("thread_id"), b["id"], b["project_id"]))
+    if not linked:
         bots.ensure_thread(b)  # its conversation was deleted earlier: give it a fresh one, never a dead link
         b = db.one("SELECT * FROM bots WHERE id=?", (b["id"],))
     trig = db.all("SELECT * FROM bot_triggers WHERE bot_id=? ORDER BY id", (b["id"],))
@@ -1732,7 +1734,7 @@ def read_thread(thread_id: int, user: dict = Depends(current_user)):
         view["events"] = [{"seq": s, **e} for s, e in db.events_after(r["id"], 0, limit=5000)]
         msgs.append(view)
     tg = db.one("SELECT chat_id, active_thread FROM telegram_links WHERE user_id=?", (user["id"],)) or {}
-    b = db.one("SELECT * FROM bots WHERE thread_id=? AND user_id=?", (thread_id, user["id"]))
+    b = db.one("SELECT * FROM bots WHERE id=? AND user_id=? AND project_id=?", (t.get("bot_id"), user["id"], t["project_id"])) if t.get("bot_id") else None
     return {"thread": {**thread_out(t), "effective_mode": jobs.exec_mode(t, user["id"]),
                        "telegram": {"linked": bool(tg.get("chat_id")), "attached": tg.get("active_thread") == t["id"]},
                        "bot": _bot_view(b) if b else None},
@@ -1777,7 +1779,7 @@ def delete_thread(thread_id: int, user: dict = Depends(current_user)):
     for r in db.all("SELECT id FROM runs WHERE thread_id=?", (thread_id,)):
         jobs.cancel(r["id"])
     # a bot IS its conversation: deleting the conversation deletes the bot (triggers, memory, webhook secret)
-    for b in db.all("SELECT id FROM bots WHERE thread_id=? AND user_id=?", (thread_id, user["id"])):
+    for b in db.all("SELECT id FROM bots WHERE id=? AND user_id=?", (t.get("bot_id") or -1, user["id"])):
         vault.delete(user["id"], f"bot:{b['id']}:webhook")
         db.execute("UPDATE runs SET bot_id=NULL WHERE bot_id=?", (b["id"],))
         db.execute("DELETE FROM bots WHERE id=?", (b["id"],))
@@ -1936,7 +1938,7 @@ def send_message(thread_id: int, body: MessageCreate, user: dict = Depends(curre
             raise HTTPException(422, f"El adjunto ya no existe: {rel}")
         atts.append(_attachment_meta(f, rel))
     first = db.one("SELECT COUNT(*) AS n FROM runs WHERE thread_id=?", (thread_id,))["n"] == 0
-    bot = db.one("SELECT id FROM bots WHERE thread_id=? AND user_id=?", (thread_id, user["id"]))
+    bot = db.one("SELECT id FROM bots WHERE id=? AND user_id=? AND project_id=?", (t.get("bot_id"), user["id"], p["id"])) if t.get("bot_id") else None
     rid = db.insert(
         "INSERT INTO runs (project_id, thread_id, kind, task, status, created_at, attachments, bot_id, trigger) "
         "VALUES (?, ?, 'chat', ?, 'waiting', ?, ?, ?, ?)",

@@ -234,6 +234,24 @@ class BotManager:
         jobs.on_finish.append(self.after_run)
 
     # ------------------------------------------------------------ bots
+    def repair_links(self) -> int:
+        """Bots created before threads.bot_id existed: keep a link only if that thread really is the bot's
+        (same project, a bot title); otherwise drop it — the bot gets a fresh conversation when needed."""
+        fixed = 0
+        for b in self.db.all("SELECT * FROM bots WHERE thread_id IS NOT NULL"):
+            t = self.db.one("SELECT * FROM threads WHERE id=?", (b["thread_id"],))
+            if t and t.get("bot_id") == b["id"]:
+                continue
+            if t and t["project_id"] == b["project_id"] and t.get("bot_id") is None and t["title"].startswith("🤖"):
+                self.db.execute("UPDATE threads SET bot_id=? WHERE id=?", (b["id"], t["id"]))
+            else:
+                self.db.execute("UPDATE bots SET thread_id=NULL WHERE id=?", (b["id"],))
+            fixed += 1
+        # runs that a reused thread id wrongly attributed to a bot are plain chat runs
+        self.db.execute("UPDATE runs SET bot_id=NULL WHERE bot_id IS NOT NULL AND thread_id IS NOT NULL AND NOT EXISTS "
+                        "(SELECT 1 FROM threads t WHERE t.id=runs.thread_id AND t.bot_id=runs.bot_id)")
+        return fixed
+
     def bot(self, bot_id: int, user_id: int | None = None) -> dict | None:
         if user_id is None:
             return self.db.one("SELECT * FROM bots WHERE id=?", (bot_id,))
@@ -243,11 +261,11 @@ class BotManager:
         from .chatops import ensure_thread
 
         t = self.db.one("SELECT * FROM threads WHERE id=?", (bot["thread_id"],)) if bot.get("thread_id") else None
-        if t and t["project_id"] == bot["project_id"]:
+        if t and t["project_id"] == bot["project_id"] and t.get("bot_id") == bot["id"]:
             return t
         project = self.db.one("SELECT * FROM projects WHERE id=?", (bot["project_id"],))
         t = ensure_thread(self.db, project, bot["user_id"], f"🤖 {bot['name']}")
-        self.db.execute("UPDATE threads SET exec_mode=? WHERE id=?", (exec_mode_for(bot["policy"]), t["id"]))
+        self.db.execute("UPDATE threads SET exec_mode=?, bot_id=? WHERE id=?", (exec_mode_for(bot["policy"]), bot["id"], t["id"]))
         self.db.execute("UPDATE bots SET thread_id=? WHERE id=?", (t["id"], bot["id"]))
         return self.db.one("SELECT * FROM threads WHERE id=?", (t["id"],))
 

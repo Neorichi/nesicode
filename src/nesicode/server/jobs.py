@@ -586,6 +586,13 @@ class Jobs:
             tools = self.connector_tools(project["user_id"], emit, context=recent, info=info)
             tools.update(self.chat_tools(project, emit))
             note = continuity_note(thread["id"], interrupted)
+            if thread["isolated"]:
+                where = project.get("folder") or "the project folder"
+                note += ("\n\n# Where your files go\nYou work in an ISOLATED COPY of the project (" + where + "), not in it: "
+                         "files you create or clone stay in this conversation until the user presses «Archivos → Aplicar al "
+                         "proyecto». Always work inside your workspace (never /tmp or other folders), and when you create files the "
+                         "user may expect in their folder, tell them where they are and that they appear in " + where +
+                         " after «Aplicar».")
             if info["on_request"]:
                 note += ("\n\n" if note else "") + ("# Connectors available on request\nThe user has these connectors but wants them used ONLY when they "
                         "explicitly ask for them by name: " + ", ".join(sorted(set(info["on_request"]))) + ". Do the task with "

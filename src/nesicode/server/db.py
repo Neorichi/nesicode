@@ -225,6 +225,8 @@ MIGRATIONS = [
     ("user_connectors", "usage", "TEXT NOT NULL DEFAULT 'mention'"),
     # project profile: general | security | webdev | data | docs (a harness overlay, see harness/profiles.py)
     ("projects", "profile", "TEXT NOT NULL DEFAULT 'general'"),
+    # the bot this conversation belongs to (set by the bot itself; ids can be reused, so never infer it from bots.thread_id)
+    ("threads", "bot_id", "INTEGER"),
     # per-conversation execution mode ('' = the user's default) and tools allowed "always" in it
     ("threads", "exec_mode", "TEXT NOT NULL DEFAULT ''"),
     # main folder picked by the user on disk ('' = nesicode keeps the files in its data dir)
