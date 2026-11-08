@@ -666,9 +666,15 @@ class Agent:
             lines.append(ctxm.skills_block(bodies, self._skills_loaded, min(12_000, b["skills"])))
         lines.append(git)
         lines.append(ctxm.recovery_footer(self.archive, tr_rel))
-        lines.append(FINAL_NUDGE if self._nudged else
-                     "Continue the task from the Next Step without asking for confirmation and without redoing completed "
-                     "actions. If something was only partly seen, read just the missing part.")
+        if self._parts:  # a reply cut by the output limit is being continued: pick it up, never restart it
+            lines.append("## Your last reply was cut off by the output limit\nIt is part of your answer to the user (already "
+                         "kept); it ended with:\n«…" + "".join(self._parts)[-1_500:] + "»\nContinue it exactly where it "
+                         "stopped — no recap, no repetition.")
+        elif self._nudged:
+            lines.append(FINAL_NUDGE)
+        else:
+            lines.append("Continue the task from the Next Step without asking for confirmation and without redoing completed "
+                         "actions. If something was only partly seen, read just the missing part.")
         return "\n\n".join(p for p in lines if p)
 
     @staticmethod

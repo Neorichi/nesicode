@@ -919,3 +919,25 @@ def test_mask_marker_of_a_cut_read_names_only_the_lines_the_model_saw(tmp_path):
     shown = int(re.search(r"showing lines 1–(\d+) of 316", r.content).group(1))
     marker = a._marker("c1", r.content)
     assert f"app.log lines 1–{shown} " in marker and f"offset=1, limit={shown})" in marker and "1–316" not in marker
+
+
+def test_cut_reply_still_continues_when_a_compaction_comes_right_after_it(tmp_path, fake):
+    # the report is cut by the per-reply cap (not by the room) just as the context crosses the threshold: the rebuilt
+    # conversation must ask to continue it, or the model rewrites it and the user gets it twice
+    def policy(conv, rec):
+        if rec["role"] == "summarizer":
+            return summarizer(rec)
+        n = len(prov.executor())
+        if n <= 10:
+            return Turn("escribo", [ToolCall(f"w{n}", "write_file", {"path": f"d{n}.txt", "content": "d" * 12_000})],
+                        "tool_use", Usage(0, 30))
+        if n == 11:
+            return Turn("# INFORME\nPARTE-1 " + "texto " * 10_500, [], "max_tokens", Usage(0, rec["max_tokens"]))
+        last = rec["messages"][-1]["content"]
+        assert ctxm.SUMMARY_PREFIX in last  # (the compaction did happen)
+        return Turn(" PARTE-2 fin." if "exactly where it stopped" in last else "# INFORME\notra vez", [], "end_turn", Usage(0, 20))
+    prov = fake(policy)
+    events = []
+    res = _agent(Workspace(tmp_path / "ws"), events, context_limit=65_536).run("escribe los datos y luego el informe")
+    assert [e["reason"] for e in events if e["type"] == "compacted"] == ["threshold"]
+    assert res.status == "done" and res.final_text.count("# INFORME") == 1 and res.final_text.endswith("PARTE-2 fin.")
