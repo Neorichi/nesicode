@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { ACTIVE, api, isAbort, money, relTime, statusLabel, STREAM_LOST, streamRun, type Run, type RunEvent } from '../api'
+import { ACTIVE, api, ApiError, isAbort, money, relTime, statusLabel, STREAM_LOST, streamRun, type Run, type RunEvent } from '../api'
 import { useApp, useProject } from '../App'
 import ApplyReport from '../components/ApplyReport'
 import Diff from '../components/Diff'
 import Transcript from '../components/Transcript'
 import { useVisibleInterval } from '../hooks'
 import { t, translateError, useLang } from '../i18n'
-import { applyCounts, followAgainIn, type ApplyResult } from '../logic'
+import { applyCounts, canRetryApply, followAgainIn, type ApplyResult } from '../logic'
 
 type Node = {
   label: string
@@ -194,6 +194,24 @@ function AppliedBox({ applied }: { applied: ApplyResult }) {
   )
 }
 
+/**
+ * «Aplicar» for a finished run: offered until something was applied, and again («Reintentar») while the last apply
+ * left out changes the server keeps the run's copies for (a folder that was not there, a file that could not be
+ * written…: see canRetryApply). Never once the server said those copies are gone (410): it could only fail again.
+ */
+export function ApplyButton({ applied, gone, busy, onApply }: { applied: ApplyResult | null; gone: boolean; busy: boolean; onApply: () => void }) {
+  useLang()
+  if (gone || (applied && !canRetryApply(applied))) return null
+  return applied ? (
+    <button className="btn" disabled={busy} onClick={onApply}
+      title={t('Vuelve a aplicar lo que quedó sin aplicar (p. ej. cuando la carpeta del proyecto vuelva a estar disponible). Lo que cambiaste en el proyecto no se sobrescribe.')}>
+      {t('Reintentar aplicar los cambios de código')}
+    </button>
+  ) : (
+    <button className="btn" disabled={busy} onClick={onApply}>{t('Aplicar los cambios de código al proyecto')}</button>
+  )
+}
+
 // Rendered with key={runId}: one instance per run, so Adopt/Apply always act on the run on screen.
 function RunDetail({ runId }: { runId: number }) {
   const { refreshProjects } = useApp()
@@ -203,6 +221,7 @@ function RunDetail({ runId }: { runId: number }) {
   const [err, setErr] = useState('') // a failed action (e.g. 409: the project is busy) — the buttons stay usable
   const [busy, setBusy] = useState(false)
   const [lastApplied, setLastApplied] = useState<ApplyResult | null>(null) // the «Aplicar» answer until the reload has it
+  const [copiesGone, setCopiesGone] = useState(false) // «Aplicar» answered 410: the run's copies of the project are gone
   const [merged, setMerged] = useState(false) // the manual adopt merged the run's edits onto a newer version
   const loadSeq = useRef(0)
   const loadCtl = useRef<AbortController | null>(null)
@@ -307,7 +326,10 @@ function RunDetail({ runId }: { runId: number }) {
         : t('Harness adoptado como v{n}', { n: r.version }))
   })
   const apply = () => act(async () => {
-    const r = await api.post<{ changes: ApplyResult }>(`/api/runs/${runId}/apply`)
+    const r = await api.post<{ changes: ApplyResult }>(`/api/runs/${runId}/apply`).catch((e) => {
+      if (e instanceof ApiError && e.status === 410) setCopiesGone(true) // (its message says why: shown below)
+      throw e
+    })
     setLastApplied(asApplied(r.changes) ?? {})
     await load().catch(() => {})
   })
@@ -402,7 +424,7 @@ function RunDetail({ runId }: { runId: number }) {
             ) : (
               <span className="muted">{t('El resultado elegido usa el harness base: no hay cambios que adoptar.')}</span>
             )}
-            {!applied && <button className="btn" disabled={busy} onClick={apply}>{t('Aplicar los cambios de código al proyecto')}</button>}
+            <ApplyButton applied={applied} gone={copiesGone} busy={busy} onApply={apply} />
           </div>
           {res.harness_changed && !res.adopted_version && adoptSkipped && (
             <div className="muted small">{t('No se adoptó automáticamente: {why}.', { why: translateError(adoptSkipped) })}</div>

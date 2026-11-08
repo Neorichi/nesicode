@@ -101,6 +101,44 @@ export function interruptedSaved(events: RunEvent[], text: string): boolean {
   return events.some((e) => e.type === 'assistant' && !e.depth && (e.interrupted || (!!head && String(e.text ?? '').includes(head))))
 }
 
+/**
+ * The runs of a conversation that was deleted meanwhile (in another tab, or with its project): the server stopped its
+ * reply and dropped its queue (cancelled) and nothing more will ever come for them, whatever a late reload said.
+ */
+export function endedRuns(runs: Run[]): Run[] {
+  const open = new Set(['queued', 'running', 'waiting'])
+  return runs.map((r) => (open.has(r.status) ? { ...r, status: 'cancelled' } : r))
+}
+
+// ------------------------------------------------------------------ the streaming reply
+/**
+ * Does this event end the reply text being streamed? Its final text is in the event ('assistant'), the run ended, a
+ * model call is retried from the start ('llm_retry'), or the context was compacted ('compacted', top level): a
+ * compaction comes between two model calls, so what was streaming then is a reply the agent dropped (cut by the
+ * output limit for lack of room, or over the model's context) and asks for again.
+ */
+export function endsLiveText(e: RunEvent): boolean {
+  return e.type === 'assistant' || e.type === 'done' || e.type === 'error' || e.type === 'cancelled'
+    || ((e.type === 'llm_retry' || e.type === 'compacted') && !e.depth)
+}
+
+/**
+ * The streaming reply's text after one batch of a run's live items (top level only): their text deltas appended, in
+ * order. Every compaction ends with a live 'context' item, reason 'compacted', and the text before it belongs to the
+ * dropped reply (see endsLiveText): it is cleared there — also when a reconnect replays the whole reply in one batch,
+ * dropped part included.
+ */
+export function liveText(text: string, items: unknown[]): string {
+  let out = text
+  for (const i of Array.isArray(items) ? items : []) {
+    const e = i as { type?: unknown; depth?: unknown; reason?: unknown; text?: unknown } | null
+    if (!e || typeof e !== 'object' || e.depth) continue
+    if (e.type === 'context' && e.reason === 'compacted') out = ''
+    else if (e.type === 'text_delta' && typeof e.text === 'string') out += e.text
+  }
+  return out
+}
+
 // ------------------------------------------------------------------ model-call retries
 /**
  * llm_retry events come one per retry of the same model call. Each run of consecutive ones (same depth) is shown
@@ -206,6 +244,18 @@ export function intervalSpec(n: string, u: IntervalUnit): string | null {
 /** Bot triggers the editor can change. 'once' follow-ups (scheduled by the bot itself) and webhooks are kept apart. */
 export const EDITABLE_TRIGGERS = ['cron', 'interval', 'url']
 
+/**
+ * What to tell after «Añadir proveedor» (POST /api/providers): '' when the server listed its models (or got them from
+ * the form); else its `warning` (it could not ask the endpoint: the provider was created anyway, with no models) and
+ * how to get them later.
+ */
+export function providerAddedNote(name: string, r: { warning?: unknown } | null | undefined): string {
+  const warning = typeof r?.warning === 'string' ? r.warning.trim() : ''
+  if (!warning) return ''
+  return t('«{name}» se ha añadido sin modelos. {warning}. Cuando el endpoint responda pulsa «Actualizar modelos», o escribe sus modelos en «Editar».',
+    { name, warning: translateError(warning).replace(/\.$/, '') })
+}
+
 /** Endpoint typed without a scheme ("localhost:11434/v1") → http for local hosts, https otherwise. */
 export function normalizeBaseUrl(raw: string): string {
   const s = raw.trim()
@@ -235,8 +285,10 @@ export function conflictWhy(reason: string): string {
   return known[reason] ?? String(reason ?? '')
 }
 
-// Apply's skipped paths come as "path: reason", the reason in English (workspace._why, or the system's message).
+// Apply's skipped paths come as "path: reason", the reason in English (workspace._why, or the system's message); an
+// uploaded ZIP's ones in Spanish (app._store_upload).
 const SKIP_WHY: [string, string][] = [
+  ['enlace simbólico, no se extrae', 'enlace simbólico, no se extrae'],
   ['it is a symbolic link (links are not followed; use the path it points to)', 'es un enlace simbólico (no se siguen enlaces: usa la ruta a la que apunta)'],
   ['a parent folder is a symbolic link or a file', 'una carpeta de su ruta es un enlace simbólico o un archivo'],
   ['not found', 'no se encontró'],
@@ -261,6 +313,15 @@ export function skippedPath(entry: string): { path: string; reason: string } {
   return i > 0 ? { path: s.slice(0, i), reason: s.slice(i + 2) } : { path: s, reason: '' }
 }
 
+/**
+ * What an upload to the project's folder answered (POST /api/projects/{id}/upload): how many files arrived, and the
+ * ZIP entries left out as "path: reason" (a symbolic link is never extracted; shown with skippedPath).
+ */
+export function uploadReport(r: { files?: unknown; skipped?: unknown } | null | undefined): { files: number; skipped: string[] } {
+  const files = typeof r?.files === 'number' && Number.isFinite(r.files) ? r.files : 0
+  return { files, skipped: list<unknown>(r?.skipped).filter((s): s is string => typeof s === 'string' && !!s) }
+}
+
 /** What an Apply really changed: a path it left out (conflict or skipped) is never counted, whatever list holds it. */
 export function applyCounts(r: ApplyResult | null | undefined): { added: number; modified: number; removed: number; left: number } {
   const conflicts = list<Conflict>(r?.conflicts)
@@ -275,6 +336,31 @@ export function applySummary(r: ApplyResult | null | undefined): string {
   const c = applyCounts(r)
   const head = t('Aplicados: +{a} ~{m} −{r}', { a: c.added, m: c.modified, r: c.removed })
   return c.left ? `${head} · ${t('{n} sin aplicar (detalle abajo)', { n: c.left })}` : head
+}
+
+/**
+ * After a harnessing run's «Aplicar» (or its auto-apply): can it be tried again? The server keeps the run's copies of
+ * the project for another try while the result is not all in the project (jobs._fully_applied): a change that could
+ * not be written ('error': the folder was not there, no permission, a full disk…), a proposed version that could not
+ * be put beside the user's file ('changed'/'exists' with no side file) or a file refused as 'unsafe' (its path goes
+ * through a link now). The page can't see those copies, so it offers the retry for each of those; when the server has
+ * none (e.g. a removal the user's own edit overrides, also 'changed' with no side file) it answers 410, and says so.
+ */
+export function canRetryApply(r: ApplyResult | null | undefined): boolean {
+  return list<Conflict>(r?.conflicts).some((c) => c?.reason === 'error' || c?.reason === 'unsafe'
+    || ((c?.reason === 'changed' || c?.reason === 'exists') && !c?.side_file))
+}
+
+// ------------------------------------------------------------------ a conversation's files
+/**
+ * Why an entry of a conversation's folder («Archivos») could not be shown. A symbolic link opens when it leads to a
+ * file of that folder; one that leads out of it (or nowhere) answers 404, which then says so; anything else is the
+ * server's own message.
+ */
+export function openFileError(entry: { path: string; link?: boolean }, status: number, message: string): string {
+  if (entry.link && status === 404)
+    return t('«{path}» es un enlace simbólico que apunta fuera de la carpeta de esta conversación (o a algo que no existe): no se puede abrir aquí.', { path: entry.path })
+  return message
 }
 
 // ------------------------------------------------------------------ connectors

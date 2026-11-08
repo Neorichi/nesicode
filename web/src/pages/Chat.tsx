@@ -1,13 +1,17 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { ACTIVE, api, isAbort, STREAM_LOST, streamRun, transcribeAudio, type Attachment, type Run, type RunEvent, type Thread } from '../api'
+import { ACTIVE, api, ApiError, isAbort, STREAM_LOST, streamRun, transcribeAudio, type Attachment, type Run, type RunEvent, type Thread } from '../api'
 import { useApp, useProject } from '../App'
 import ApplyReport from '../components/ApplyReport'
 import Composer, { AttachmentChip } from '../components/Composer'
 import Diff from '../components/Diff'
 import Transcript from '../components/Transcript'
+import { forgetDraft } from '../drafts'
 import { t, useLang } from '../i18n'
-import { applySummary, compactionNotice, compactReason, followAgainIn, mergeLoaded, queueStalled, runKey, withEvent, withRun, type ApplyResult } from '../logic'
+import {
+  applySummary, compactionNotice, compactReason, endedRuns, endsLiveText, followAgainIn, liveText, mergeLoaded, openFileError, queueStalled,
+  runKey, withEvent, withRun, type ApplyResult,
+} from '../logic'
 
 type Ctx = { used: number; limit: number; reason?: string }
 
@@ -20,10 +24,14 @@ const interruptedText = new Map<string, string>()
 export default function Chat() {
   const { pid, tid } = useParams()
   const project = useProject(pid)
-  const { refreshThreads, threads, threadsPid } = useApp()
+  const { refreshProjects, refreshThreads, threads, threadsPid } = useApp()
   const navigate = useNavigate()
   const [thread, setThread] = useState<Thread | null>(null)
-  const [runs, setRuns] = useState<Run[]>([])
+  const [loaded, setRuns] = useState<Run[]>([])
+  // Deleted meanwhile (in another tab, or with its project): its stream ends 'deleted', a reload answers 404. The page
+  // stays readable and says so; nothing in it runs any more, whatever a late reload or event says (no Stop, no queue).
+  const [gone, setGone] = useState(false)
+  const runs = useMemo(() => (gone ? endedRuns(loaded) : loaded), [gone, loaded])
   const [live, setLive] = useState('')
   const liveRef = useRef('')
   const [ctxLive, setCtxLive] = useState<Ctx | null>(null)
@@ -37,14 +45,12 @@ export default function Chat() {
   const seenUpdated = useRef<number | null>(null) // updated_at of the conversation on screen
   useLang()
 
-  const appendLive = (txt: string) => {
-    liveRef.current += txt
-    setLive(liveRef.current)
+  const showLive = (txt: string) => {
+    if (txt === liveRef.current) return
+    liveRef.current = txt
+    setLive(txt)
   }
-  const resetLive = () => {
-    liveRef.current = ''
-    setLive('')
-  }
+  const resetLive = () => showLive('')
   const loadCtl = useRef<AbortController | null>(null)
   // local changes a reload that started earlier doesn't know about yet (see mergeLoaded)
   const created = useRef(new Set<number>())
@@ -68,6 +74,7 @@ export default function Chat() {
       return data
     } catch (e) {
       if (isAbort(e)) return null
+      if (e instanceof ApiError && e.status === 404) setGone(true) // (see `gone`)
       throw e
     }
   }, [tid])
@@ -102,6 +109,19 @@ export default function Chat() {
     if (activeId || seenUpdated.current === null) return // a live reply reloads by itself when it ends
     if (row.updated_at > seenUpdated.current) load().catch(() => {})
   }, [row?.updated_at, row?.title, activeId, load]) // eslint-disable-line react-hooks/exhaustive-deps
+  // ...and when it drops out of that list it was probably deleted elsewhere: a reload says (404: `gone`)
+  const listed = threadsPid === Number(pid) ? !!row : null
+  const wasListed = useRef(false)
+  useEffect(() => {
+    if (listed) wasListed.current = true
+    else if (listed === false && wasListed.current) load().catch(() => {})
+  }, [listed, load])
+  useEffect(() => {
+    if (!gone) return
+    forgetDraft(`chat:${tid}`) // (as when it is deleted here)
+    refreshThreads()
+    refreshProjects().catch(() => {}) // deleted with its project: it leaves the list, and the way out leads home
+  }, [gone]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // A queued message with nothing running is about to start (see queueStalled): look again once, shortly, instead of
   // showing it queued (with no live progress) until it has finished.
@@ -134,8 +154,8 @@ export default function Chat() {
       onEvent: (e: RunEvent) => {
         setRuns((rs) => withEvent(rs, activeId, e))
         if (!e.depth && (e.type === 'cancelled' || e.type === 'error')) freeze()
-        // a retried model call starts its reply again from the beginning
-        if (e.type === 'assistant' || e.type === 'done' || e.type === 'error' || e.type === 'cancelled' || (e.type === 'llm_retry' && !e.depth)) resetLive()
+        // its text is in the event, the run ended, or the reply is asked for again (a retried call, a compaction)
+        if (endsLiveText(e)) resetLive()
         if (!e.depth) setNotice('') // the run moved on (e.g. 'compacted', with a fallback summary)
       },
       onLive: (items) => {
@@ -144,12 +164,12 @@ export default function Chat() {
         // shown while the compaction goes on; gone once it ended, even when both come in one batch (or a replay)
         const failed = compactionNotice(items)
         if (failed !== null) setNotice(failed)
-        const txt = items.filter((i) => i.type === 'text_delta' && !i.depth).map((i) => i.text).join('')
-        if (txt) appendLive(txt)
+        showLive(liveText(liveRef.current, items)) // (a reply dropped for a compaction is cleared, also when replayed)
       },
       onEnd: async (status) => {
         if (status !== 'done' && status !== 'max_steps' && status !== STREAM_LOST) freeze()
         resetLive()
+        if (status === 'deleted') setGone(true) // with its conversation or project: see `gone`
         const data = await load().catch(() => null)
         refreshThreads()
         // The connection gave up (server unreachable for a while) but the reply may go on: follow it again — now if
@@ -227,21 +247,23 @@ export default function Chat() {
     } catch (e) {
       setError((e as Error).message)
       setStoppingId(null)
+      if (e instanceof ApiError && e.status === 404) load().catch(() => {}) // the reply went with its conversation? (`gone`)
     }
   }
 
   return (
     <div className="chat">
       <header className="chat-head">
-        <ThreadTitle thread={thread} onSaved={(th) => { setThread(th); refreshThreads() }} />
+        <ThreadTitle thread={thread} locked={gone} onSaved={(th) => { setThread(th); refreshThreads() }} />
         <div className="row">
           {thread && (
             <span className={`cage ${thread.isolated ? 'on' : 'off'}`} title={thread.isolated ? t('Esta conversación trabaja en su propia carpeta aislada; no ve el proyecto ni otras conversaciones.') : t('Esta conversación trabaja directamente sobre la carpeta del proyecto (configuración global).')}>
               {thread.isolated ? `🔒 ${t('Aislada')}` : t('Compartida')}
             </span>
           )}
-          {thread?.isolated ? <ChangesButton tid={Number(tid)} busy={!!active} /> : null}
-          {thread?.telegram?.linked && (
+          {/* (a deleted conversation has nothing left to act on: its folder, its Telegram link and its mode are gone) */}
+          {thread?.isolated && !gone ? <ChangesButton tid={Number(tid)} busy={!!active} /> : null}
+          {thread?.telegram?.linked && !gone && (
             <button
               className={`btn small ${thread.telegram.attached ? 'primary' : ''}`}
               title={thread.telegram.attached ? t('Anclada en Telegram: lo que escribas allí va aquí y ves allí lo que pasa. Pulsa para soltarla.') : t('Anclar esta conversación en Telegram')}
@@ -258,7 +280,7 @@ export default function Chat() {
               📌 {thread.telegram.attached ? t('En Telegram') : 'Telegram'}
             </button>
           )}
-          {thread && (
+          {thread && !gone && (
             <select
               className="mode-select"
               value={thread?.exec_mode ?? ''}
@@ -286,7 +308,7 @@ export default function Chat() {
           )}
         </div>
       </header>
-      {thread?.bot && (
+      {thread?.bot && !gone && (
         <BotBar bot={thread.bot} onRun={async () => {
           try {
             await api.post(`/api/bots/${thread.bot.id}/run`, { text: '' })
@@ -330,29 +352,38 @@ export default function Chat() {
                 interrupted={r.id === activeId ? undefined : interruptedText.get(runKey(r))}
                 runId={r.id}
               />
-              {r.status !== 'running' && r.status !== 'queued' && <ImproveButton run={r} pid={Number(pid)} />}
+              {r.status !== 'running' && r.status !== 'queued' && !gone && <ImproveButton run={r} pid={Number(pid)} />}
             </div>
           ))}
           <div ref={bottom} />
         </div>
       </div>
       <div className="chat-foot">
-        {error && <div className="error-box">{error}</div>}
-        {queue.length > 0 && (
-          <div className="msg-queue">
-            <div className="muted small">{t('En cola · se envían solos cuando termine la respuesta en curso')}</div>
-            {queue.map((r) => (
-              <div key={r.id} className="queued-msg">
-                <span className="queued-text" title={r.task}>{r.task}</span>
-                {r.attachments && r.attachments.length > 0 && <span className="muted small">📎 {r.attachments.length}</span>}
-                <button className="queued-now" title={t('Parar lo que está haciendo y enviar este mensaje ya')} onClick={() => sendNow(r.id)}>⚡ {t('Enviar ya')}</button>
-                <button className="queued-x" title={t('Quitar de la cola')} onClick={() => unqueue(r.id)}>×</button>
-              </div>
-            ))}
+        {gone ? (
+          <div className="error-box">
+            {t('Esta conversación se ha eliminado (en otra pestaña o junto con su proyecto): ya no se puede seguir en ella.')}{' '}
+            <Link to={project ? `/p/${project.id}` : '/'}>{project ? t('Nueva conversación') : t('Ir al inicio')}</Link>
           </div>
+        ) : (
+          <>
+            {error && <div className="error-box">{error}</div>}
+            {queue.length > 0 && (
+              <div className="msg-queue">
+                <div className="muted small">{t('En cola · se envían solos cuando termine la respuesta en curso')}</div>
+                {queue.map((r) => (
+                  <div key={r.id} className="queued-msg">
+                    <span className="queued-text" title={r.task}>{r.task}</span>
+                    {r.attachments && r.attachments.length > 0 && <span className="muted small">📎 {r.attachments.length}</span>}
+                    <button className="queued-now" title={t('Parar lo que está haciendo y enviar este mensaje ya')} onClick={() => sendNow(r.id)}>⚡ {t('Enviar ya')}</button>
+                    <button className="queued-x" title={t('Quitar de la cola')} onClick={() => unqueue(r.id)}>×</button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <Composer draftKey={`chat:${tid}`} history={runs.map((r) => r.task)} onSend={send} onStop={stop} onUpload={upload} busy={!!active} stopping={!!active && stoppingId === activeId} queueWhileBusy transcribe={(wav) => transcribeAudio(pid!, wav)} placeholder={active ? t('Escribe y se pondrá en cola…') : t('Responde o pide otra cosa…')} autoFocus />
+            <div className="foot-note">{t('Nesicode puede ejecutar comandos y modificar archivos del proyecto.')}</div>
+          </>
         )}
-        <Composer draftKey={`chat:${tid}`} history={runs.map((r) => r.task)} onSend={send} onStop={stop} onUpload={upload} busy={!!active} stopping={!!active && stoppingId === activeId} queueWhileBusy transcribe={(wav) => transcribeAudio(pid!, wav)} placeholder={active ? t('Escribe y se pondrá en cola…') : t('Responde o pide otra cosa…')} autoFocus />
-        <div className="foot-note">{t('Nesicode puede ejecutar comandos y modificar archivos del proyecto.')}</div>
       </div>
     </div>
   )
@@ -360,6 +391,24 @@ export default function Chat() {
 
 // (skipped: paths an earlier Apply could not copy, when the server keeps listing them until they are resolved)
 type Changes = { added: string[]; modified: string[]; removed: string[]; diff: string; skipped?: string[] }
+// A symbolic link is listed as one entry (never entered or followed): it opens when it points to a file of the copy.
+type TreeEntry = { path: string; dir: boolean; size: number; link?: boolean }
+
+/** The conversation's folder, one entry per line: folders unfold below themselves, links are marked (see TreeEntry). */
+export function FileTree({ tree, active, onOpen }: { tree: TreeEntry[]; active?: string; onOpen: (e: TreeEntry) => void }) {
+  useLang()
+  return (
+    <div className="tree">
+      {tree.length === 0 && <div className="muted small pad">{t('Carpeta vacía.')}</div>}
+      {tree.map((e) => (
+        <button key={e.path} className={`tree-item ${active === e.path ? 'active' : ''}`} style={{ paddingLeft: 10 + (e.path.split('/').length - 1) * 14 }} disabled={e.dir} onClick={() => onOpen(e)}
+          title={e.link ? t('Enlace simbólico: se abre si apunta a un fichero de esta carpeta') : undefined}>
+          {e.dir ? '▸ ' : e.link ? '↪ ' : ''}{e.path.split('/').pop()}
+        </button>
+      ))}
+    </div>
+  )
+}
 
 function ChangesButton({ tid, busy }: { tid: number; busy: boolean }) {
   const { refreshProjects } = useApp()
@@ -370,13 +419,24 @@ function ChangesButton({ tid, busy }: { tid: number; busy: boolean }) {
   const [applied, setApplied] = useState<ApplyResult | null>(null) // the last Apply's answer: what it left out and why
   const [applying, setApplying] = useState(false)
   const [tab, setTab] = useState<'changes' | 'files'>('changes')
-  const [tree, setTree] = useState<{ path: string; dir: boolean; size: number }[]>([])
+  const [tree, setTree] = useState<TreeEntry[]>([])
   const [file, setFile] = useState<{ path: string; content: string; binary: boolean; image?: boolean } | null>(null)
+  const [fileErr, setFileErr] = useState('') // the entry picked can't be shown (a link out of the copy, deleted meanwhile…)
+  const opening = useRef(0) // only the entry picked last may show
   const load = useCallback(async () => setCh(await api.get<Changes>(`/api/threads/${tid}/changes`)), [tid])
   const loadTree = useCallback(async () => setTree(await api.get(`/api/threads/${tid}/tree`)), [tid])
-  const openFile = async (path: string) => {
-    if (/\.(png|jpe?g|gif|webp)$/i.test(path)) return setFile({ path, content: '', binary: false, image: true })
-    setFile(await api.get(`/api/threads/${tid}/file?path=${encodeURIComponent(path)}`))
+  const openFile = async (e: TreeEntry) => {
+    const n = ++opening.current
+    setFileErr('')
+    if (/\.(png|jpe?g|gif|webp)$/i.test(e.path)) return setFile({ path: e.path, content: '', binary: false, image: true })
+    try {
+      const f = await api.get<{ path: string; content: string; binary: boolean }>(`/api/threads/${tid}/file?path=${encodeURIComponent(e.path)}`)
+      if (n === opening.current) setFile(f)
+    } catch (err) {
+      if (n !== opening.current) return
+      setFile(null) // never the previous file's text under this one's name
+      setFileErr(openFileError(e, err instanceof ApiError ? err.status : 0, (err as Error).message))
+    }
   }
   useEffect(() => {
     if (!busy) load()
@@ -412,22 +472,17 @@ function ChangesButton({ tid, busy }: { tid: number; busy: boolean }) {
             <div className="drawer-head">
               <div className="tabs flat">
                 <button className={tab === 'changes' ? 'on' : ''} onClick={() => setTab('changes')}>{t('Cambios')}{n ? ` · ${n}` : ''}</button>
-                <button className={tab === 'files' ? 'on' : ''} onClick={() => { setTab('files'); loadTree() }}>{t('Archivos')}</button>
+                <button className={tab === 'files' ? 'on' : ''} onClick={() => { setTab('files'); loadTree().catch((e) => setFileErr((e as Error).message)) }}>{t('Archivos')}</button>
               </div>
               <button className="icon-btn" onClick={() => setOpen(false)} aria-label={t('Cerrar')}>✕</button>
             </div>
             {tab === 'files' ? (
               <div className="files-grid modal-files">
-                <div className="tree">
-                  {tree.length === 0 && <div className="muted small pad">{t('Carpeta vacía.')}</div>}
-                  {tree.map((e) => (
-                    <button key={e.path} className={`tree-item ${file?.path === e.path ? 'active' : ''}`} style={{ paddingLeft: 10 + (e.path.split('/').length - 1) * 14 }} disabled={e.dir} onClick={() => openFile(e.path)}>
-                      {e.dir ? '▸ ' : ''}{e.path.split('/').pop()}
-                    </button>
-                  ))}
-                </div>
+                <FileTree tree={tree} active={file?.path} onOpen={openFile} />
                 <div className="editor">
-                  {file ? (
+                  {fileErr ? (
+                    <div className="error-box">{fileErr}</div>
+                  ) : file ? (
                     <>
                       <div className="editor-head"><code>{file.path}</code></div>
                       {file.image ? <img className="viewer-img" src={`/api/threads/${tid}/file?path=${encodeURIComponent(file.path)}`} alt={file.path} /> : <pre className="code viewer">{file.binary ? t('(binario)') : file.content}</pre>}
@@ -532,11 +587,12 @@ function ContextMeter({ runs, live }: { runs: Run[]; live: Ctx | null }) {
   )
 }
 
-function ThreadTitle({ thread, onSaved }: { thread: Thread | null; onSaved: (t: Thread) => void }) {
+function ThreadTitle({ thread, locked, onSaved }: { thread: Thread | null; locked?: boolean; onSaved: (t: Thread) => void }) {
   const [editing, setEditing] = useState(false)
   const [value, setValue] = useState('')
   useLang()
   if (!thread) return <div className="chat-title">…</div>
+  if (locked) return <div className="chat-title">{thread.title}</div> // (deleted: nothing to rename)
   const save = async () => {
     const title = value.trim()
     setEditing(false)

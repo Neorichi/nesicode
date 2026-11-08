@@ -949,4 +949,14 @@ const EN: Record<string, string> = {
   'Bot de Telegram': 'Telegram bot',
   'sustituye al bot de Telegram de este equipo': "replaces this computer's Telegram bot",
   'bots: {names}': 'bots: {names}',
+  // final review (web)
+  'Reintentar aplicar los cambios de código': 'Retry applying the code changes',
+  'Vuelve a aplicar lo que quedó sin aplicar (p. ej. cuando la carpeta del proyecto vuelva a estar disponible). Lo que cambiaste en el proyecto no se sobrescribe.': "Applies again what was left out (e.g. once the project folder is available again). What you changed in the project isn't overwritten.",
+  'Esta conversación se ha eliminado (en otra pestaña o junto con su proyecto): ya no se puede seguir en ella.': "This conversation was deleted (in another tab, or along with its project): it can't be continued.",
+  'Ir al inicio': 'Go to the start page',
+  '«{path}» es un enlace simbólico que apunta fuera de la carpeta de esta conversación (o a algo que no existe): no se puede abrir aquí.': "“{path}” is a symbolic link that points outside this conversation's folder (or to something that doesn't exist): it can't be opened here.",
+  'Enlace simbólico: se abre si apunta a un fichero de esta carpeta': 'Symbolic link: it opens if it points to a file in this folder',
+  '{n} entrada(s) del .zip no se extrajeron:': '{n} .zip entry(ies) were not extracted:',
+  'enlace simbólico, no se extrae': 'symbolic link, not extracted',
+  '«{name}» se ha añadido sin modelos. {warning}. Cuando el endpoint responda pulsa «Actualizar modelos», o escribe sus modelos en «Editar».': '“{name}” was added with no models. {warning}. When the endpoint responds press “Refresh models”, or type its models in “Edit”.',
 }

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
 import { t, translateError, useLang } from '../i18n'
 import { cachedLimits, forgetLearned, watchLimits } from '../limits'
-import { normalizeBaseUrl } from '../logic'
+import { normalizeBaseUrl, providerAddedNote } from '../logic'
 
 type Assigned = { project: string; executor_model?: string; improver_model?: string; vision_model?: string }
 
@@ -171,7 +171,8 @@ function ModelLimits({ spec }: { spec: string }) {
   )
 }
 
-function ProviderForm({ initial, templates, onDone }: { initial?: ProviderRow; templates: Template[]; onDone: () => void }) {
+/** `onDone(note)`: closed; `note` says what the user should know about the provider just added ('' when nothing). */
+function ProviderForm({ initial, templates, onDone }: { initial?: ProviderRow; templates: Template[]; onDone: (note?: string) => void }) {
   const editing = !!initial
   const [f, setF] = useState({
     name: initial?.name ?? '',
@@ -220,18 +221,20 @@ function ProviderForm({ initial, templates, onDone }: { initial?: ProviderRow; t
     const models = f.models.split(/[\n,]/).map((m) => m.trim()).filter(Boolean)
     try {
       const base_url = baseUrl()
+      let note = ''
       if (editing) {
         await api.patch(`/api/providers/${initial!.name}`, {
           label: f.label, kind: f.kind, base_url, models, ...(f.api_key ? { api_key: f.api_key } : {}),
         })
       } else {
-        const r = await api.post<{ assigned?: Assigned[] }>('/api/providers', { name: f.name, label: f.label, kind: f.kind, base_url, api_key: f.api_key || undefined, models })
+        const r = await api.post<{ assigned?: Assigned[]; warning?: string }>('/api/providers', { name: f.name, label: f.label, kind: f.kind, base_url, api_key: f.api_key || undefined, models })
         if (r.assigned?.length) {
           alertAssigned(assignedText(r.assigned))
         }
+        note = providerAddedNote(f.name, r) // created, but its models could not be listed: say so, and how to get them
       }
       await reloadProviders()
-      onDone()
+      onDone(note)
     } catch (e) {
       setMsg({ err: (e as Error).message })
     } finally {
@@ -287,7 +290,7 @@ function ProviderForm({ initial, templates, onDone }: { initial?: ProviderRow; t
         <button type="button" className="btn" disabled={busy || !f.base_url} onClick={() => test(false)}>{t('Probar conexión')}</button>
         <button type="button" className="btn" disabled={busy || !f.base_url} onClick={() => test(true)}>{t('Descubrir modelos')}</button>
         <span style={{ flex: 1 }} />
-        <button type="button" className="btn ghost" onClick={onDone}>{t('Cancelar')}</button>
+        <button type="button" className="btn ghost" onClick={() => onDone()}>{t('Cancelar')}</button>
         <button type="button" className="btn primary" disabled={busy || !f.name || !f.base_url} onClick={save}>{editing ? t('Guardar') : t('Añadir proveedor')}</button>
       </div>
     </div>
@@ -299,6 +302,11 @@ export default function ProvidersSection({ onAssigned }: { onAssigned?: () => vo
   useLang()
   const [editing, setEditing] = useState<string | null>(null)
   const [msg, setMsg] = useState('')
+  const [warn, setWarn] = useState('') // the provider just added has no models (its endpoint could not list them)
+  const closeForm = (note?: string) => {
+    setEditing(null)
+    setWarn(note ?? '')
+  }
   useEffect(() => {
     assignedListener = (m) => {
       setMsg(m.replace(/^ · /, ''))
@@ -311,6 +319,7 @@ export default function ProvidersSection({ onAssigned }: { onAssigned?: () => vo
 
   const discover = useCallback(async (name: string) => {
     setMsg('')
+    setWarn('')
     try {
       const r = await api.post<{ models: string[]; assigned?: Assigned[] }>(`/api/providers/${name}/discover`)
       await reloadProviders()
@@ -324,6 +333,7 @@ export default function ProvidersSection({ onAssigned }: { onAssigned?: () => vo
   // hide / show / delete: on failure say why instead of failing silently
   const act = async (call: () => Promise<unknown>) => {
     setMsg('')
+    setWarn('')
     try {
       await call()
     } catch (e) {
@@ -336,9 +346,10 @@ export default function ProvidersSection({ onAssigned }: { onAssigned?: () => vo
   return (
     <div className="providers">
       {msg && <div className="ok-box">{msg}</div>}
+      {warn && <div className="error-box">{warn}</div>}
       {data.providers.map((p) =>
         editing === p.name ? (
-          <ProviderForm key={p.name} initial={p} templates={data.templates} onDone={() => setEditing(null)} />
+          <ProviderForm key={p.name} initial={p} templates={data.templates} onDone={closeForm} />
         ) : (
           <div key={p.name} className="prov">
             <div className="prov-main">
@@ -405,7 +416,7 @@ export default function ProvidersSection({ onAssigned }: { onAssigned?: () => vo
         </div>
       )}
       {editing === '__new__' ? (
-        <ProviderForm templates={data.templates} onDone={() => setEditing(null)} />
+        <ProviderForm templates={data.templates} onDone={closeForm} />
       ) : (
         <button className="btn" onClick={() => setEditing('__new__')}>{t('+ Añadir proveedor')}</button>
       )}
