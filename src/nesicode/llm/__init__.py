@@ -31,6 +31,7 @@ from .base import (
 )
 from .mock import MockProvider
 from .openai_compat import OpenAICompatProvider
+from .transport import private_providers_allowed
 
 
 @dataclass(frozen=True)
@@ -116,11 +117,16 @@ def split_any(spec: str, ctx: ProviderContext | None = None) -> tuple[str, str]:
 
 
 def build_provider(kind: str, name: str, base_url: str, api_key: str) -> Provider:
+    """A user-defined provider. It only ever uses its own endpoint and key: never the server's (no fallback to
+    ANTHROPIC_API_KEY & co.). With NESICODE_ALLOW_PRIVATE_PROVIDERS=0 the address it connects to is checked on
+    every request, not only when the endpoint was saved (DNS can change)."""
+    guard = not private_providers_allowed()
     if kind == "anthropic":
         default = base_url.rstrip("/") in ("", "https://api.anthropic.com")
-        return AnthropicProvider(api_key=api_key or None, base_url=None if default else base_url)
+        return AnthropicProvider(api_key=api_key or "", base_url=None if default else base_url, isolated=True,
+                                 guard_private=guard)
     if kind == "openai":
-        return OpenAICompatProvider(name, base_url, api_key)
+        return OpenAICompatProvider(name, base_url, api_key, guard_private=guard)
     raise LLMError(f"unknown provider kind {kind!r}")
 
 
@@ -174,8 +180,14 @@ def list_models(kind: str, base_url: str, api_key: str, timeout: float = 20.0) -
         raise LLMError(f"no se pudo conectar: {exc}") from exc
     if r.status_code >= 400:
         raise LLMError(f"HTTP {r.status_code}: {r.text[:300]}")
-    data = r.json()
-    items = data.get("data", data.get("models", [])) if isinstance(data, dict) else data
+    hint = "¿es una API compatible con OpenAI? Revisa la URL (suele terminar en /v1)"
+    try:
+        data = r.json()
+    except ValueError as exc:  # an HTML page (web site, SPA, captive portal) instead of the API
+        raise LLMError(f"la respuesta de {url} no es JSON ({r.headers.get('content-type', '?')}): {hint}") from exc
+    items = (data.get("data") if "data" in data else data.get("models")) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        raise LLMError(f"la respuesta de {url} no trae una lista de modelos: {hint}")
     ids = sorted({str(m.get("id") or m.get("name")) for m in items if isinstance(m, dict) and (m.get("id") or m.get("name"))})
     return ids
 
@@ -210,77 +222,106 @@ def fetch_limits(kind: str, base_url: str, api_key: str, model: str, timeout: fl
     import httpx
 
     base = base_url.rstrip("/")
+
+    def body(r) -> dict:  # a JSON object, or {} for anything else (HTML pages, lists, errors)
+        try:
+            data = r.json() if r.status_code == 200 else {}
+        except ValueError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
     try:
         if kind == "anthropic":
             r = httpx.get((base or "https://api.anthropic.com") + f"/v1/models/{model}",
                           headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"}, timeout=timeout)
-            if r.status_code == 200 and r.json().get("max_input_tokens"):
-                d = r.json()
+            d = body(r)
+            if d.get("max_input_tokens"):
                 return {"context": int(d["max_input_tokens"]), "output": int(d.get("max_tokens") or 0) or None}
             return None
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         # LiteLLM proxies (e.g. Nesi Labs): /model/info
         root = re.sub(r"/v1$", "", base)
-        r = httpx.get(root + "/model/info", headers=headers, timeout=timeout)
-        is_litellm = r.status_code == 200 and isinstance(r.json().get("data"), list)
-        if r.status_code == 200:
-            best = None
-            for m in r.json().get("data", []):
-                info = m.get("model_info") or {}
-                if m.get("model_name") == model and info.get("max_input_tokens"):
-                    cand = {"context": int(info["max_input_tokens"]), "output": int(info.get("max_output_tokens") or 0) or None}
-                    best = cand if not best or cand["context"] < best["context"] else best  # several backends: the smallest is safe
-            if best:
-                return best
+        info_list = body(httpx.get(root + "/model/info", headers=headers, timeout=timeout)).get("data")
+        is_litellm = isinstance(info_list, list)
+        best = None
+        for m in info_list if is_litellm else []:
+            if not isinstance(m, dict):
+                continue
+            info = m.get("model_info") if isinstance(m.get("model_info"), dict) else {}
+            if m.get("model_name") == model and info.get("max_input_tokens"):
+                cand = {"context": int(info["max_input_tokens"]), "output": int(info.get("max_output_tokens") or 0) or None}
+                best = cand if not best or cand["context"] < best["context"] else best  # several backends: the smallest is safe
+        if best:
+            return best
         # OpenRouter-style /models with context_length
-        r = httpx.get(base + "/models", headers=headers, timeout=timeout)
-        if r.status_code == 200:
-            for m in (r.json().get("data") or []):
-                if m.get("id") == model:
+        listed = body(httpx.get(base + "/models", headers=headers, timeout=timeout)).get("data")
+        if isinstance(listed, list):
+            for m in listed:
+                if isinstance(m, dict) and m.get("id") == model:
                     c = m.get("context_length") or m.get("context_window") or m.get("max_context_length")
                     if c:
                         top = m.get("top_provider") or {}
                         return {"context": int(c), "output": int(top.get("max_completion_tokens") or 0) or None}
         # Not reported: measure it. An oversized request is rejected (not billed) and the error says the limit.
         if is_litellm:
-            return probe_limit(base, headers, model, timeout=240)
+            return probe_limit(base, headers, model)
     except Exception:
         return None
     return None
 
 
 LIMIT_PATTERNS = [
-    r"maximum (?:context|input|model) length is ([0-9][0-9,]*)",
+    r"maximum (?:context|input|model|prompt) length is ([0-9][0-9,]*)",  # OpenAI, vLLM; xAI says "prompt"
     r"available context size \(([0-9][0-9,]*) tokens\)",
     r"max_model_len[^0-9]{0,10}([0-9][0-9,]*)",
     r"tokens? > ([0-9][0-9,]*) maximum",  # Anthropic: "prompt is too long: 1050000 tokens > 1000000 maximum"
-    r"context (?:window|length) (?:is|of) ([0-9][0-9,]*)",
+    # Anthropic (older): "input length and `max_tokens` exceed context limit: 195000 + 64000 > 200000, decrease ..."
+    r"exceed context limit: [0-9,]+ \+ [0-9,]+ > ([0-9][0-9,]*)",
+    # Gemini: "The input token count (1200000) exceeds the maximum number of tokens allowed (1048576)."
+    r"maximum number of tokens allowed \(([0-9][0-9,]*)\)",
+    # Mistral: "... too large for model with 131072 maximum context length"
+    r"([0-9][0-9,]*) maximum context length",
+    # llama.cpp: {"type": "exceed_context_size_error", "n_prompt_tokens": 10000, "n_ctx": 8192}
+    r"\"n_ctx\"\s*:\s*([0-9]+)",
+    # OpenAI: "Input tokens exceed the configured limit of 272000 tokens." (tokens: not a gateway's byte/request limit)
+    r"exceeds? the configured limit of ([0-9][0-9,]*) tokens",
+    r"context (?:window|length) (?:is|of) (?:only )?([0-9][0-9,]*)",  # LM Studio: "context length of only 4096"
     r"exceeds? (?:the )?(?:model'?s? )?(?:maximum )?(?:context|token) (?:limit|length) (?:of )?([0-9][0-9,]*)",
 ]
 
 
 def parse_limit(text: str) -> int | None:
     for rx in LIMIT_PATTERNS:
-        m = re.search(rx, text, re.I)
+        m = re.search(rx, text or "", re.I)
         if m:
             return int(m.group(1).replace(",", ""))
     return None
 
 
-def probe_limit(base: str, headers: dict, model: str, timeout: float = 240) -> dict | None:
-    """Send ~600k tokens with max_tokens=1 to self-hosted/proxied models and read the limit from the
-    rejection. Only used when the provider does not publish the context window."""
+_probed: set[tuple[str, str]] = set()  # (endpoint, model) probes that told us nothing: never sent again
+
+
+def probe_limit(base: str, headers: dict, model: str, timeout: float = 60.0) -> dict | None:
+    """Send ~300-600k tokens with max_tokens=1 to self-hosted/proxied models and read the limit from the rejection
+    (not billed). Only used when the provider does not publish the context window. If the model ACCEPTS the probe
+    (a window that big, and the request is billed), the result is None — the table/default is used — and the probe
+    is not repeated while the server runs."""
     import httpx
 
+    key = (base, model)
+    if key in _probed:
+        return None
     try:
-        r = httpx.post(base + "/chat/completions", headers=headers, timeout=timeout,
+        r = httpx.post(base + "/chat/completions", headers=headers, timeout=httpx.Timeout(timeout, connect=15.0),
                        json={"model": model, "messages": [{"role": "user", "content": "hola " * 300_000}], "max_tokens": 1})
     except Exception:
+        _probed.add(key)
         return None
-    if r.status_code < 400:
-        return {"context": 600_000, "output": None}  # accepted: at least this big
-    limit = parse_limit(r.text)
-    return {"context": limit, "output": None} if limit else None
+    limit = parse_limit(r.text) if r.status_code >= 400 else None
+    if not limit:
+        _probed.add(key)
+        return None
+    return {"context": limit, "output": None}
 
 
 # Pre-filled forms for the "Añadir proveedor" dialog.

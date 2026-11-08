@@ -1,8 +1,19 @@
-"""Claude via the official Anthropic SDK (streaming manual tool loop)."""
+"""Claude via the official Anthropic SDK (streaming manual tool loop).
+
+Each request streams on a helper thread (`transport.pump`), so Stop aborts it at once: while connecting, while Claude
+streams a large tool input, and between retries. The retries are ours (the SDK's are off: its backoff cannot be
+cancelled and it does not cover errors that arrive mid-stream). Prompt caching: a breakpoint on the system prompt
+(which caches the tools too) and a rolling one on the last message."""
 
 from __future__ import annotations
 
+import json
+import os
+import re
+import threading
+
 import anthropic
+import httpx2
 
 from .base import (
     Conversation,
@@ -12,42 +23,141 @@ from .base import (
     Provider,
     ToolCall,
     ToolResult,
-    ToolSpec,
     Turn,
     Usage,
 )
+from .transport import (
+    CONNECT_TIMEOUT,
+    RETRY_STATUS,
+    Call,
+    Retryable,
+    address_problem,
+    proxied,
+    pump,
+    retry_after_seconds,
+    with_retries,
+)
 
-# $ per 1M tokens (input, output). Unknown models report cost 0.
+# $ per 1M tokens: (input, output, cache read). Cache writes (5-minute TTL) cost 1.25x input. Unknown models cost 0;
+# dated ids (claude-opus-4-5-20251101) use the price of their family.
 PRICES = {
-    "claude-fable-5-1": (10.0, 50.0),
-    "claude-fable-5": (10.0, 50.0),
-    "claude-opus-5-5": (4.0, 20.0),
-    "claude-opus-5": (5.0, 25.0),
-    "claude-opus-4-8": (5.0, 25.0),
-    "claude-sonnet-5-5": (2.0, 10.0),
-    "claude-sonnet-5": (2.0, 10.0),
-    "claude-haiku-5-5": (0.10, 0.50),
-    "claude-haiku-4-5": (1.0, 5.0),
+    "claude-fable-5-1": (10.0, 50.0, 0.25),
+    "claude-mythos-5-1": (10.0, 50.0, 0.25),
+    "claude-fable-5": (10.0, 50.0, 1.0),
+    "claude-mythos-5": (10.0, 50.0, 1.0),
+    "claude-opus-5-5": (4.0, 20.0, 0.20),
+    "claude-opus-5": (5.0, 25.0, 0.50),
+    "claude-opus-4-8": (5.0, 25.0, 0.50),
+    "claude-opus-4-7": (5.0, 25.0, 0.50),
+    "claude-opus-4-6": (5.0, 25.0, 0.50),
+    "claude-opus-4-5": (5.0, 25.0, 0.50),
+    "claude-sonnet-5-5": (2.0, 10.0, 0.20),
+    "claude-sonnet-5": (2.0, 10.0, 0.20),
+    "claude-sonnet-4-6": (3.0, 15.0, 0.30),
+    "claude-sonnet-4-5": (3.0, 15.0, 0.30),
+    "claude-haiku-5-5": (0.10, 0.50, 0.01),
+    "claude-haiku-4-5": (1.0, 5.0, 0.10),
 }
+LONG_PROMPT_PRICES = {"claude-haiku-5-5": (100_000, (0.50, 2.50, 0.05))}  # prompts over N tokens cost more
+CACHE_WRITE = 1.25
+EPHEMERAL = {"type": "ephemeral"}
+CACHEABLE = ("text", "image", "document", "tool_result")
+CUT = "output was cut off at max_tokens; resend a smaller call"
 
 # Models that accept the server-side `fallbacks: "default"` refusal fallback.
 FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
-# Older models that do not take adaptive thinking / effort.
-LEGACY_THINKING = ("claude-haiku-4-5", "claude-sonnet-4-5", "claude-3")
+_VERSION = re.compile(r"claude-(?:opus|sonnet|haiku|fable|mythos)-(\d+)(?:-(\d{1,2}))?(?!\d)")
+_VERSION_OLD = re.compile(r"claude-(\d+)(?:[-.](\d{1,2}))?-(?:opus|sonnet|haiku)")  # claude-3-7-sonnet-20250219
 
 
-def _cost(model: str, usage) -> float:
-    pin, pout = PRICES.get(model, (0.0, 0.0))
-    return (usage.input_tokens * pin + usage.output_tokens * pout) / 1_000_000
+def claude_version(model: str) -> tuple[int, int] | None:
+    """(major, minor) of a Claude model id: claude-opus-4-5-20251101 -> (4, 5), claude-sonnet-4-20250514 -> (4, 0),
+    claude-3-7-sonnet-20250219 -> (3, 7), claude-opus-5-5 -> (5, 5). None for names that are not Claude ids."""
+    m = _VERSION.search(model or "") or _VERSION_OLD.search(model or "")
+    return (int(m.group(1)), int(m.group(2) or 0)) if m else None
+
+
+def thinking_params(model: str, effort: str) -> dict:
+    """Adaptive thinking and effort only where the model takes them: Claude 4.6+ and 5.x (and names that are not
+    Claude ids, as before). Older models answer 400 to both, except Opus 4.5, which takes effort low/medium/high."""
+    version = claude_version(model)
+    if version is None or version >= (4, 6):
+        out: dict = {"thinking": {"type": "adaptive", "display": "summarized"}}
+        if effort:
+            # xhigh arrived with Opus 4.7: Opus/Sonnet 4.6 stop at high/max
+            out["output_config"] = {"effort": "high" if effort == "xhigh" and version and version < (4, 7) else effort}
+        return out
+    if version == (4, 5) and "opus" in model and effort in ("low", "medium", "high"):
+        return {"output_config": {"effort": effort}}
+    return {}
+
+
+def _price_key(model: str) -> str | None:
+    m = (model or "").lower()
+    m = m[m.find("claude-"):] if "claude-" in m else m  # "anthropic/claude-…", "us.anthropic.claude-…"
+    if m in PRICES:
+        return m
+    return max((k for k in PRICES if m.startswith((k + "-", k + "@"))), key=len, default=None)
+
+
+def _cost(model: str, fresh: int, read: int, write: int, output: int) -> float:
+    key = _price_key(model)
+    if key is None:
+        return 0.0
+    pin, pout, pread = PRICES[key]
+    if key in LONG_PROMPT_PRICES and fresh + read + write > LONG_PROMPT_PRICES[key][0]:
+        pin, pout, pread = LONG_PROMPT_PRICES[key][1]
+    return (fresh * pin + write * pin * CACHE_WRITE + read * pread + output * pout) / 1_000_000
+
+
+def _rolling_breakpoint(messages: list[dict]) -> list[dict]:
+    """A copy of the history whose last block carries a cache breakpoint. The history itself is never changed, so a
+    request has at most two breakpoints (the system prompt and this one) and the next request reads this prefix."""
+    last = messages[-1]
+    content = last.get("content") if isinstance(last, dict) else None
+    if isinstance(content, str) and content:
+        blocks = [{"type": "text", "text": content, "cache_control": EPHEMERAL}]
+    elif isinstance(content, list) and content and isinstance(content[-1], dict) \
+            and content[-1].get("type") in CACHEABLE:
+        blocks = [*content[:-1], {**content[-1], "cache_control": EPHEMERAL}]
+    else:
+        return messages
+    return [*messages[:-1], {**last, "content": blocks}]
+
+
+def _whole_json(raw: str) -> bool:
+    if not raw.strip():
+        return True  # no input deltas: the input came whole with the block (or is empty)
+    try:
+        return isinstance(json.loads(raw), dict)
+    except ValueError:
+        return False
+
+
+def _status_error(exc: anthropic.APIStatusError, partial: bool) -> Exception:
+    status, kind = exc.status_code, exc.type
+    message = exc.api_message or exc.message
+    if status == 401:
+        return LLMError(f"Anthropic authentication failed: {message}")
+    retry_after = retry_after_seconds(exc.response.headers)
+    if status == 429 or kind == "rate_limit_error":
+        return Retryable(f"rate limit: {message}", retry_after, partial)
+    # status 200 = an error event inside the stream (e.g. overloaded_error under load)
+    if status in RETRY_STATUS or status >= 500 or (status == 200 and kind in (None, "overloaded_error", "api_error",
+                                                                               "timeout_error")):
+        where = "in the reply stream" if status == 200 else str(status)
+        return Retryable(f"API error {where} ({kind or 'error'}): {message}", retry_after, partial)
+    return LLMError(f"Anthropic API error {status}: {message}")
 
 
 class AnthropicConversation(Conversation):
-    def __init__(self, client: anthropic.Anthropic, first_party: bool, model, system, tools, options):
+    def __init__(self, client: anthropic.Anthropic, first_party: bool, model, system, tools, options, policy=None):
         super().__init__(model, system, tools, options)
         self.client = client
         self.first_party = first_party
+        self.policy = policy  # vets the address connected to (user endpoints on multi-user servers)
         self.messages: list[dict] = []
 
     def add_user(self, text: str) -> None:
@@ -118,18 +228,20 @@ class AnthropicConversation(Conversation):
         params: dict = {
             "model": self.model,
             "max_tokens": self.options.max_tokens,
-            "system": self.system,
             "messages": self.messages,
         }
+        # Prompt caching (Claude ids or the official API; other Anthropic-compatible servers may not take it)
+        cache = self.first_party or claude_version(self.model) is not None
+        if self.system:
+            params["system"] = [{"type": "text", "text": self.system, "cache_control": EPHEMERAL}] if cache else self.system
+        if cache and self.messages:
+            params["messages"] = _rolling_breakpoint(self.messages)
         if self.tools:
             params["tools"] = [
                 {"name": t.name, "description": t.description, "input_schema": t.parameters}
                 for t in self.tools
             ]
-        if not self.model.startswith(LEGACY_THINKING):
-            params["thinking"] = {"type": "adaptive", "display": "summarized"}
-            if self.options.effort:
-                params["output_config"] = {"effort": self.options.effort}
+        params.update(thinking_params(self.model, self.options.effort))
         betas: list[str] = []
         if self.first_party and self.model in FALLBACK_MODELS:
             betas.append(FALLBACK_BETA)
@@ -140,28 +252,88 @@ class AnthropicConversation(Conversation):
 
     def step(self, on_event: EventSink | None = None) -> Turn:
         params = self._params()
-        try:
-            with self.client.beta.messages.stream(**params) as stream:
-                for event in stream:
-                    if on_event is None or event.type != "content_block_delta":
-                        continue
-                    if event.delta.type == "text_delta":
-                        on_event("text", event.delta.text)
-                    elif event.delta.type == "thinking_delta":
-                        on_event("thinking", event.delta.thinking)
-                final = stream.get_final_message()
-        except anthropic.AuthenticationError as exc:
-            raise LLMError(f"Anthropic authentication failed: {exc.message}") from exc
-        except anthropic.RateLimitError as exc:
-            raise LLMError(f"Anthropic rate limit: {exc.message}") from exc
-        except anthropic.APIStatusError as exc:
-            raise LLMError(f"Anthropic API error {exc.status_code}: {exc.message}") from exc
-        except anthropic.APIConnectionError as exc:
-            raise LLMError(f"Could not reach the Anthropic API: {exc}") from exc
+        return with_retries(lambda n: self._attempt(params, on_event), label="Anthropic",
+                            cancel=getattr(self.options, "cancel", None), notify=getattr(self.options, "notify", None),
+                            attempts=getattr(self.options, "max_attempts", None))
 
-        usage = Usage(final.usage.input_tokens, final.usage.output_tokens)
-        usage.cost_usd = _cost(self.model, usage)
-        stop = final.stop_reason or "end_turn"
+    def _attempt(self, params: dict, on_event: EventSink | None) -> Turn:
+        call = Call(self.policy)
+        inputs: dict[int, list[str]] = {}  # tool-input JSON as it arrived, per content block
+        closed: set[int] = set()
+        state = {"complete": False}
+
+        def produce(call: Call, emit):
+            _local.call = call
+            try:
+                with self.client.beta.messages.stream(**params) as stream:
+                    call.touch()
+                    for event in stream:  # Stop is checked on every event, tool-input deltas included
+                        call.touch()
+                        if call.reason:
+                            break
+                        if event.type == "content_block_delta":
+                            call.data = True
+                            delta = event.delta
+                            if delta.type == "text_delta":
+                                emit("text", delta.text)
+                            elif delta.type == "thinking_delta":
+                                emit("thinking", delta.thinking)
+                            elif delta.type == "input_json_delta":
+                                inputs.setdefault(event.index, []).append(delta.partial_json)
+                        elif event.type == "content_block_stop":
+                            closed.add(event.index)
+                        elif event.type == "message_stop":
+                            state["complete"] = True
+                    try:
+                        return stream.current_message_snapshot
+                    except AssertionError:  # no message_start at all
+                        return None
+            finally:
+                _local.call = None
+
+        partial = lambda: call.emitted > 0  # noqa: E731
+        try:
+            final = pump(produce, call, cancel=getattr(self.options, "cancel", None), on_event=on_event)
+        except (LLMError, Retryable):
+            raise
+        except anthropic.APIStatusError as exc:
+            raise _status_error(exc, partial()) from exc
+        except (anthropic.APIConnectionError, httpx2.TransportError) as exc:
+            if call.blocked:
+                raise LLMError(f"Anthropic: {call.blocked}") from exc
+            if isinstance(exc.__cause__, httpx2.LocalProtocolError):  # refused before sending: retrying cannot help
+                raise LLMError(f"Anthropic: invalid request ({exc.__cause__}); check the API key for stray spaces "
+                               "or line breaks") from exc
+            if isinstance(exc, anthropic.APIConnectionError):  # before the reply started (timeouts included)
+                raise Retryable(f"could not reach the API: {exc.__cause__ or exc}", partial=partial()) from exc
+            raise Retryable(f"connection lost mid-reply: {exc or type(exc).__name__}", partial=partial()) from exc
+        except ValueError as exc:  # the SDK could not parse a tool input
+            if "tool parameter JSON" not in str(exc):
+                raise
+            raise Retryable(f"invalid tool input in the reply: {str(exc)[:200]}", partial=partial()) from exc
+        except RuntimeError as exc:
+            if "Unexpected event order" not in str(exc):
+                raise
+            raise Retryable(f"malformed reply stream: {exc}", partial=partial()) from exc
+        if final is None or not state["complete"] or final.stop_reason is None:
+            # The stream ended without its end (e.g. a proxy closed it after an upstream failure). The SDK silently
+            # drops a tool input's unfinished fields, so a partial write_file would empty the file: never use it.
+            raise Retryable("the reply stream ended before it was complete", partial=partial())
+        return self._take(final, inputs, closed)
+
+    def _take(self, final, inputs: dict[int, list[str]], closed: set[int]) -> Turn:
+        u = final.usage
+        read = int(getattr(u, "cache_read_input_tokens", 0) or 0)
+        write = int(getattr(u, "cache_creation_input_tokens", 0) or 0)
+        fresh = int(getattr(u, "input_tokens", 0) or 0)
+        output = int(getattr(u, "output_tokens", 0) or 0)
+        # input_tokens is the WHOLE prompt (the loop measures the context with it); the cost uses the cache prices
+        # of the model that actually answered (a refusal fallback may serve the turn)
+        usage = Usage(fresh + read + write, output, cache_read_tokens=read, cache_write_tokens=write)
+        served = str(getattr(final, "model", "") or "")
+        usage.cost_usd = _cost(served if _price_key(served) else self.model, fresh, read, write, output)
+        stop = final.stop_reason
+        cut = stop in ("max_tokens", "model_context_window_exceeded")
 
         # Pass the content back unchanged (thinking blocks must survive verbatim).
         self.messages.append({"role": "assistant", "content": final.content})
@@ -170,45 +342,92 @@ class AnthropicConversation(Conversation):
             return Turn(text="", stop_reason="refusal", usage=usage)
 
         text_parts, thinking_parts, calls = [], [], []
-        for block in final.content:
+        for i, block in enumerate(final.content):
             if block.type == "text":
                 text_parts.append(block.text)
             elif block.type == "thinking":
                 thinking_parts.append(getattr(block, "thinking", "") or "")
             elif block.type == "tool_use":
                 args = block.input if isinstance(block.input, dict) else {}
-                calls.append(ToolCall(id=block.id, name=block.name, arguments=args))
-        if stop == "max_tokens":
-            for c in calls:
-                c.parse_error = "output was cut off at max_tokens; resend a smaller call"
+                raw = "".join(inputs.get(i, []))
+                err = ""
+                # A partial input (cut by the output cap or a full window): the SDK drops the unfinished field. Cut
+                # right after the tool's name (the last block, no input at all), the whole input is missing.
+                if i not in closed or not _whole_json(raw) or \
+                        (cut and i == len(final.content) - 1 and not raw.strip() and not args):
+                    err = CUT if cut else "the tool input arrived incomplete; resend the call"
+                calls.append(ToolCall(id=block.id, name=block.name, arguments=args, parse_error=err))
         return Turn(
             text="".join(text_parts),
             tool_calls=calls,
-            stop_reason=stop,
+            stop_reason="max_tokens" if cut else stop,  # a full context window cuts the reply like the output cap
             usage=usage,
             thinking="\n".join(t for t in thinking_parts if t),
         )
 
 
+_local = threading.local()
+
+
+def _attach_trace(request) -> None:
+    """httpx2 request hook: the attempt running on this thread can see (and abort) its request's sockets."""
+    call = getattr(_local, "call", None)
+    if call is not None:
+        request.extensions["trace"] = call.trace
+
+
+def _env_header_names() -> list[str]:
+    """Headers the SDK adds from ANTHROPIC_CUSTOM_HEADERS (the server's own configuration)."""
+    names = []
+    for line in (os.environ.get("ANTHROPIC_CUSTOM_HEADERS") or "").split("\n"):
+        name = line.split(":", 1)[0].strip() if ":" in line else ""
+        if name:
+            names.append(name)
+    return names
+
+
 class AnthropicProvider(Provider):
     name = "anthropic"
+    policy = None
 
-    def __init__(self, api_key: str | None = None, base_url: str | None = None):
-        kwargs: dict = {"max_retries": 4}
-        if api_key:
+    def __init__(self, api_key: str | None = None, base_url: str | None = None, *, isolated: bool = False,
+                 guard_private: bool = False):
+        """api_key=None lets the SDK find the server's own credentials (environment, profile): only for the built-in
+        provider. isolated (user-defined providers): never the server's key, base URL or custom headers; an empty
+        key stays empty."""
+        http = anthropic.DefaultHttpxClient(
+            event_hooks={"request": [_attach_trace]},
+            # a fresh connection per request, so Stop can always reach (and close) its socket
+            limits=httpx2.Limits(max_connections=100, max_keepalive_connections=0),
+        )
+        kwargs: dict = {"max_retries": 0, "timeout": httpx2.Timeout(600.0, connect=CONNECT_TIMEOUT), "http_client": http}
+        if api_key is not None:
             kwargs["api_key"] = api_key
         if base_url:
             kwargs["base_url"] = base_url
+        elif isolated:
+            kwargs["base_url"] = "https://api.anthropic.com"
+        if isolated:
+            headers: dict = {}
+            for name in _env_header_names():  # the server's own headers (maybe credentials for its gateway)
+                headers[name] = f"Bearer {api_key}" if name.lower() == "authorization" and api_key else anthropic.Omit()
+            if not api_key:  # no key: send no credentials at all (an empty "Bearer " is not even a valid header)
+                headers[next((n for n in headers if n.lower() == "authorization"), "Authorization")] = anthropic.Omit()
+            if headers:
+                kwargs["default_headers"] = headers
         self.client = anthropic.Anthropic(**kwargs)
-        self.first_party = not base_url
+        self.first_party = (self.client.base_url.host or "") == "api.anthropic.com"
+        if guard_private and not proxied(str(self.client.base_url)):
+            self.policy = lambda ip: address_problem(ip, strict=True)
 
     def conversation(self, model, system, tools, options: ModelOptions) -> Conversation:
-        return AnthropicConversation(self.client, self.first_party, model, system, tools, options)
+        return AnthropicConversation(self.client, self.first_party, model, system, tools, options, policy=self.policy)
 
     def vision(self, model: str, prompt: str, image: bytes, mime: str) -> tuple[str, Usage]:
         import base64
 
-        conv = AnthropicConversation(self.client, self.first_party, model, "", [], ModelOptions(effort="low", max_tokens=16000))
+        conv = AnthropicConversation(self.client, self.first_party, model, "", [], ModelOptions(effort="low", max_tokens=16000),
+                                     policy=self.policy)
         conv.messages.append({"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": mime, "data": base64.b64encode(image).decode()}},
             {"type": "text", "text": prompt},

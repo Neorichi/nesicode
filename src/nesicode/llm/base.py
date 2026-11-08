@@ -42,28 +42,36 @@ class ToolResult:
 
 @dataclass
 class Usage:
-    input_tokens: int = 0
+    input_tokens: int = 0  # the WHOLE prompt of the request (with prompt caching: uncached + cache reads + cache writes)
     output_tokens: int = 0
     cost_usd: float = 0.0
+    cache_read_tokens: int = 0  # part of input_tokens served from the provider's prompt cache
+    cache_write_tokens: int = 0  # part of input_tokens written to it
 
     def add(self, other: "Usage") -> None:
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
         self.cost_usd += other.cost_usd
+        self.cache_read_tokens += other.cache_read_tokens
+        self.cache_write_tokens += other.cache_write_tokens
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cost_usd": round(self.cost_usd, 6),
         }
+        if self.cache_read_tokens or self.cache_write_tokens:
+            out.update(cache_read_tokens=self.cache_read_tokens, cache_write_tokens=self.cache_write_tokens)
+        return out
 
 
 @dataclass
 class Turn:
     text: str
     tool_calls: list[ToolCall] = field(default_factory=list)
-    stop_reason: str = "end_turn"  # end_turn | tool_use | max_tokens | refusal
+    # end_turn | tool_use | max_tokens (cut by the output cap or a full context window) | refusal
+    stop_reason: str = "end_turn"
     usage: Usage = field(default_factory=Usage)
     thinking: str = ""
 
@@ -74,6 +82,10 @@ class ModelOptions:
     max_tokens: int = 64000
     role: str = "executor"  # executor | proposer | composer | selector | reflector | subagent
     cancel: Any = None  # threading.Event: set when the user presses Stop (aborts a request in flight)
+    # Called before each retry with {"type": "llm_retry", "attempt": n (the one about to start), "max": m,
+    # "wait": seconds, "reason": "...", "partial": bool (part of the reply had already been streamed)}.
+    notify: Callable[[dict], None] | None = None
+    max_attempts: int | None = None  # attempts per request (None = the provider's default)
 
 
 class Conversation(ABC):
@@ -145,6 +157,11 @@ class Provider(ABC):
         raise LLMError(f"provider {self.name!r} cannot generate images")
 
     def complete(self, model: str, system: str, prompt: str, options: ModelOptions) -> tuple[str, Usage]:
+        """One-shot request. `options.cancel` aborts it (the providers' step() honours it while connecting,
+        streaming and waiting between retries)."""
+        cancel = getattr(options, "cancel", None)
+        if cancel is not None and cancel.is_set():
+            raise LLMError("cancelled by the user")
         conv = self.conversation(model, system, [], options)
         conv.add_user(prompt)
         turn = conv.step()
