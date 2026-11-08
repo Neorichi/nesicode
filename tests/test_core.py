@@ -273,14 +273,16 @@ def test_layer2_checkpoint_md_and_search(tmp_path):
     res = a.run("write the report about src/app.py " + "z" * 1500)
     assert res.status in ("done", "max_steps")
     comp = [e for e in events if e["type"] == "compacted"]
-    assert comp and comp[0]["path"] == ".nesicode/context/compact-1.md"
-    md = (ws.root / ".nesicode/context/compact-1.md").read_text()
+    # archive files are named per run (<YYYYmmdd-HHMMSS>-compact-N.md) so a later run never overwrites them
+    import re
+    assert comp and re.fullmatch(r"\.nesicode/context/\d{8}-\d{6}(-\d+)?-compact-1\.md", comp[0]["path"])
+    md = (ws.root / comp[0]["path"]).read_text()
     assert md.startswith("# Compactación 1") and "transcript-1.md" in md
     from nesicode.agent.context import search_history
     assert "transcript-1.md" in search_history(ws, {"query": "ACTION"})
     # the archive survives the next run's harness install
     Agent(model="mock/demo", harness=base_harness(), workspace=ws).run("otra")
-    assert (ws.root / ".nesicode/context/compact-1.md").exists()
+    assert (ws.root / comp[0]["path"]).exists()
 
 
 def test_extract_anchors():

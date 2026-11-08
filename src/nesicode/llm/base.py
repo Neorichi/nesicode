@@ -97,10 +97,31 @@ class Conversation(ABC):
     def step(self, on_event: EventSink | None = None) -> Turn:
         """Call the model on the current history and append its reply."""
 
-    def mask_tool_results(self, keep_last: int, marker: Callable[[str, str], str | None]) -> int:
-        """Replace the content of all but the last `keep_last` tool results with `marker(call_id, old)`
-        (None = keep). Returns the number of characters freed. Default: not supported (0)."""
+    def mask_tool_results(self, keep_last: int, marker: Callable[[str, str], str | None], *,
+                          keep_chars: int = 0, apply: bool = True) -> int:
+        """Replace the content of older tool results with `marker(call_id, old)` (None = keep) and return the number
+        of characters freed. Never touched: the newest `keep_last` results, any newer result while the cumulative size
+        of the newer results is <= `keep_chars`, and the results of the latest assistant turn (the round the model has
+        not answered yet). apply=False only computes what would be freed (masking breaks the prompt cache, so callers
+        dry-run first). Default: not supported (0)."""
         return 0
+
+    @staticmethod
+    def maskable(sizes: list[int], pending: int, keep_last: int, keep_chars: int) -> list[int]:
+        """Indexes (oldest first) of the tool results that may be masked, given their sizes; the last `pending`
+        results belong to the turn the model has not answered yet. Newest results are kept by count and by size."""
+        keep = max(pending, keep_last)
+        out, acc, budget_open = [], 0, True
+        for i in range(len(sizes) - 1, -1, -1):
+            if len(sizes) - i <= keep:
+                acc += sizes[i]
+                continue
+            if budget_open and acc + sizes[i] <= keep_chars:
+                acc += sizes[i]
+                continue
+            budget_open = False  # past the newest window: everything older may go
+            out.append(i)
+        return sorted(out)
 
 
 class Provider(ABC):

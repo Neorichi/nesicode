@@ -40,14 +40,22 @@ class OpenAICompatConversation(Conversation):
             content = ("ERROR: " if r.is_error else "") + (r.content or "(empty)")
             self.messages.append({"role": "tool", "tool_call_id": r.call_id, "content": content})
 
-    def mask_tool_results(self, keep_last: int, marker) -> int:
-        tool_msgs = [m for m in self.messages if m.get("role") == "tool"]
+    def mask_tool_results(self, keep_last: int, marker, *, keep_chars: int = 0, apply: bool = True) -> int:
+        idx = [i for i, m in enumerate(self.messages) if m.get("role") == "tool"]
+        last_reply = max((i for i, m in enumerate(self.messages) if m.get("role") == "assistant"), default=-1)
+        pending = sum(1 for i in idx if i > last_reply)  # results the model has not seen yet: never masked
+        sizes = [len(c) if isinstance(c := self.messages[i].get("content"), str) else 0 for i in idx]
         freed = 0
-        for m in tool_msgs[: max(0, len(tool_msgs) - keep_last)]:
-            new = marker(m.get("tool_call_id", ""), m.get("content", ""))
-            if new is not None and len(new) < len(m.get("content", "")):
-                freed += len(m["content"]) - len(new)
-                m["content"] = new
+        for k in self.maskable(sizes, pending, keep_last, keep_chars):
+            m = self.messages[idx[k]]
+            old = m.get("content")
+            if not isinstance(old, str):
+                continue
+            new = marker(m.get("tool_call_id", ""), old)
+            if new is not None and len(new) < len(old):
+                freed += len(old) - len(new)
+                if apply:
+                    m["content"] = new
         return freed
 
     def step(self, on_event: EventSink | None = None) -> Turn:

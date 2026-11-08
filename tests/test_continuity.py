@@ -74,7 +74,8 @@ def test_cancel_without_work_is_one_line():
     from nesicode.server.jobs import conversation_history
 
     _, p, t = _client()
-    _run(p, t, "algo", "cancelled", at=time.time() - 5)
+    # it started and was stopped at once (a message removed from the queue never started: no events, not shown at all)
+    _run(p, t, "algo", "cancelled", events=[{"type": "start", "task": "algo"}, {"type": "cancelled"}], at=time.time() - 5)
     history, interrupted = conversation_history(db, _run(p, t, "sigue", "waiting"))
     assert history == [("algo", "[this turn was cancelled before doing any work]")]
 
