@@ -1,97 +1,141 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
-import { ACTIVE, api, streamRun, transcribeAudio, type Attachment, type Run, type RunEvent, type Thread } from '../api'
+import { Link, useNavigate, useParams } from 'react-router-dom'
+import { ACTIVE, api, isAbort, STREAM_LOST, streamRun, transcribeAudio, type Attachment, type Run, type RunEvent, type Thread } from '../api'
 import { useApp, useProject } from '../App'
 import Composer, { AttachmentChip } from '../components/Composer'
 import Diff from '../components/Diff'
 import Transcript from '../components/Transcript'
 import { t, useLang } from '../i18n'
+import { compactReason, mergeLoaded, withEvent, withRun } from '../logic'
 
+type Ctx = { used: number; limit: number; reason?: string }
+
+// The text of a reply cut short by Stop or an error exists only in the browser (the server keeps finished replies).
+// Keep it for the rest of the session, per run, so it doesn't vanish while the user is reading it.
+const interruptedText = new Map<number, string>()
+
+// One instance per conversation (App keys it by tid): nothing here can belong to another conversation.
 export default function Chat() {
   const { pid, tid } = useParams()
   const project = useProject(pid)
-  const { refreshThreads } = useApp()
+  const { refreshThreads, threads, threadsPid } = useApp()
+  const navigate = useNavigate()
   const [thread, setThread] = useState<Thread | null>(null)
   const [runs, setRuns] = useState<Run[]>([])
   const [live, setLive] = useState('')
-  const [ctxLive, setCtxLive] = useState<{ used: number; limit: number } | null>(null)
+  const liveRef = useRef('')
+  const [ctxLive, setCtxLive] = useState<Ctx | null>(null)
   const [error, setError] = useState('')
+  const [, setFrozen] = useState(0)
   const bottom = useRef<HTMLDivElement>(null)
   const stick = useRef(true)
+  const loadSeq = useRef(0) // only the newest load may apply its response
+  const seenUpdated = useRef<number | null>(null) // updated_at of the conversation on screen
   useLang()
 
+  const appendLive = (txt: string) => {
+    liveRef.current += txt
+    setLive(liveRef.current)
+  }
+  const resetLive = () => {
+    liveRef.current = ''
+    setLive('')
+  }
+  const loadCtl = useRef<AbortController | null>(null)
+  // local changes a reload that started earlier doesn't know about yet (see mergeLoaded)
+  const created = useRef(new Set<number>())
+  const removed = useRef(new Set<number>())
+
   const load = useCallback(async () => {
-    const data = await api.get<{ thread: Thread; runs: Run[] }>(`/api/threads/${tid}`)
-    setThread(data.thread)
-    setRuns(data.runs)
+    const n = ++loadSeq.current
+    loadCtl.current?.abort() // superseded: stop downloading it
+    const ctl = new AbortController()
+    loadCtl.current = ctl
+    try {
+      const data = await api.get<{ thread: Thread; runs: Run[] }>(`/api/threads/${tid}`, { signal: ctl.signal })
+      if (n !== loadSeq.current) return null
+      setThread(data.thread)
+      setRuns((prev) => mergeLoaded(prev, data.runs, created.current, removed.current))
+      for (const r of data.runs) {
+        created.current.delete(r.id)
+        if (r.status !== 'waiting') removed.current.delete(r.id)
+      }
+      seenUpdated.current = data.thread.updated_at
+      return data
+    } catch (e) {
+      if (isAbort(e)) return null
+      throw e
+    }
   }, [tid])
+  const [streamKey, setStreamKey] = useState(0) // bumped to subscribe again after the stream gave up
 
   useEffect(() => {
-    setRuns([])
-    setLive('')
     load().catch((e) => setError(e.message))
+    return () => {
+      // gone: ignore (and stop downloading) anything still in flight
+      loadSeq.current += 1
+      loadCtl.current?.abort()
+    }
   }, [load])
+
+  // /p/<other project>/c/<id>: show it under its own project (sidebar, header, model)
+  useEffect(() => {
+    if (thread && pid && thread.project_id !== Number(pid)) navigate(`/p/${thread.project_id}/c/${thread.id}`, { replace: true })
+  }, [thread, pid, navigate])
 
   const active = runs.find((r) => ACTIVE.has(r.status))
   const queue = runs.filter((r) => r.status === 'waiting')
   // queued messages show above the composer; ones removed from the queue never ran: hide them
   const shown = runs.filter((r) => r.status !== 'waiting' && !(r.status === 'cancelled' && !(r.events ?? []).length))
-  const statusSig = runs.map((r) => `${r.id}:${r.status}`).join(',')
   const activeId = active?.id
 
+  // Messages can arrive from Telegram or a bot. Instead of downloading the whole conversation every few seconds,
+  // watch this conversation's row in the sidebar list (refreshed every 5 s): reload only when it changed.
+  const row = threadsPid === Number(pid) ? threads.find((x) => x.id === Number(tid)) : undefined
   useEffect(() => {
-    // Messages can arrive from Telegram: when idle, check for new ones every few seconds.
-    if (activeId) return
-    const id = setInterval(async () => {
-      try {
-        const data = await api.get<{ thread: Thread; runs: Run[] }>(`/api/threads/${tid}`)
-        if (data.thread.title !== thread?.title) {
-          setThread(data.thread)
-          refreshThreads()
-        }
-        if (data.runs.map((r) => `${r.id}:${r.status}`).join(',') !== statusSig) {
-          setRuns(data.runs)
-          setThread(data.thread)
-        }
-      } catch {
-        /* ignore */
-      }
-    }, 4000)
-    return () => clearInterval(id)
-  }, [activeId, tid, statusSig, thread?.title])
+    if (!row) return
+    setThread((th) => (th && th.title !== row.title ? { ...th, title: row.title } : th)) // e.g. the auto-title
+    if (activeId || seenUpdated.current === null) return // a live reply reloads by itself when it ends
+    if (row.updated_at > seenUpdated.current) load().catch(() => {})
+  }, [row?.updated_at, row?.title, activeId, load]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { setCtxLive(null) }, [activeId]) // a new message rebuilds the context: never show the previous run's value
   useEffect(() => {
     if (!activeId) return
     const run = runs.find((r) => r.id === activeId)!
     const after = Math.max(0, ...(run.events ?? []).map((e) => e.seq ?? 0))
+    const freeze = () => {
+      if (!liveRef.current.trim()) return
+      interruptedText.set(activeId, liveRef.current)
+      setFrozen((n) => n + 1)
+    }
     const close = streamRun(activeId, after, {
+      // every (re)connection replays the reply's live text from its start: drop ours so it isn't shown twice
+      onOpen: resetLive,
       onEvent: (e: RunEvent) => {
-        setRuns((rs) =>
-          rs.map((r) =>
-            r.id === activeId && !(r.events ?? []).some((x) => x.seq === e.seq)
-              ? { ...r, status: r.status === 'queued' ? 'running' : r.status, events: [...(r.events ?? []), e] }
-              : r,
-          ),
-        )
-        if (e.type === 'assistant' || e.type === 'done' || e.type === 'error') setLive('')
+        setRuns((rs) => withEvent(rs, activeId, e))
+        if (!e.depth && (e.type === 'cancelled' || e.type === 'error')) freeze()
+        // a retried model call starts its reply again from the beginning
+        if (e.type === 'assistant' || e.type === 'done' || e.type === 'error' || e.type === 'cancelled' || (e.type === 'llm_retry' && !e.depth)) resetLive()
       },
       onLive: (items) => {
         const c = [...items].reverse().find((i) => i.type === 'context' && !i.depth)
-        if (c) setCtxLive({ used: c.used, limit: c.limit })
+        if (c) setCtxLive({ used: c.used, limit: c.limit, reason: c.reason })
         const txt = items.filter((i) => i.type === 'text_delta' && !i.depth).map((i) => i.text).join('')
-        if (txt) setLive((l) => l + txt)
+        if (txt) appendLive(txt)
       },
-      onEnd: async () => {
-        setLive('')
-        await load()
+      onEnd: async (status) => {
+        if (status !== 'done' && status !== 'max_steps' && status !== STREAM_LOST) freeze()
+        resetLive()
+        const data = await load().catch(() => null)
         refreshThreads()
-        setTimeout(() => { load().then(refreshThreads).catch(() => {}) }, 6000) // the auto-title arrives a few seconds later
+        // the connection gave up (server unreachable for a while) but the reply may go on: follow it again
+        if (status === STREAM_LOST && data?.runs.some((r) => r.id === activeId && ACTIVE.has(r.status))) setStreamKey((k) => k + 1)
       },
     })
     return close
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeId])
+  }, [activeId, streamKey])
 
   useEffect(() => {
     if (stick.current) bottom.current?.scrollIntoView({ block: 'end' })
@@ -101,12 +145,13 @@ export default function Chat() {
     setError('')
     try {
       const run = await api.post<Run>(`/api/threads/${tid}/messages`, { text, attachments: attachments.map((a) => a.path) })
+      created.current.add(run.id) // a reload started before this message must not hide it
       if (opts?.now && run.status === 'waiting') {
         if (activeId) setStoppingId(activeId)
         api.post(`/api/runs/${run.id}/send-now`).catch((e) => setError((e as Error).message))
       }
       stick.current = true
-      setRuns((rs) => [...rs, { ...run, events: [] }])
+      setRuns((rs) => withRun(rs, run)) // a reload may already show it: never twice
       refreshThreads()
       return true
     } catch (e) {
@@ -132,12 +177,14 @@ export default function Chat() {
   }
 
   const unqueue = async (id: number) => {
+    removed.current.add(id) // a reload started before this must not bring it back
     setRuns((rs) => rs.filter((r) => r.id !== id))
     try {
       await api.post(`/api/runs/${id}/cancel`)
     } catch (e) {
+      removed.current.delete(id)
       setError((e as Error).message)
-      load()
+      load().catch(() => {})
     }
   }
 
@@ -170,8 +217,12 @@ export default function Chat() {
               title={thread.telegram.attached ? t('Anclada en Telegram: lo que escribas allí va aquí y ves allí lo que pasa. Pulsa para soltarla.') : t('Anclar esta conversación en Telegram')}
               onClick={async () => {
                 const attach = !thread.telegram!.attached
-                await api.post(`/api/threads/${tid}/telegram`, { attach })
-                setThread((th) => (th ? { ...th, telegram: { linked: true, attached: attach } } : th))
+                try {
+                  await api.post(`/api/threads/${tid}/telegram`, { attach })
+                  setThread((th) => (th ? { ...th, telegram: { linked: true, attached: attach } } : th))
+                } catch (e) {
+                  setError((e as Error).message)
+                }
               }}
             >
               📌 {thread.telegram.attached ? t('En Telegram') : 'Telegram'}
@@ -183,8 +234,12 @@ export default function Chat() {
               value={thread?.exec_mode ?? ''}
               title={t('Qué necesita tu permiso en esta conversación')}
               onChange={async (e) => {
-                const r = await api.patch<Thread>(`/api/threads/${tid}`, { exec_mode: e.target.value })
-                setThread((th) => (th ? { ...th, ...r } : th))
+                try {
+                  const r = await api.patch<Thread>(`/api/threads/${tid}`, { exec_mode: e.target.value })
+                  setThread((th) => (th ? { ...th, ...r } : th))
+                } catch (err) {
+                  setError((err as Error).message)
+                }
               }}
             >
               <option value="">{t('Modo: por defecto')} ({modeLabel(thread?.effective_mode)})</option>
@@ -201,7 +256,16 @@ export default function Chat() {
           )}
         </div>
       </header>
-      {thread?.bot && <BotBar bot={thread.bot} onRun={async () => { await api.post(`/api/bots/${thread.bot.id}/run`, { text: '' }); load() }} />}
+      {thread?.bot && (
+        <BotBar bot={thread.bot} onRun={async () => {
+          try {
+            await api.post(`/api/bots/${thread.bot.id}/run`, { text: '' })
+            await load()
+          } catch (e) {
+            setError((e as Error).message)
+          }
+        }} />
+      )}
       <div
         className="chat-scroll"
         onScroll={(e) => {
@@ -232,6 +296,7 @@ export default function Chat() {
                 events={r.events ?? []}
                 status={r.status}
                 live={r.id === activeId ? live : undefined}
+                interrupted={r.id === activeId ? undefined : interruptedText.get(r.id)}
                 runId={r.id}
               />
               {r.status !== 'running' && r.status !== 'queued' && <ImproveButton run={r} pid={Number(pid)} />}
@@ -255,7 +320,7 @@ export default function Chat() {
             ))}
           </div>
         )}
-        <Composer history={runs.map((r) => r.task)} onSend={send} onStop={stop} onUpload={upload} busy={!!active} stopping={!!active && stoppingId === activeId} queueWhileBusy transcribe={(wav) => transcribeAudio(pid!, wav)} placeholder={active ? t('Escribe y se pondrá en cola…') : t('Responde o pide otra cosa…')} autoFocus />
+        <Composer draftKey={`chat:${tid}`} history={runs.map((r) => r.task)} onSend={send} onStop={stop} onUpload={upload} busy={!!active} stopping={!!active && stoppingId === activeId} queueWhileBusy transcribe={(wav) => transcribeAudio(pid!, wav)} placeholder={active ? t('Escribe y se pondrá en cola…') : t('Responde o pide otra cosa…')} autoFocus />
         <div className="foot-note">{t('Nesicode puede ejecutar comandos y modificar archivos del proyecto.')}</div>
       </div>
     </div>
@@ -393,8 +458,8 @@ function fmtK(n: number) {
   return n >= 1_000_000 ? `${(n / 1_000_000).toFixed(n % 1_000_000 ? 1 : 0)}M` : `${Math.round(n / 1000)}k`
 }
 
-function ContextMeter({ runs, live }: { runs: Run[]; live: { used: number; limit: number } | null }) {
-  let c = live
+function ContextMeter({ runs, live }: { runs: Run[]; live: Ctx | null }) {
+  let c: Ctx | null = live
   if (!c) {
     for (const r of [...runs].reverse()) {
       const d = [...(r.events ?? [])].reverse().find((e) => e.type === 'done' && !e.depth && e.context?.limit)
@@ -406,10 +471,16 @@ function ContextMeter({ runs, live }: { runs: Run[]; live: { used: number; limit
   }
   if (!c || !c.limit) return null
   const pct = Math.min(100, Math.round((c.used / c.limit) * 100))
+  // the step that just compacted/lightened the context says so: the drop has a visible reason
+  const dropped = c.reason === 'compacted' || c.reason === 'masked'
+  const why = c.reason === 'compacted'
+    ? ' ' + t('Se acaba de compactar: el agente sigue con un resumen de lo hecho.')
+    : c.reason === 'masked' ? ' ' + t('Se acaban de apartar salidas antiguas de herramientas (siguen en disco).') : ''
   return (
-    <span className={`ctx-meter ${pct >= 67 ? 'hi' : pct >= 49 ? 'mid' : ''}`} title={t('Contexto: {u} de {l} tokens. Al 49% se aligeran las salidas antiguas de herramientas y al 67% se resume la conversación (siempre queda todo en el archivo de la conversación).', { u: c.used.toLocaleString(), l: c.limit.toLocaleString() })}>
+    <span className={`ctx-meter ${pct >= 67 ? 'hi' : pct >= 49 ? 'mid' : ''}`} title={t('Contexto: {u} de {l} tokens. Al 49% se aligeran las salidas antiguas de herramientas y al 67% se resume la conversación (siempre queda todo en el archivo de la conversación).', { u: c.used.toLocaleString(), l: c.limit.toLocaleString() }) + why}>
       <span className="ctx-bar"><span style={{ width: `${pct}%` }} /></span>
       {fmtK(c.used)} / {fmtK(c.limit)}
+      {dropped && <span className="ctx-reason">↓ {compactReason(c.reason)}</span>}
     </span>
   )
 }

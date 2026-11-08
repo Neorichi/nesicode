@@ -619,3 +619,14 @@ label.inline { display: flex; align-items: center; gap: 8px; flex-direction: row
 .html-modal { position: fixed; inset: 0; z-index: 1000; background: rgba(0, 0, 0, .55); display: grid; place-items: center; padding: 24px; }
 .html-modal-inner { width: min(1400px, 100%); height: 100%; display: flex; flex-direction: column; background: var(--panel); border-radius: 12px; overflow: hidden; }
 .html-frame.big { flex: 1; height: auto; resize: none; }
+
+/* audit fixes (web UI) */
+.md .md-img-blocked { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; margin: 2px 0; padding: 4px 9px; border: 1px dashed var(--line-2); border-radius: 7px; background: var(--code-bg); color: var(--ink-2); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.md .md-img-blocked:hover { border-color: var(--accent); color: var(--ink); }
+.retry-note { font-size: 12.5px; color: var(--ink-3); padding: 2px 0; }
+.retry-note.now { color: var(--warn); animation: nesi-pulse 1.6s ease-in-out infinite; }
+.approval.done.stopped { color: var(--ink-3); }
+.answer.interrupted { border-left: 3px solid var(--line-2); padding-left: 12px; opacity: 0.85; }
+.answer.interrupted > .muted { margin-top: 4px; }
+.ctx-reason { font-size: 10.5px; color: var(--accent); }
+.threads-more { display: block; width: 100%; text-align: left; padding: 6px 10px; }

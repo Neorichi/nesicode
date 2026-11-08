@@ -12,6 +12,8 @@ const IDEAS = () => [
   t('Crea un README con instrucciones de instalación'),
 ]
 
+// One instance per project (App keys it by pid): a conversation created here for an attachment always belongs to
+// the project on screen.
 export default function NewChat() {
   const { pid } = useParams()
   const project = useProject(pid)
@@ -19,22 +21,36 @@ export default function NewChat() {
   const navigate = useNavigate()
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
-  const pending = useRef<Thread | null>(null)
+  const [uploading, setUploading] = useState(0)
+  // the conversation being created (one request shared by an upload and a send that race each other)
+  const pending = useRef<{ project: number; thread: Promise<Thread> } | null>(null)
   useLang()
 
   if (!project) return projects.length ? <Navigate to="/" replace /> : <Navigate to="/new" replace />
 
-  const thread = async () => {
+  const thread = () => {
     // The conversation (and its cage) is created on the first attachment or message.
-    if (!pending.current) pending.current = await api.post<Thread>(`/api/projects/${project.id}/threads`, {})
-    return pending.current
+    if (!pending.current || pending.current.project !== project.id) {
+      const p = api.post<Thread>(`/api/projects/${project.id}/threads`, {})
+      const entry = { project: project.id, thread: p }
+      pending.current = entry
+      p.catch(() => {
+        if (pending.current === entry) pending.current = null // failed: the next try creates it again
+      })
+    }
+    return pending.current.thread
   }
 
   const upload = async (files: File[]) => {
-    const t = await thread()
-    const fd = new FormData()
-    files.forEach((f) => fd.append('files', f))
-    return { attachments: await api.post<Attachment[]>(`/api/threads/${t.id}/attachments`, fd), threadId: t.id }
+    setUploading((n) => n + 1)
+    try {
+      const t = await thread()
+      const fd = new FormData()
+      files.forEach((f) => fd.append('files', f))
+      return { attachments: await api.post<Attachment[]>(`/api/threads/${t.id}/attachments`, fd), threadId: t.id }
+    } finally {
+      setUploading((n) => n - 1)
+    }
   }
 
   const start = async (text: string, attachments: Attachment[] = []) => {
@@ -69,7 +85,7 @@ export default function NewChat() {
         {error && <div className="error-box">{error}</div>}
         <div className="ideas">
           {IDEAS().map((i) => (
-            <button key={i} className="idea" disabled={busy} onClick={() => start(i)}>
+            <button key={i} className="idea" disabled={busy || uploading > 0} onClick={() => start(i)}>
               {i}
             </button>
           ))}

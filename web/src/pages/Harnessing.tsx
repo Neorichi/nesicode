@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { ACTIVE, api, money, relTime, statusLabel, streamRun, type Run, type RunEvent } from '../api'
+import { ACTIVE, api, isAbort, money, relTime, statusLabel, streamRun, type Run, type RunEvent } from '../api'
 import { useApp, useProject } from '../App'
 import Diff from '../components/Diff'
 import Transcript from '../components/Transcript'
+import { useVisibleInterval } from '../hooks'
 import { t, translateError, useLang } from '../i18n'
 
 type Node = {
@@ -100,8 +101,13 @@ function NodeDetail({ runId, node, onClose }: { runId: number; node: Node; onClo
   const [ro, setRo] = useState<any>(null)
   const [tab, setTab] = useState<'notes' | 'trajectory' | 'diff' | 'check'>(node.stage ? 'notes' : 'trajectory')
   useEffect(() => {
+    setRo(null)
     if (!node.rollout) return
-    api.get(`/api/runs/${runId}/rollouts/${node.label}`).then(setRo).catch(() => setRo(null))
+    let alive = true // another node clicked meanwhile: drop this answer
+    api.get(`/api/runs/${runId}/rollouts/${node.label}`).then((r) => alive && setRo(r)).catch(() => alive && setRo(null))
+    return () => {
+      alive = false
+    }
   }, [runId, node.label, node.rollout])
   return (
     <div className="drawer">
@@ -139,7 +145,11 @@ function NodeDetail({ runId, node, onClose }: { runId: number; node: Node; onClo
 function HarnessDiffAgainstBase({ runId, harness }: { runId: number; harness: Record<string, string> }) {
   const [base, setBase] = useState<Record<string, string> | null>(null)
   useEffect(() => {
-    api.get<any>(`/api/runs/${runId}/rollouts/base1`).then((r) => setBase(r.harness)).catch(() => setBase(null))
+    let alive = true
+    api.get<any>(`/api/runs/${runId}/rollouts/base1`).then((r) => alive && setBase(r.harness)).catch(() => alive && setBase(null))
+    return () => {
+      alive = false
+    }
   }, [runId])
   const text = useMemo(() => {
     if (!base) return ''
@@ -164,18 +174,37 @@ function HarnessDiffAgainstBase({ runId, harness }: { runId: number; harness: Re
   )
 }
 
+// Rendered with key={runId}: one instance per run, so Adopt/Apply always act on the run on screen.
 function RunDetail({ runId }: { runId: number }) {
   const { refreshProjects } = useApp()
   const [run, setRun] = useState<Run | null>(null)
   const [sel, setSel] = useState<string | null>(null)
   const [msg, setMsg] = useState('')
+  const loadSeq = useRef(0)
+  const loadCtl = useRef<AbortController | null>(null)
   useLang()
 
-  const load = useCallback(async () => setRun(await api.get<Run>(`/api/runs/${runId}`)), [runId])
+  // only the newest request may paint, and only with this run's data (a big run's download stops when superseded)
+  const load = useCallback(async () => {
+    const n = ++loadSeq.current
+    loadCtl.current?.abort()
+    const ctl = new AbortController()
+    loadCtl.current = ctl
+    try {
+      const r = await api.get<Run>(`/api/runs/${runId}`, { signal: ctl.signal })
+      if (n === loadSeq.current && r.id === runId) setRun(r)
+    } catch (e) {
+      if (!isAbort(e)) throw e
+    }
+  }, [runId])
   useEffect(() => {
     setRun(null)
     setSel(null)
-    load()
+    load().catch((e) => setMsg((e as Error).message))
+    return () => {
+      loadSeq.current += 1
+      loadCtl.current?.abort()
+    }
   }, [load])
 
   const active = run && ACTIVE.has(run.status)
@@ -186,14 +215,14 @@ function RunDetail({ runId }: { runId: number }) {
       onEvent: (e) =>
         setRun((r) => (r && !(r.events ?? []).some((x) => x.seq === e.seq) ? { ...r, status: 'running', events: [...(r.events ?? []), e] } : r)),
       onEnd: () => {
-        load()
+        load().catch(() => {})
         refreshProjects()
       },
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId, !!active])
 
-  if (!run) return <div className="muted">{t('Cargando…')}</div>
+  if (!run) return msg ? <div className="error-box">{msg}</div> : <div className="muted">{t('Cargando…')}</div>
   const events = run.events ?? []
   const nodes = buildNodes(events)
   const phases = events.filter((e) => e.type === 'phase').map((e) => e.phase)
@@ -212,9 +241,13 @@ function RunDetail({ runId }: { runId: number }) {
   const err = events.find((e) => e.type === 'error')
 
   const adopt = async () => {
-    const r = await api.post<{ version: number }>(`/api/runs/${runId}/adopt`)
-    setMsg(t('Harness adoptado como v{n}', { n: r.version }))
-    await Promise.all([load(), refreshProjects()])
+    try {
+      const r = await api.post<{ version: number }>(`/api/runs/${runId}/adopt`)
+      setMsg(t('Harness adoptado como v{n}', { n: r.version }))
+      await Promise.all([load(), refreshProjects()])
+    } catch (e) {
+      setMsg((e as Error).message)
+    }
   }
   const apply = async () => {
     try {
@@ -241,7 +274,7 @@ function RunDetail({ runId }: { runId: number }) {
             <Link to={`/p/${run.project_id}/c/${run.params.source.thread_id}`}>{t('la conversación')}</Link>
           </div>
         )}
-        {active && <button className="btn small" onClick={() => api.post(`/api/runs/${runId}/cancel`)}>{t('Cancelar')}</button>}
+        {active && <button className="btn small" onClick={() => api.post(`/api/runs/${runId}/cancel`).catch((e) => setMsg((e as Error).message))}>{t('Cancelar')}</button>}
       </div>
 
       <div className="phases">
@@ -382,13 +415,23 @@ export default function Harnessing() {
   const project = useProject(pid)
   const navigate = useNavigate()
   const [runs, setRuns] = useState<Run[]>([])
+  const listSeq = useRef(0)
   useLang()
-  const load = useCallback(async () => setRuns(await api.get<Run[]>(`/api/projects/${pid}/runs?kind=harness`)), [pid])
+  // newest request wins (switching projects must not show the previous project's runs)
+  const load = useCallback(async () => {
+    const n = ++listSeq.current
+    try {
+      const rs = await api.get<Run[]>(`/api/projects/${pid}/runs?kind=harness`)
+      if (n === listSeq.current) setRuns(rs)
+    } catch {
+      /* keep the list; the next poll retries */
+    }
+  }, [pid])
   useEffect(() => {
+    setRuns([])
     load()
-    const t = setInterval(load, 5000)
-    return () => clearInterval(t)
   }, [load])
+  useVisibleInterval(() => void load(), 5000)
 
   if (!project) return null
   return (
@@ -417,7 +460,7 @@ export default function Harnessing() {
           ))}
         </div>
         <div className="hn-main">
-          {rid ? <RunDetail runId={Number(rid)} /> : <NewRunForm pid={project.id} onStarted={(r) => { load(); navigate(`/p/${pid}/harnessing/${r.id}`) }} />}
+          {rid ? <RunDetail key={rid} runId={Number(rid)} /> : <NewRunForm pid={project.id} onStarted={(r) => { load(); navigate(`/p/${pid}/harnessing/${r.id}`) }} />}
         </div>
       </div>
     </div>

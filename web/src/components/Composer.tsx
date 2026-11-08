@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import type { Attachment } from '../api'
 import { showImage } from './ImageViewer'
+import { drafts } from '../drafts'
 import { t, useLang } from '../i18n'
+import { pasteUploads } from '../logic'
 import { startRecording, type Recording } from './recorder'
 
 const HISTORY_KEY = 'nesi:history'
@@ -65,6 +67,7 @@ export default function Composer({
   queueWhileBusy,
   stopping,
   transcribe,
+  draftKey,
 }: {
   /** Return false if sending failed: the text and attachments are put back. */
   onSend: (text: string, attachments: Attachment[], opts?: { now?: boolean }) => void | boolean | Promise<void | boolean>
@@ -81,10 +84,18 @@ export default function Composer({
   stopping?: boolean
   /** Microphone button: turn a WAV recording into text (it lands in the box to review before sending). */
   transcribe?: (wav: Blob) => Promise<string>
+  /** Keep the unsent draft under this key (one per conversation) while the user looks elsewhere. */
+  draftKey?: string
 }) {
-  const [text, setText] = useState('')
-  const [atts, setAtts] = useState<Attachment[]>([])
-  const [threadId, setThreadId] = useState<number | undefined>()
+  const saved = draftKey ? drafts.get(draftKey) : undefined
+  const [text, setText] = useState(saved?.text ?? '')
+  const [atts, setAtts] = useState<Attachment[]>(saved?.atts ?? [])
+  const [threadId, setThreadId] = useState<number | undefined>(saved?.threadId)
+  useEffect(() => {
+    if (!draftKey) return
+    if (text.trim() || atts.length) drafts.set(draftKey, { text, atts, threadId })
+    else drafts.delete(draftKey)
+  }, [draftKey, text, atts, threadId])
   const [uploading, setUploading] = useState(0)
   const [drag, setDrag] = useState(false)
   const [error, setError] = useState('')
@@ -112,7 +123,9 @@ export default function Composer({
 
   // ---- microphone
   const rec = useRef<Recording | null>(null)
-  const [mic, setMic] = useState<'idle' | 'rec' | 'busy'>('idle')
+  const alive = useRef(true)
+  const starting = useRef(false) // getUserMedia pending (permission prompt, device start): ignore more clicks
+  const [mic, setMic] = useState<'idle' | 'starting' | 'rec' | 'busy'>('idle')
   const [secs, setSecs] = useState(0)
   const [level, setLevel] = useState(0)
   useEffect(() => {
@@ -124,19 +137,39 @@ export default function Composer({
     }, 120)
     return () => clearInterval(id)
   }, [mic])
-  useEffect(() => () => rec.current?.cancel(), [])
+  useEffect(() => {
+    alive.current = true
+    return () => {
+      alive.current = false
+      rec.current?.cancel()
+      rec.current = null
+    }
+  }, [])
   const toggleMic = async () => {
     if (!transcribe) return
     setError('')
     if (mic === 'idle') {
+      if (starting.current || rec.current) return
+      starting.current = true
+      setMic('starting')
       try {
-        rec.current = await startRecording()
+        const r = await startRecording()
+        // the page changed (or another recording exists) while the prompt was open: never leave the mic on
+        if (!alive.current || rec.current) {
+          r.cancel()
+          return
+        }
+        rec.current = r
         setSecs(0)
         setMic('rec')
       } catch (e) {
+        if (!alive.current) return
+        setMic('idle')
         const name = (e as Error).name
         setError(name === 'NotAllowedError' ? t('Sin permiso para el micrófono: actívalo en Ajustes del Sistema → Privacidad y seguridad → Micrófono.')
           : (e as Error).message === 'mic-unsupported' ? t('Este navegador no permite grabar audio.') : t('No se pudo usar el micrófono: ') + (e as Error).message)
+      } finally {
+        starting.current = false
       }
       return
     }
@@ -257,7 +290,8 @@ export default function Composer({
           }}
           onPaste={(e) => {
             const files = Array.from(e.clipboardData.files)
-            if (files.length && onUpload) {
+            // text copied from Excel/Word/Numbers also brings a picture of itself: paste the text, don't upload
+            if (onUpload && pasteUploads(e.clipboardData.getData('text/plain'), files)) {
               e.preventDefault()
               upload(files.map((f, i) => (f.name && f.name !== 'image.png' ? f : new File([f], `pegado-${Date.now()}-${i}.${(f.type.split('/')[1] || 'bin').replace('jpeg', 'jpg')}`, { type: f.type }))))
             }
@@ -294,9 +328,9 @@ export default function Composer({
               </button>
             </div>
           ) : (
-            <button className={`mic ${mic === 'busy' ? 'busy' : ''}`} onClick={toggleMic} disabled={mic === 'busy'}
-              title={mic === 'busy' ? t('Transcribiendo…') : t('Dictar un mensaje')}>
-              {mic === 'busy' ? <span className="spinner" /> : (
+            <button className={`mic ${mic === 'busy' || mic === 'starting' ? 'busy' : ''}`} onClick={toggleMic} disabled={mic === 'busy' || mic === 'starting'}
+              title={mic === 'busy' ? t('Transcribiendo…') : mic === 'starting' ? t('Abriendo el micrófono…') : t('Dictar un mensaje')}>
+              {mic === 'busy' || mic === 'starting' ? <span className="spinner" /> : (
                 <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="7" y="2.5" width="6" height="10" rx="3" /><path d="M4 9.5a6 6 0 0 0 12 0M10 15.5V18" /></svg>
               )}
             </button>

@@ -1,8 +1,30 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom'
-import { api, relTime, switchLang } from '../api'
+import { api, relTime, switchLang, type Thread } from '../api'
 import { t, useLang } from '../i18n'
 import { useApp } from '../App'
+import { forgetDraft } from '../drafts'
+
+const PAGE = 100 // conversations shown before «Ver más»
+
+/** Deleting a conversation removes its cage (unapplied work) and, for a bot's conversation, the bot: say so first. */
+async function confirmDelete(th: Thread): Promise<boolean> {
+  let bot: { name: string } | null | undefined
+  try {
+    const r = await api.get<{ bots: { name: string; thread_id: number | null }[] }>('/api/bots')
+    bot = r.bots.find((b) => b.thread_id === th.id) ?? null
+  } catch {
+    bot = undefined // unknown: warn in general terms
+  }
+  const parts = [t('¿Eliminar la conversación «{title}»?', { title: th.title })]
+  parts.push(th.isolated
+    ? t('Se borran sus mensajes y su carpeta aislada: los cambios que no hayas aplicado al proyecto se pierden.')
+    : t('Se borran sus mensajes (los archivos del proyecto no se tocan).'))
+  if (bot) parts.push(t('Es la conversación del bot «{name}»: también se borra el bot, con sus tareas programadas, su memoria y su webhook.', { name: bot.name }))
+  else if (bot === undefined) parts.push(t('Si es la conversación de un bot, también se borra el bot.'))
+  parts.push(t('No se puede deshacer.'))
+  return window.confirm(parts.join('\n\n'))
+}
 
 const I = {
   plug: <path d="M7 3v4M13 3v4M5 7h10v3a5 5 0 0 1-10 0zM10 15v3" />,
@@ -27,20 +49,30 @@ export function Icon({ name, size = 18 }: { name: keyof typeof I; size?: number 
 }
 
 export default function Sidebar({ onNavigate }: { onNavigate: () => void }) {
-  const { user, projects, threads, refreshThreads, logout } = useApp()
+  const { user, projects, pid, threads, threadsPid, refreshThreads, logout } = useApp()
   const navigate = useNavigate()
   const loc = useLocation()
-  const m = loc.pathname.match(/^\/p\/(\d+)/)
-  const pid = m ? Number(m[1]) : Number(localStorage.getItem('nesi:project')) || projects[0]?.id
   const project = projects.find((p) => p.id === pid)
   const own = threads.filter((t) => t.project_id === pid)
+  const loaded = threadsPid === pid
+  const [limit, setLimit] = useState(PAGE)
+  useEffect(() => setLimit(PAGE), [pid])
   const [userMenu, setUserMenu] = useState(false)
+  const [error, setError] = useState('')
   const [lang] = useLang()
 
-  const removeThread = async (id: number) => {
-    await api.del(`/api/threads/${id}`)
+  const removeThread = async (th: Thread) => {
+    setError('')
+    if (!(await confirmDelete(th))) return
+    try {
+      await api.del(`/api/threads/${th.id}`)
+    } catch (e) {
+      setError((e as Error).message)
+      return
+    }
+    forgetDraft(`chat:${th.id}`)
     await refreshThreads()
-    if (loc.pathname.endsWith(`/c/${id}`)) navigate(`/p/${pid}`)
+    if (loc.pathname.endsWith(`/c/${th.id}`)) navigate(`/p/${pid}`)
   }
 
   return (
@@ -85,18 +117,24 @@ export default function Sidebar({ onNavigate }: { onNavigate: () => void }) {
 
           <div className="threads-head">{t('Conversaciones')}</div>
           <div className="threads">
-            {own.length === 0 && <div className="muted small pad">{t('Aún no hay conversaciones.')}</div>}
-            {own.map((th) => (
+            {error && <div className="error-text small pad">{error}</div>}
+            {loaded && own.length === 0 && <div className="muted small pad">{t('Aún no hay conversaciones.')}</div>}
+            {own.slice(0, limit).map((th) => (
               <div key={th.id} className="thread-row">
                 <NavLink to={`/p/${project.id}/c/${th.id}`} title={th.title}>
                   <span className="t-title">{th.title}</span>
                   <span className="t-time">{relTime(th.updated_at)}</span>
                 </NavLink>
-                <button className="icon-btn ghost" title={t('Eliminar')} onClick={() => removeThread(th.id)}>
+                <button className="icon-btn ghost" title={t('Eliminar')} onClick={() => removeThread(th)}>
                   <Icon name="trash" size={15} />
                 </button>
               </div>
             ))}
+            {own.length > limit && (
+              <button className="link small threads-more" onClick={() => setLimit((n) => n + PAGE)}>
+                {t('Ver más ({n})', { n: own.length - limit })}
+              </button>
+            )}
           </div>
         </>
       )}
