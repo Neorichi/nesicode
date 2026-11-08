@@ -257,8 +257,7 @@ class OpenAICompatProvider(Provider):
                 with client.stream("POST", url, content=content, headers=self.headers,
                                    extensions={"trace": call.trace}) as resp:
                     call.touch()
-                    if resp.status_code >= 400:
-                        raise _Status(resp.status_code, _read_text(resp, call), resp.headers)
+                    _check_status(resp, call, self.name)
                     return _read_reply(resp, call, emit, self.name)
 
         data, streamed = self._run(produce, call, cancel, on_event, first, idle)
@@ -280,8 +279,7 @@ class OpenAICompatProvider(Provider):
                 with client.stream("POST", url, content=content, headers=self.headers,
                                    extensions={"trace": call.trace}) as resp:
                     call.touch()
-                    if resp.status_code >= 400:
-                        raise _Status(resp.status_code, _read_text(resp, call), resp.headers)
+                    _check_status(resp, call, self.name)
                     return _read_reply(resp, call, emit, self.name)[0]
 
         try:
@@ -428,6 +426,16 @@ class _Timeout(Retryable):
 
 class _Incomplete(Exception):
     """The reply stream ended before it was complete (no finish_reason and no [DONE])."""
+
+
+def _check_status(resp: httpx.Response, call: Call, name: str) -> None:
+    """HTTP errors become _Status. A redirect means a wrong base URL: it is never followed (the key would go along)."""
+    if resp.status_code >= 400:
+        raise _Status(resp.status_code, _read_text(resp, call), resp.headers)
+    if 300 <= resp.status_code < 400:
+        where = resp.headers.get("location", "")
+        raise LLMError(f"{name}: the endpoint answered HTTP {resp.status_code} (a redirect{' to ' + where if where else ''}); "
+                       "use the final URL as the base URL")
 
 
 def _int(value) -> int:

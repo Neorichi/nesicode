@@ -308,9 +308,12 @@ class AnthropicConversation(Conversation):
                 thinking_parts.append(getattr(block, "thinking", "") or "")
             elif block.type == "tool_use":
                 args = block.input if isinstance(block.input, dict) else {}
+                raw = "".join(inputs.get(i, []))
                 err = ""
-                if i not in closed or not _whole_json("".join(inputs.get(i, []))):
-                    # A partial input (cut by the output cap or a full window): the SDK drops the unfinished field.
+                # A partial input (cut by the output cap or a full window): the SDK drops the unfinished field. Cut
+                # right after the tool's name (the last block, no input at all), the whole input is missing.
+                if i not in closed or not _whole_json(raw) or \
+                        (cut and i == len(final.content) - 1 and not raw.strip() and not args):
                     err = CUT if cut else "the tool input arrived incomplete; resend the call"
                 calls.append(ToolCall(id=block.id, name=block.name, arguments=args, parse_error=err))
         return Turn(

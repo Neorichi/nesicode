@@ -914,3 +914,25 @@ def test_image_url_is_vetted_even_through_a_proxy(srv, monkeypatch):
     assert not proxy.requests  # nothing reached the proxy
     assert transport.fetch_image("http://127.0.0.1:9/img.png", strict=False) == (PNG, "image/png")
     assert proxy.requests[-1]["path"] == "http://127.0.0.1:9/img.png"  # fetched through the proxy
+
+
+def test_openai_redirecting_endpoint_is_a_clear_error_not_followed(srv):
+    """http->https or a moved API: say where it points; never follow it (the key would be sent there too)."""
+    target = srv(default=respond(200, completion("should not be reached")))
+    s = srv(default=respond(307, b"", {"Location": target.url + "/v1/chat/completions"}))
+    _, conv = oa_conv(s)
+    with pytest.raises(LLMError, match="HTTP 307.*redirect to http://127.0.0.1"):
+        conv.step()
+    with pytest.raises(LLMError, match="redirect"):
+        OpenAICompatProvider("x", s.url, "sk-test").post("/images/generations", {"model": "m"})
+    assert len(s.requests) == 2 and not target.requests
+
+
+def test_anthropic_cut_right_after_the_tool_name_gets_parse_error(srv):
+    """max_tokens right after a tool_use block opened: no input arrived at all, so the call must not run with {}."""
+    s = srv(stream(a_start(), a_text("Writing it now."), a_tool_start(1), a_stop_block(1), a_end("max_tokens")),
+            stream(a_start(), a_tool_start(0, name="list_dir"), a_json("", 0), a_stop_block(0), a_end("tool_use")))
+    turn = a_conv(s).step()
+    assert turn.stop_reason == "max_tokens" and [(c.arguments, c.parse_error) for c in turn.tool_calls] == [({}, CUT)]
+    turn = a_conv(s).step()  # a tool without parameters that ended normally still runs
+    assert [(c.name, c.parse_error) for c in turn.tool_calls] == [("list_dir", "")]
