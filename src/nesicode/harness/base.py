@@ -39,7 +39,9 @@ HOOKS = {
     "pre_tool": [
         {
             "tool": "bash",
-            "match": r"rm\s+-rf\s+(/|~|\$HOME)(\s|$)",
+            # rm with any flags (-rf, -fr, -r -f, --recursive...) and among its arguments the root, the home
+            # or everything in them: /, /*, ~, ~/, ~/*, $HOME, ${HOME}/*, quoted or not. Not `rm -rf build/`.
+            "match": r"""(?:^|[\s;&|({`"'])rm(?:\s+[^\s;&|]+)*?\s+["']?(?:/\*?|~/?\*?|\$\{?HOME\}?/?\*?)["']?(?=$|[\s;&|)`"'])""",
             "action": "block",
             "message": "Blocked: refusing to delete a root or home directory.",
         }
