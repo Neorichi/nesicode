@@ -134,10 +134,13 @@ Downloads are on the [Releases](../../releases) page.
   each one a conversation you can also talk to. Create them from a plain-language description or from any chat.
 - **Your own Chrome**: a Chrome extension lets the agent use only the tabs in a "Nesicode" tab group.
 - **Telegram**: drive your conversations from a Telegram bot (attach/detach chats, approvals, files).
-- **Context management** for long tasks: large outputs saved to disk, old tool results masked, structured
-  summaries, and a per-conversation archive searchable with `search_history`. Context limits are discovered
-  per model; a limit learned from a provider's error is kept until you forget it (e.g. after giving a local
-  server a bigger window).
+- **Context management** for long tasks: large outputs saved to disk; old tool results set aside (each marker says
+  how to read it again) while the newest stay whole; structured summaries that keep the user's rules from earlier
+  turns, the files the agent read and the results it has not seen yet; the model's reasoning sent back within a task
+  for models that build on it (nesi3, GLM, Qwen, DeepSeek); a reminder to write results down as it goes; and a
+  per-conversation archive (every turn, with its reasoning) searchable with `search_history`. Stop and *continue*
+  pick the work up where it was left. Context limits are discovered per model; a limit learned from a provider's
+  error is kept until you forget it (e.g. after giving a local server a bigger window).
 - **Export / import configuration**: providers with their keys, connectors, preferences, bots and a project
   template, in a password-encrypted file, to move everything to another computer. The import shows what it will
   change first, and a file never switches anything on behind your back: local MCP servers (commands) and bots with
