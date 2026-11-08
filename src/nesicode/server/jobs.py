@@ -1035,7 +1035,12 @@ class Jobs:
         return True
 
     def resume_waiting(self) -> None:
-        """After a restart: queued messages carry on, oldest conversation first."""
+        """After a restart: queued messages carry on, oldest conversation first. A bot run needs the bot manager (its
+        tools and model), which the app attaches right after starting this: give it a moment."""
+        deadline = time.time() + 5
+        while self.bots is None and time.time() < deadline and \
+                self.db.one("SELECT 1 FROM runs WHERE status='waiting' AND bot_id IS NOT NULL LIMIT 1"):
+            time.sleep(0.05)
         for row in self.db.all("SELECT thread_id, MIN(created_at) AS t FROM runs WHERE status='waiting' AND thread_id IS NOT NULL "
                                "GROUP BY thread_id ORDER BY t"):
             self.advance(row["thread_id"])

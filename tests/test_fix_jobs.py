@@ -312,6 +312,33 @@ def test_restart_resumes_accepted_messages_in_order(env):
         restarted.shutdown(wait=3)
 
 
+def test_restart_resumes_bot_runs_only_with_their_bot(env, monkeypatch):
+    import nesicode.server.jobs as jobs_mod
+
+    seen = []
+
+    class Spy(jobs_mod.Agent):
+        def __init__(self, **kw):
+            seen.append(kw["model"])
+            super().__init__(**kw)
+
+    monkeypatch.setattr(jobs_mod, "Agent", Spy)
+    e = env(1)
+    p = e.project()
+    bot = e.bot(p, model="mock/del-bot")
+    rid = e.db.insert("INSERT INTO runs (project_id, thread_id, kind, task, status, created_at, bot_id, trigger) "
+                      "VALUES (?, ?, 'chat', 'tarea', 'queued', ?, ?, 'cron#1')", (p["id"], e.thread(p)["id"], time.time(), bot["id"]))
+    restarted = Jobs(e.db, max_workers=1)
+    try:
+        threading.Thread(target=restarted.resume_waiting, daemon=True).start()  # the app starts this before attaching bots
+        time.sleep(0.3)
+        restarted.bots = _BotsStub()
+        assert e.wait(rid)["status"] == "done"
+        assert seen == ["mock/del-bot"]  # it ran as the bot (its model, tools and rules), not as a plain chat
+    finally:
+        restarted.shutdown(wait=3)
+
+
 # ------------------------------------------------------------------ jobs-runtime#2: closing the app
 def test_closing_never_overwrites_a_delivered_answer_and_keeps_the_queue(env, models):
     e = env(1)
