@@ -7,6 +7,7 @@ microphone, …) are checked by `npm run build` (tsc) and the browser checks des
 """
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -17,6 +18,8 @@ WEB = Path(__file__).resolve().parents[1] / "web"
 NODE = shutil.which("node")
 ESBUILD = WEB / "node_modules" / "esbuild"
 
+if os.environ.get("CI") and (not NODE or not ESBUILD.is_dir()):  # a release build runs them, never skips them
+    pytest.fail("the web UI tests need node and web/node_modules (esbuild): run `npm ci` in web/ first", pytrace=False)
 pytestmark = pytest.mark.skipif(not NODE or not ESBUILD.is_dir(), reason="needs node and web/node_modules (esbuild)")
 
 

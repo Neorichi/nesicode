@@ -511,7 +511,7 @@ def test_the_app_page_sends_a_content_security_policy_and_no_referrer():
     assert rules["base-uri"] == "'none'" and rules["frame-src"] == "'self'"
     assert "'unsafe-eval'" in appmod.spa_csp(desktop=True).split("; ")[1]  # pywebview's bridge builds its API with new Function
     assert appmod.SPA_HEADERS["Referrer-Policy"] == "no-referrer"
-    if appmod.WEB_DIST.is_dir():  # (a checkout with the UI built)
+    if appmod.WEB_DIST.is_dir() or os.environ.get("CI"):  # (a checkout with the UI built; a release build always has it)
         r = TestClient(app).get("/")
         assert r.headers["content-security-policy"] == csp and r.headers["referrer-policy"] == "no-referrer"
 

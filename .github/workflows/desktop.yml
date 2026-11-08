@@ -19,9 +19,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+      # 22 (as in development), not 20: the web tests run web/src under node, and modules of it read `navigator` when
+      # they load, a global node has only from 21 on (on 20, 5 of them fail with "navigator is not defined")
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
+        with: { node-version: 22 }
       - run: uv run --group build python -c "print('ok')"
+      # the web UI's logic and its contracts with the server are tested by pytest too (tests/test_*web*.py bundle
+      # web/src with esbuild, the SPA headers need web/dist): install and build it first, or those tests cannot run
+      - name: web UI for the tests
+        working-directory: web
+        run: npm ci && npm run build
       - run: uv run pytest -q
       - run: packaging/build_macos.sh
       - uses: actions/upload-artifact@v4

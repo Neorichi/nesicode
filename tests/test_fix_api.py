@@ -505,12 +505,18 @@ def test_harnessing_apply_never_follows_project_links(tmp_path):
             f.write_text(text)
         return rid
 
+    # (three-way: a link of the user's where the result adds a file is the user's — kept, the result's file beside it)
     r = a.post(f"/api/runs/{harness_run({'pwn': 'from the rollout\n'})}/apply")
     assert r.status_code == 200, r.text
-    assert (outside / "secret.py").read_text() == "victim\n" and (aws / "pwn").read_text() == "from the rollout\n"
+    assert r.json()["changes"]["conflicts"] == [{"path": "pwn", "reason": "exists", "side_file": "pwn.nesicode-new"}]
+    assert (outside / "secret.py").read_text() == "victim\n" and (aws / "pwn").is_symlink()
+    assert (aws / "pwn.nesicode-new").read_text() == "from the rollout\n"
+    # a linked folder on the way: that file is an 'unsafe' conflict, never written through the link
     (aws / "d").symlink_to(outside, target_is_directory=True)
     r = a.post(f"/api/runs/{harness_run({'d/secret.py': 'overwritten\n'})}/apply")
-    assert r.status_code == 422 and (outside / "secret.py").read_text() == "victim\n"
+    assert r.status_code == 200, r.text
+    assert r.json()["changes"]["conflicts"] == [{"path": "d/secret.py", "reason": "unsafe", "side_file": None}]
+    assert (outside / "secret.py").read_text() == "victim\n"
 
 
 def test_attachments_never_go_through_a_link(tmp_path):

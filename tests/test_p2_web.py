@@ -23,6 +23,8 @@ SRC = WEB / "src"
 NODE = shutil.which("node")
 ESBUILD = WEB / "node_modules" / "esbuild"
 
+if os.environ.get("CI") and (not NODE or not ESBUILD.is_dir()):  # a release build runs them, never skips them
+    pytest.fail("the web UI tests need node and web/node_modules (esbuild): run `npm ci` in web/ first", pytrace=False)
 pytestmark = pytest.mark.skipif(not NODE or not ESBUILD.is_dir(), reason="needs node and web/node_modules (esbuild)")
 
 STUB_MARKDOWN = "export default function Markdown({ text }: { text: string }) { return <div className=\"md\">{text}</div> }\n"
