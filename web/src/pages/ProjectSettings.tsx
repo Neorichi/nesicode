@@ -6,6 +6,7 @@ import { forgetDraft } from '../drafts'
 import ProvidersSection, { RolePicker } from '../components/Providers'
 import ConnectorsSection from '../components/Connectors'
 import { t, useLang } from '../i18n'
+import { skippedPath, uploadReport } from '../logic'
 
 export default function ProjectSettings() {
   const { pid } = useParams()
@@ -16,6 +17,7 @@ export default function ProjectSettings() {
   const [msg, setMsg] = useState('')
   const [error, setError] = useState('')
   const [upMsg, setUpMsg] = useState('')
+  const [upSkipped, setUpSkipped] = useState<string[]>([]) // the uploaded ZIP's entries not extracted ("path: reason")
   const [delError, setDelError] = useState('') // e.g. 409: a reply of this project hasn't stopped yet
   const [deleting, setDeleting] = useState(false)
   useLang()
@@ -48,9 +50,11 @@ export default function ProjectSettings() {
     const fd = new FormData()
     fd.append('file', f)
     setUpMsg(t('Subiendo…'))
+    setUpSkipped([])
     try {
-      const r = await api.post<{ files: number }>(`/api/projects/${project.id}/upload`, fd)
+      const r = uploadReport(await api.post<{ files: number; skipped?: string[] }>(`/api/projects/${project.id}/upload`, fd))
       setUpMsg(t('{n} fichero(s) añadidos al proyecto. Las conversaciones nuevas los verán.', { n: r.files }))
+      setUpSkipped(r.skipped)
     } catch (e) {
       setUpMsg((e as Error).message)
     }
@@ -133,6 +137,7 @@ export default function ProjectSettings() {
           <input type="file" hidden onChange={(e) => e.target.files?.[0] && upload(e.target.files[0])} />
         </label>
         {upMsg && <div className="ok-box">{upMsg}</div>}
+        <UploadSkipped skipped={upSkipped} />
       </div>
 
       <div className="card danger">
@@ -140,6 +145,20 @@ export default function ProjectSettings() {
         {delError && <div className="error-box">{delError}</div>}
         <button className="btn danger" disabled={deleting} onClick={remove}>{deleting ? t('Eliminando…') : t('Eliminar proyecto')}</button>
       </div>
+    </div>
+  )
+}
+
+/** The entries of an uploaded .zip that were not extracted ("path: reason"), and why: a symbolic link never is. */
+export function UploadSkipped({ skipped }: { skipped: string[] }) {
+  useLang()
+  if (!skipped.length) return null
+  return (
+    <div className="apply-report">
+      <div className="warn small">{t('{n} entrada(s) del .zip no se extrajeron:', { n: skipped.length })}</div>
+      <ul className="apply-list small">
+        {skipped.map(skippedPath).map((s, i) => <li key={`${s.path}:${i}`}><code>{s.path}</code>{s.reason && <> — {s.reason}</>}</li>)}
+      </ul>
     </div>
   )
 }
