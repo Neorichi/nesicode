@@ -1056,3 +1056,35 @@ def test_review_a_page_repeating_one_image_never_makes_a_huge_preview(monkeypatc
     assert r.status_code == 200 and "sandbox" in r.headers["content-security-policy"]
     assert len(r.content) < 3 * 1024 * 1024 + 20_000  # was ~700 MB for this 10 KB page
     assert r.text.count("data:image/png;base64,") == 3 and r.text.count('src="big.png"') == 498
+
+
+def test_review_apply_and_changes_tolerate_versioned_manifests(monkeypatch):
+    """The workspace module of the tools group versions its manifests ('' entry) and records links and big files.
+    A conversation whose stored manifest predates that must still apply (the '' entry is no path), and the links it
+    copied from the project are neither 'new' nor removed from the project by the apply."""
+    from nesicode.agent import workspace as wsmod
+
+    a = _user("v2")
+    pa = _project(a)
+    aws = Path(pa["workspace"])
+    (aws / "shared").mkdir()
+    (aws / "shared" / "a.txt").write_text("a\n")
+    (aws / "link").symlink_to("shared", target_is_directory=True)  # the user's own link, copied into the cage
+    t, cage = _thread(a, pa)
+    (cage / "new.txt").write_text("hola\n")
+    real = appmod.manifest
+
+    def versioned(root):
+        out = {"": "2", **real(root)}
+        out.update({e.name: "symlink:" + os.readlink(e) for e in Path(root).iterdir() if e.is_symlink()})
+        return out
+
+    monkeypatch.setattr(appmod, "manifest", versioned)
+    ch = a.get(f"/api/threads/{t['id']}/changes").json()
+    assert (ch["added"], ch["modified"], ch["removed"]) == (["new.txt"], [], []) and "changed: \n" not in ch["diff"]
+    r = a.post(f"/api/threads/{t['id']}/apply")
+    assert r.status_code == 200, r.text
+    assert (aws / "new.txt").read_text() == "hola\n" and (aws / "link").is_symlink()
+    # a workspace module that computes the change sets itself is the one used (apply_cage then writes exactly those)
+    monkeypatch.setattr(wsmod, "_changes", lambda base, root: (["x"], [], []), raising=False)
+    assert appmod.cage_change_sets({}, cage) == (["x"], [], [])

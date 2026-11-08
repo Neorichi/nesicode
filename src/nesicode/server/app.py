@@ -2555,16 +2555,32 @@ def _diff_side(root: Path, rel: str) -> tuple[bool, str | None]:
     return True, data.decode("utf-8", "replace")
 
 
+def cage_change_sets(base: dict, cage: Path) -> tuple[list[str], list[str], list[str]]:
+    """(added, modified, removed) of a cage since its starting manifest — the very paths apply_cage writes or
+    removes. A workspace module that versions its manifests (a '' entry; links and big files recorded too)
+    computes them itself; otherwise they come from the manifests, where '' is never a path and, against a
+    manifest from before the versioning, entries it never recorded (links, big files) are not new."""
+    from ..agent import workspace as wsmod
+
+    if callable(getattr(wsmod, "_changes", None)):
+        return wsmod._changes(base, cage)
+    now, base = dict(manifest(cage)), dict(base)
+    older = "" in now and "" not in base
+    now.pop("", None)
+    base.pop("", None)
+    if older:
+        now = {k: v for k, v in now.items() if k in base or re.fullmatch(r"[0-9a-f]{64}", str(v))}
+    return (sorted(p for p in now if p not in base), sorted(p for p in now if p in base and now[p] != base[p]),
+            sorted(p for p in base if p not in now))
+
+
 def cage_changes(base: dict, cage: Path, project: Path, max_chars: int = 80_000) -> dict:
     """What a conversation changed since its starting manifest, diffed against the project. Same output as
     workspace.changes_since, but the project side is read without following links: a linked folder in the
     project (`d -> another user's project`) must not print someone else's .env as the 'old' side."""
     import difflib
 
-    now = manifest(cage)
-    added = sorted(p for p in now if p not in base)
-    modified = sorted(p for p in now if p in base and now[p] != base[p])
-    removed = sorted(p for p in base if p not in now)
+    added, modified, removed = cage_change_sets(base, cage)
     chunks: list[str] = []
     for rel in added + modified + removed:
         (had, ta), (has, tb) = _diff_side(project, rel), _diff_side(cage, rel)
@@ -2684,8 +2700,8 @@ def thread_apply(thread_id: int, user: dict = Depends(current_user)):
         raise HTTPException(409, "Espera a que termine la respuesta en curso")
     cage, target, base = thread_ws(p, t), project_ws(p), loads(t["manifest"], {})
     with jobs._project_lock(p["id"]):
-        now = manifest(cage)
-        prepare_targets(target, [r for r in now if base.get(r) != now[r]], [r for r in base if r not in now])
+        added, modified, removed = cage_change_sets(base, cage)
+        prepare_targets(target, added + modified, removed)
         applied = apply_cage(base, cage, target)
     # Re-baseline: later applies only carry changes made after this one.
     db.execute("UPDATE threads SET manifest=? WHERE id=?", (json.dumps(manifest(cage)), thread_id))
