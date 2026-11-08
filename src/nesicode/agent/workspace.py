@@ -7,6 +7,7 @@ its parent with O_NOFOLLOW, so even a link swapped in by a background process is
 
 from __future__ import annotations
 
+import contextvars
 import difflib
 import errno
 import hashlib
@@ -55,17 +56,20 @@ class Stopped(ToolError):
 def interruptible(cancel: threading.Event | None, fn, name: str = "nesi-call"):
     """Run a blocking call (an MCP request, a Chrome command, a vision model…) in a helper thread and wait for it in
     short slices, so Stop returns at once instead of when the call ends (up to minutes): Stopped. The abandoned call
-    finishes, or times out, in the background and its result is dropped. No `cancel`: a plain call."""
+    finishes, or times out, in the background and its result is dropped. No `cancel`: a plain call. The call sees the
+    caller's context variables (a new thread starts without them): the model layer's request scope — the Stop and
+    the retry notices the agent gives a tool's vision or image request — must reach it as if called directly."""
     if cancel is None:
         return fn()
     if cancel.is_set():
         raise Stopped("stopped by the user")
     box: dict = {}
     done = threading.Event()
+    context = contextvars.copy_context()
 
     def target() -> None:
         try:
-            box["value"] = fn()
+            box["value"] = context.run(fn)
         except BaseException as exc:  # noqa: BLE001 - re-raised in the caller's thread
             box["error"] = exc
         finally:
@@ -438,7 +442,10 @@ def store_new_file(root: Path, folder: str, name: str, data: bytes) -> str:
     returns the name used. Nothing is followed: a link at the folder (the agent can plant one, `ln -s ~/x .attachments`)
     is replaced by a real folder, never written through, and every name is created with O_EXCL, which refuses an
     existing entry — a dangling link too (writing through it would create a file wherever it points). A file where the
-    folder should be is not touched: OSError (ToolError for a path out of root)."""
+    folder should be is not touched: OSError (ToolError for a path out of root, or a `name` that is not a plain file
+    name: 'sub/x' would be opened through `sub` — a link maybe)."""
+    if name in ("", ".", "..") or any(s and s in name for s in ("/", os.sep, os.altsep)):
+        raise ToolError(f"{name!r} is not a file name")
     stem, dot, ext = name.rpartition(".")
     if not dot:
         stem, ext = name, ""
@@ -728,11 +735,28 @@ def _link_stays_inside(target_root: Path, rel: str, link: str) -> bool:
     return _within(_real(os.path.join(root, os.path.dirname(rel), link)), root)
 
 
+def _up_after_down(link: str) -> bool:
+    """A link target that goes into a folder and back up ('y/../x', 'y/z/../../x', '/abs/y/../x'). '..' after a name is
+    applied where that name LEADS (a link's target), so where such a link ends depends on links made later — by
+    another «Aplicar» of the same conversation, too: `a -> y/../x` is inside while y is a folder and leaves the project
+    once a later apply replaces y with `y -> .`. No check of the folder as it is now can vouch for it, so it is never
+    created. Leading '..' are fine (applied to the real folders the link is written in: `.bin/x -> ../pkg/bin/x`)."""
+    down = False
+    for part in re.split(r"[\\/]" if os.name == "nt" else "/", link):
+        if part == "..":
+            if down:
+                return True
+        elif part not in ("", "."):
+            down = True
+    return False
+
+
 def _escaping_links(target: Path, rels: list[str]) -> dict[str, str]:
     """Of the entries `rels` an apply just wrote into `target`, the links that point out of it now that all of them
-    exist — each was checked when written, against the folder as it was then and where it was made, but a link the user
-    made in the folder meanwhile can still complete a chain (`a -> y/z/../x`, `y -> .` from the apply, `z -> .` the
-    user's). They are removed again (until none is left: removing one changes where others lead). {rel: link text}."""
+    exist — each was checked when written, against the folder as it was then, but a link of the user's can still
+    complete a chain: one made meanwhile, or one with a '..' after a folder name (`w -> q/..`, which the apply's own
+    `q -> .` takes out of the project, and `a -> w/x` with it). They are removed again (until none is left: removing
+    one changes where others lead). {rel: link text}."""
     links = {}
     for rel in rels:
         try:
@@ -772,10 +796,14 @@ def _copy_entry(src_root: Path, dst_root: Path, rel: str, dst_rel: str | None = 
     parts = _parts(dst_root, rel)
     if stat.S_ISLNK(st.st_mode):
         link = os.readlink(src)
-        # Judged in dst_root as it is now, and — copied to the same place — also in src_root, where every link of the
-        # change already exists: one at a time, `a -> y/z/../../x` looks inside until `y -> .` and `z -> .` are there.
-        if not _link_stays_inside(dst_root, rel, link) or (
-                rel == src_rel and not _within(_real(src), os.path.realpath(src_root))):
+        # Judged in dst_root as it is now — which holds for good only for a target without a '..' after a folder name
+        # (_up_after_down): its leading '..' climb the real folders it is written in, the rest only goes down, through
+        # links that are inside too. One that goes down and back up (`a -> y/z/../../x`) follows those folders where
+        # they lead, so links made after it (`y -> .`, `z -> .`: later in this apply, in a later «Aplicar» of the same
+        # conversation, or a folder replaced by one) take it out of the project: refused whatever the folders are now.
+        # (Not judged in src_root: an absolute link into the project, and links through one, point out of the cage.)
+        # One message for both (the web UI translates it: "path: symlink to X would point outside the project").
+        if not _link_stays_inside(dst_root, rel, link) or _up_after_down(link):
             raise OSError(errno.EPERM, f"symlink to {link} would point outside the project")
         if _FD_WALK:
             dfd = _parent_fd(dst_root, parts, mkdirs=True)
