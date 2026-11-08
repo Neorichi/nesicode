@@ -936,6 +936,38 @@ def test_auto_apply_while_the_project_folder_is_not_there_keeps_the_result(env, 
     assert "NESICODE_RESULT.md" in e.jobs.apply_later(rid, p)["added"] and (folder / "NESICODE_RESULT.md").is_file()
 
 
+@pytest.mark.skipif(not hasattr(os, "chflags") or not hasattr(stat, "UF_IMMUTABLE"), reason="needs chflags (macOS/BSD)")
+def test_a_file_the_system_refuses_to_write_is_not_reported_as_a_link(env):
+    """(review) EPERM is the apply's own answer to a result's link out of the project ('unsafe') — but also the
+    system's for a locked file (macOS 'uchg'). That one is an 'error': the result's version waits beside it and the run's
+    copies stay for another «Aplicar»."""
+    from nesicode.harnessing import apply_rollout
+
+    e = env()
+    p = e.project()
+    proj = project_ws(p)
+    _tree(proj, {"app.py": "v1\n", "viejo.md": "viejo\n"})
+    rid, rd, ws = _harness_run(e, p)
+    (ws / "app.py").write_text("v2\n")
+    os.unlink(ws / "viejo.md")
+    os.symlink("/etc/hosts", ws / "fuera")
+    for name in ("app.py", "viejo.md"):
+        os.chflags(proj / name, stat.UF_IMMUTABLE)
+    try:
+        res = e.jobs.apply_later(rid, p)
+        assert apply_rollout(rd / "source", ws, proj)["conflicts"] == res["conflicts"]  # (the same, run again)
+    finally:
+        for name in ("app.py", "viejo.md"):
+            os.chflags(proj / name, 0)
+    assert {c["path"]: (c["reason"], c["side_file"]) for c in res["conflicts"]} == {
+        "viejo.md": ("error", None), "fuera": ("unsafe", None), "app.py": ("error", "app.py.nesicode-new")}
+    assert (proj / "app.py").read_text() == "v1\n" and (proj / "app.py.nesicode-new").read_text() == "v2\n"
+    assert (rd / "source").is_dir() and ws.is_dir()  # kept: once unlocked, «Aplicar» again does it
+    again = e.jobs.apply_later(rid, p)
+    assert again["modified"] == ["app.py"] and again["removed"] == ["viejo.md"] and (proj / "app.py").read_text() == "v2\n"
+    assert not (rd / "source").exists()
+
+
 def test_an_applied_run_shows_done_only_once_its_copies_are_gone(env, monkeypatch):
     """Once a run is 'done', «Aplicar» is offered: its copies must not be half deleted under an «Aplicar» then (a file
     missing from the copy of the result looks like the result deleted it). An applied run drops them before."""

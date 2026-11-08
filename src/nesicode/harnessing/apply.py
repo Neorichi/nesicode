@@ -29,11 +29,13 @@ UNSAFE = "unsafe"  # the path leads out of the project through a symlink
 ERROR = "error"  # it could not be written (something in the way, permissions, disk...)
 
 
-def _reason(target: Path, rel: str, exc: BaseException) -> str:
-    """Why writing or removing target/rel failed: UNSAFE for a link on the way (or a copied link that would point out
-    of the project), ERROR for anything else (a file where a folder should be, permissions, a full disk…)."""
+def _reason(target: Path, rel: str, exc: BaseException, link: bool = False) -> str:
+    """Why writing or removing target/rel failed: UNSAFE for a link on the way (or, `link`, the result's own link that
+    would point out of the project: _copy_entry refuses it with EPERM), ERROR for anything else (a file where a folder
+    should be, permissions, a file the system protects — macOS answers EPERM for a locked 'uchg' file too —, a full
+    disk…): an ERROR keeps the result's version beside the file and the run's copies, for another «Aplicar»."""
     no = getattr(exc, "errno", None)
-    if no in (errno.ELOOP, errno.EMLINK, errno.EPERM):
+    if no in (errno.ELOOP, errno.EMLINK) or (no == errno.EPERM and link):
         return UNSAFE
     if no == errno.ENOTDIR:  # a link or a plain file where a folder should be
         cur = Path(target)
@@ -140,6 +142,6 @@ def apply_rollout(before: Path, after: Path, target: Path) -> dict:
                 _copy_entry(after, target, rel)
                 done[kind].append(rel)
             except (OSError, ValueError) as exc:  # a link on the way or out of the project; a full folder in the way…
-                why = _reason(target, rel, exc)
+                why = _reason(target, rel, exc, link=os.path.islink(after / rel))
                 conflict(rel, why, side=why != UNSAFE)
     return done
