@@ -116,6 +116,16 @@ def hooks(h: Harness) -> dict:
     return {k: v if isinstance(v := data.get(k, []), list) else [] for k in ("pre_tool", "post_tool")}
 
 
+def _freezes(pattern: str) -> bool:
+    """A hook regex with nested repetitions can take exponential time on one tool call, and Python's re holds the GIL
+    meanwhile (the whole server freezes): the improver must not write one. The shipped rm guard (and its earlier
+    spellings, still stored in older projects) trips the same heuristic without being slow, so it is exempt."""
+    from ..agent.tools import _nested_repeat  # (imported here: agent.tools imports this package)
+    from .base import LEGACY_RM_MATCHES, RM_MATCH
+
+    return pattern not in (RM_MATCH, *LEGACY_RM_MATCHES) and _nested_repeat(pattern)
+
+
 def _validate_hooks(raw: str) -> list[str]:
     errs: list[str] = []
     try:
@@ -153,6 +163,10 @@ def _validate_hooks(raw: str) -> list[str]:
                     re.compile(match)
                 except (re.error, RecursionError, OverflowError) as exc:
                     errs.append(f"{where}: bad regex in `match`: {exc}")
+                else:
+                    if _freezes(match):
+                        errs.append(f"{where}: `match` repeats a group made only of repetitions (like `(a+)+` or "
+                                    "`(\\w+\\s?)*`): on a long tool call it can freeze the server; rewrite it")
             msg = rule.get("message")
             if action in ("block", "warn", "append") and not (isinstance(msg, str) and msg.strip()):
                 errs.append(f"{where}: `message` (a non-empty string) is required for action {action!r}")
