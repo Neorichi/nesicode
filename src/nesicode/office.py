@@ -78,31 +78,7 @@ def office_read(args: dict, ws: Workspace):
             for row in table.rows:
                 out.append(" | ".join(c.text.strip() for c in row.cells))
     elif ext in (".xlsx", ".xlsm"):
-        from openpyxl import load_workbook
-
-        max_rows = int(args.get("max_rows", 200))
-        wb_f = load_workbook(str(p), data_only=False)
-        wb_v = load_workbook(str(p), data_only=True)
-        names = [args["sheet"]] if args.get("sheet") else wb_f.sheetnames
-        for name in names:
-            if name not in wb_f.sheetnames:
-                raise ToolError(f"no sheet {name!r}; sheets: {', '.join(wb_f.sheetnames)}")
-            sf, sv = wb_f[name], wb_v[name]
-            out.append(f"## Sheet {name!r} ({sf.max_row} rows × {sf.max_column} cols, range {sf.dimensions})")
-            for r, (row_f, row_v) in enumerate(zip(sf.iter_rows(), sv.iter_rows()), 1):
-                if r > max_rows:
-                    out.append(f"... ({sf.max_row - max_rows} more rows; pass max_rows)")
-                    break
-                cells = []
-                for cf, cv in zip(row_f, row_v):
-                    if cf.value is None:
-                        cells.append("")
-                    elif isinstance(cf.value, str) and cf.value.startswith("="):
-                        cells.append(f"{cf.value} → {cv.value}" if cv.value is not None else cf.value)
-                    else:
-                        cells.append(str(cf.value))
-                if any(cells):
-                    out.append(f"{r}: " + " | ".join(cells))
+        out += _read_workbook(p, args)
     else:
         from pptx import Presentation
 
@@ -118,6 +94,90 @@ def office_read(args: dict, ws: Workspace):
             if slide.has_notes_slide and slide.notes_slide.notes_text_frame.text.strip():
                 out.append(f"(notes) {slide.notes_slide.notes_text_frame.text}")
     return _clip("\n".join(out) or "(empty document)"), None
+
+
+def _formula(value) -> str:
+    """The formula text of a cell value read with data_only=False ('' for plain values)."""
+    if isinstance(value, str):
+        return value if value.startswith("=") else ""
+    text = getattr(value, "text", None)  # ArrayFormula
+    return text if isinstance(text, str) and text.startswith("=") else ""
+
+
+def _saved_values(wb, p: Path, name: str, n_rows: int) -> dict:
+    """{(row, col): value Excel saved} for the first n_rows of a sheet: the results of its formulas. Read-only
+    sheets parse rows on demand, so the same workbook re-reads them with data_only on (no second load, which
+    would parse the shared strings again, and the whole sheet when the file has no <dimension>)."""
+    from openpyxl import load_workbook
+
+    src, other = wb, None
+    wb._data_only = True  # what load_workbook(data_only=True) sets
+    try:
+        if not wb.data_only:  # openpyxl changed: load the values separately
+            src = other = load_workbook(str(p), read_only=True, data_only=True)
+        sv = src[name]
+        sv.reset_dimensions()
+        return {(r, c): v for r, row in enumerate(sv.iter_rows(max_row=n_rows, values_only=True), 1)
+                for c, v in enumerate(row) if v is not None}
+    finally:
+        wb._data_only = False
+        if other is not None:
+            other.close()
+
+
+def _read_workbook(p: Path, args: dict) -> list[str]:
+    """Excel as text. Read-only mode streams rows from the file, so a big workbook only costs the rows shown (a
+    full load took ~1.5 GB and 20 s for an 8 MB export); the saved formula results are read only when the rows
+    shown have formulas."""
+    from openpyxl import load_workbook
+
+    max_rows = max(1, int(args.get("max_rows") or 200))
+    out: list[str] = []
+    wb = load_workbook(str(p), read_only=True, data_only=False)
+    try:
+        sheets = {s.title: s for s in wb.worksheets}
+        charts = [c.title for c in wb.chartsheets]  # a chart moved to its own sheet: no cells to show
+        want = str(args.get("sheet") or "")
+        if want and want not in sheets:
+            if want in charts:
+                return [f"## Chart sheet {want!r}: it holds a chart, no cells"]
+            raise ToolError(f"no sheet {want!r}; sheets: {', '.join(wb.sheetnames)}")
+        budget = MAX_TEXT  # the text is clipped there anyway: don't hold more rows than that in memory
+        for name in [want] if want else list(sheets):
+            sf = sheets[name]
+            n_rows, n_cols = sf.max_row, sf.max_column  # the file's own <dimension>, when it has one
+            out.append(f"## Sheet {name!r} ({n_rows} rows × {n_cols} cols, range {sf.calculate_dimension()})"
+                       if n_rows and n_cols else f"## Sheet {name!r}")
+            sf.reset_dimensions()  # some writers store a wrong <dimension>: read the cells that are really there
+            rows, cut = [], ""
+            for r, row in enumerate(sf.iter_rows(max_row=max_rows + 1, values_only=True), 1):
+                if r > max_rows:
+                    cut = f"{n_rows - max_rows} more rows" if n_rows and n_rows > max_rows else "more rows"
+                    break
+                if budget <= 0:
+                    cut = "output limit reached"
+                    break
+                rows.append(row)
+                budget -= sum(len(str(v)) + 3 for v in row if v is not None)
+            cached = _saved_values(wb, p, name, len(rows)) if any(_formula(v) for row in rows for v in row) else {}
+            for r, row in enumerate(rows, 1):
+                cells = []
+                for c, v in enumerate(row):
+                    if v is None:
+                        cells.append("")
+                    elif f := _formula(v):
+                        cells.append(f"{f} → {cached[(r, c)]}" if (r, c) in cached else f)
+                    else:
+                        cells.append(str(v))
+                if any(cells):
+                    out.append(f"{r}: " + " | ".join(cells))
+            if cut:
+                out.append(f"... ({cut}; pass max_rows" + (" or sheet" if len(sheets) > 1 else "") + ")")
+        if not want:
+            out += [f"## Chart sheet {c!r}: it holds a chart, no cells" for c in charts]
+    finally:
+        wb.close()
+    return out
 
 
 # ------------------------------------------------------------------ Word
@@ -138,19 +198,30 @@ def word_write(args: dict, ws: Workspace):
             b = {"type": "paragraph", "text": b}
         kind = b.get("type", "paragraph")
         if kind == "heading":
-            d.add_heading(str(b.get("text", "")), level=max(1, min(4, int(b.get("level", 1)))))
+            level = max(1, min(4, int(b.get("level", 1))))
+            if _ensure_style(d, f"Heading {level}"):
+                d.add_heading(str(b.get("text", "")), level=level)
+            else:
+                d.add_paragraph().add_run(str(b.get("text", ""))).bold = True
         elif kind == "paragraph":
             _runs(d.add_paragraph(), b.get("text", ""))
         elif kind in ("bullets", "numbered"):
             style = "List Bullet" if kind == "bullets" else "List Number"
-            for item in b.get("items", []):
-                _runs(d.add_paragraph(style=style), item)
+            native = style in d.styles  # its numbering comes with the document; it can't be copied in alone
+            for k, item in enumerate(b.get("items", []), 1):
+                if native:
+                    _runs(d.add_paragraph(style=style), item)
+                else:  # Word/Google Docs files only carry the styles they use: draw the list by hand
+                    para = d.add_paragraph()
+                    para.paragraph_format.left_indent, para.paragraph_format.first_line_indent = Cm(1.0), Cm(-0.5)
+                    _runs(para, ("• " if kind == "bullets" else f"{k}. ") + str(item))
         elif kind == "table":
             rows = _rows(b.get("rows"))
             if not rows:
                 continue
             t = d.add_table(rows=len(rows), cols=max(len(r) for r in rows))
-            t.style = "Table Grid"
+            if _ensure_style(d, "Table Grid"):
+                t.style = "Table Grid"
             for i, row in enumerate(rows):
                 for j, cell in enumerate(row):
                     t.cell(i, j).text = "" if cell is None else str(cell)
@@ -163,7 +234,7 @@ def word_write(args: dict, ws: Workspace):
                 raise ToolError(f"image not found: {b.get('path')}")
             d.add_picture(str(img), width=Cm(float(b.get("width_cm", 15))))
             if b.get("caption"):
-                d.add_paragraph(str(b["caption"])).italic = True
+                d.add_paragraph().add_run(str(b["caption"])).italic = True
         elif kind == "page_break":
             d.add_page_break()
         else:
@@ -172,46 +243,188 @@ def word_write(args: dict, ws: Workspace):
     return f"{'Appended to' if append else 'Wrote'} {ws.rel(p)} ({len(blocks)} blocks).", ws.rel(p)
 
 
+_DEFAULT_DOCX = None  # python-docx's own template: where missing styles are copied from
+
+
+def _ensure_style(d, name: str) -> bool:
+    """Make sure the document defines style `name`. Files made by Word, Google Docs or LibreOffice only carry the
+    styles they use ('Table Grid', 'Heading 3'…): a missing one is copied from python-docx's default template.
+    False when it can't be (list styles need numbering definitions the document doesn't have)."""
+    import copy
+
+    from docx import Document
+    from docx.oxml.ns import qn
+
+    if name in d.styles:
+        return True
+    global _DEFAULT_DOCX
+    if _DEFAULT_DOCX is None:
+        _DEFAULT_DOCX = Document()
+    if name not in _DEFAULT_DOCX.styles:
+        return False
+    el = copy.deepcopy(_DEFAULT_DOCX.styles[name].element)
+    if el.find(f"{qn('w:pPr')}/{qn('w:numPr')}") is not None:
+        return False
+    el.attrib.pop(qn("w:default"), None)
+    for tag in ("w:link", "w:rsid"):  # its linked character style and revision id belong to the template
+        for x in el.findall(qn(tag)):
+            el.remove(x)
+    have = {s.get(qn("w:styleId")) for s in d.styles.element.findall(qn("w:style"))}
+    for tag in ("w:basedOn", "w:next"):  # only keep references to styles this document has
+        x = el.find(qn(tag))
+        if x is not None and x.get(qn("w:val")) not in have:
+            el.remove(x)
+    sid, n = el.get(qn("w:styleId")), 2
+    while el.get(qn("w:styleId")) in have:  # the id is taken by another (e.g. localised) style
+        el.set(qn("w:styleId"), f"{sid}{n}")
+        n += 1
+    d.styles.element.append(el)
+    return True
+
+
+def _replace_in_paragraph(p_el, find: str, repl: str) -> int:
+    """Replace every `find` in one paragraph, also when Word split it across runs or it sits in a hyperlink.
+    Works on the w:t text nodes: a match spanning several nodes is written into the first one (keeping that
+    run's formatting) and cut from the others, so nothing else in the paragraph moves or repeats."""
+    from docx.oxml.ns import qn
+
+    W_P, W_T = qn("w:p"), qn("w:t")
+    nodes = [t for t in p_el.iter(W_T) if next(t.iterancestors(W_P), None) is p_el]  # not nested text boxes
+    texts = [t.text or "" for t in nodes]
+    full = "".join(texts)
+    hits, i = [], full.find(find)
+    while i != -1:
+        hits.append(i)
+        i = full.find(find, i + len(find))
+    if not hits:
+        return 0
+    starts, lens, pos = [], [len(s) for s in texts], 0
+    for s in texts:
+        starts.append(pos)
+        pos += len(s)
+
+    def node_at(off: int) -> int:
+        return next(k for k in range(len(texts)) if starts[k] <= off < starts[k] + lens[k])
+
+    for h in reversed(hits):  # right to left: the offsets of earlier matches stay valid
+        a, b = node_at(h), node_at(h + len(find) - 1)
+        oa, ob = h - starts[a], h + len(find) - starts[b]
+        if a == b:
+            texts[a] = texts[a][:oa] + repl + texts[a][oa + len(find):]
+        else:
+            texts[a] = texts[a][:oa] + repl
+            for k in range(a + 1, b):
+                texts[k] = ""
+            texts[b] = texts[b][ob:]
+    for t, s in zip(nodes, texts):
+        if (t.text or "") != s:
+            t.text = s
+            if s != s.strip():
+                t.set(qn("xml:space"), "preserve")
+    return len(hits)
+
+
 def word_replace(args: dict, ws: Workspace):
     from docx import Document
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.oxml.ns import qn
 
     p = _path(ws, args, (".docx",), must_exist=True)
     pairs = args.get("replacements") or []
     if not pairs:
         raise ToolError("`replacements` is required: [{find, replace}]")
     d = Document(str(p))
-    paragraphs = list(d.paragraphs)
-    for table in d.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                paragraphs.extend(cell.paragraphs)
+    # every paragraph once, straight from the XML: body, tables (a merged cell is one cell, not one per grid
+    # column), nested tables, text boxes, plus headers and footers
+    roots, seen = [d.element.body], set()
+    for rel in d.part.rels.values():
+        if not rel.is_external and rel.reltype in (RT.HEADER, RT.FOOTER) and id(rel.target_part) not in seen:
+            seen.add(id(rel.target_part))
+            roots.append(rel.target_part.element)
+    fallback = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
+    paragraphs = [(para, next(para.iterancestors(fallback), None) is None) for root in roots for para in root.iter(qn("w:p"))]
     counts = {}
     for pair in pairs:
         find, repl = str(pair.get("find", "")), str(pair.get("replace", ""))
         if not find:
             continue
         n = 0
-        for para in paragraphs:
-            if find not in para.text:
-                continue
-            hit = next((r for r in para.runs if find in r.text), None)
-            if hit is not None:  # keep formatting when the text sits inside one run
-                n += hit.text.count(find)
-                hit.text = hit.text.replace(find, repl)
-            else:  # spans several runs: rewrite the paragraph text in its first run
-                n += para.text.count(find)
-                text = para.text.replace(find, repl)
-                for r in para.runs[1:]:
-                    r.text = ""
-                para.runs[0].text = text
+        for para, counted in paragraphs:
+            hits = _replace_in_paragraph(para, find, repl)
+            n += hits if counted else 0  # a text box's legacy copy (mc:Fallback) is updated but not counted twice
         counts[find] = n
     d.save(str(p))
     return f"Replacements in {ws.rel(p)}: " + ", ".join(f"{k!r}×{v}" for k, v in counts.items()), ws.rel(p)
 
 
 # ------------------------------------------------------------------ Excel
+_BAD_SHEET = re.compile(r"[\\/*?:\[\]]")
+MAX_FORMAT_CELLS = 100_000
+
+
+def _load_xlsx(p: Path):
+    """Open a workbook to edit it. An .xlsm keeps its macros (vbaProject.bin) and its macro-enabled type: without
+    keep_vba, saving dropped the VBA and Excel refused to open the file."""
+    from openpyxl import load_workbook
+
+    return load_workbook(str(p), keep_vba=p.suffix.lower() == ".xlsm")
+
+
+def _save_xlsx(wb, p: Path) -> None:
+    wb.save(str(p))
+    if wb.vba_archive is not None:  # the in-memory copy keep_vba made: close it now, not at garbage collection
+        wb.vba_archive.close()
+
+
+def _find_sheet(wb, name: str):
+    """The worksheet called `name` (Excel compares sheet names case-insensitively), or None."""
+    if any(c.title.lower() == name.lower() for c in wb.chartsheets):
+        raise ToolError(f"{name!r} is a chart sheet (it holds a chart, no cells); sheets: {', '.join(wb.sheetnames)}")
+    return next((s for s in wb.worksheets if s.title.lower() == name.lower()), None)
+
+
+def _first_sheet(wb):
+    """The active sheet, unless it is a chart sheet."""
+    from openpyxl.worksheet.worksheet import Worksheet
+
+    if isinstance(wb.active, Worksheet):
+        return wb.active
+    return wb.worksheets[0] if wb.worksheets else wb.create_sheet()
+
+
+def _check_sheet_name(name: str) -> str:
+    if len(name) > 31:  # openpyxl only warns; Excel 'repairs' the file and renames the sheet
+        raise ToolError(f"Excel sheet names have at most 31 characters and {name!r} has {len(name)}: use a shorter `sheet`")
+    if _BAD_SHEET.search(name) or name.startswith("'") or name.endswith("'"):
+        raise ToolError(f"invalid sheet name {name!r}: Excel doesn't allow \\ / * ? : [ ] or an apostrophe at either end")
+    return name
+
+
+def _last_row(sh) -> int:
+    """The last row holding a value. Formatted-but-empty cells (number_format on 'B2:B1000', templates formatted
+    down to row 1000) don't count, so appended rows land right below the data."""
+    return max((r for (r, _), c in sh._cells.items() if c.value is not None), default=0)
+
+
+def _format_cells(sh, rng: str) -> list:
+    """The cells of 'B2:B20', 'C5', 'B' or '2' as a flat list (a single cell is not a tuple in openpyxl)."""
+    from openpyxl.utils.cell import range_boundaries
+
+    ref = rng.strip().replace("$", "").upper()
+    try:
+        c1, r1, c2, r2 = range_boundaries(ref)
+        sel = sh[ref]
+    except Exception as exc:  # noqa: BLE001 - openpyxl raises several types for a bad reference
+        raise ToolError(f"number_format: {rng!r} is not a cell or range (e.g. 'B2:B20' or 'C5')") from exc
+    if None not in (c1, r1, c2, r2) and (c2 - c1 + 1) * (r2 - r1 + 1) > MAX_FORMAT_CELLS:
+        raise ToolError(f"number_format: {rng!r} has more than {MAX_FORMAT_CELLS:,} cells; format only the data range")
+    if not isinstance(sel, tuple):
+        return [sel]
+    return [c for item in sel for c in (item if isinstance(item, tuple) else (item,))]
+
+
 def excel_write(args: dict, ws: Workspace):
-    from openpyxl import Workbook, load_workbook
+    from openpyxl import Workbook
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
     from openpyxl.utils.cell import coordinate_from_string, column_index_from_string
@@ -219,16 +432,24 @@ def excel_write(args: dict, ws: Workspace):
     p = _path(ws, args, (".xlsx", ".xlsm"))
     rows = _rows(args.get("rows"))
     exists = p.is_file()
-    wb = load_workbook(str(p)) if exists else Workbook()
+    if not exists and p.suffix.lower() == ".xlsm":
+        raise ToolError("a new .xlsm can't be created here (openpyxl can't write macros): write a .xlsx, "
+                        "or edit an existing .xlsm (its macros are kept)")
+    fmt = args.get("number_format") or {}
+    if not isinstance(fmt, dict):
+        raise ToolError("`number_format` must be an object like {'B2:B20': '#,##0.00 €', 'C5': '0%'}")
+    wb = _load_xlsx(p) if exists else Workbook()
     sheet = str(args.get("sheet") or "").strip()
-    if not exists and sheet:
-        wb.active.title = sheet
-    if sheet and sheet not in wb.sheetnames:
-        wb.create_sheet(sheet)
-    sh = wb[sheet] if sheet else wb.active
+    sh = _find_sheet(wb, sheet) if sheet else _first_sheet(wb)
+    if sh is None:
+        _check_sheet_name(sheet)
+        if exists:
+            sh = wb.create_sheet(sheet)
+        else:
+            sh = wb.active
+            sh.title = sheet
     if args.get("append"):
-        r0 = sh.max_row + 1 if sh.max_row > 1 or sh.cell(1, 1).value is not None else 1
-        c0 = 1
+        r0, c0 = _last_row(sh) + 1, 1
     else:
         col, r0 = coordinate_from_string(str(args.get("start", "A1")).upper())
         c0 = column_index_from_string(col)
@@ -239,28 +460,30 @@ def excel_write(args: dict, ws: Workspace):
         for j in range(len(rows[0])):
             sh.cell(r0, c0 + j).font = Font(bold=True)
         sh.freeze_panes = sh.cell(r0 + 1, c0)
-    if fmt := args.get("number_format"):
-        for rng, f in (fmt.items() if isinstance(fmt, dict) else []):
-            for row in sh[rng]:
-                for c in (row if isinstance(row, tuple) else (row,)):
-                    c.number_format = f
+    for rng, f in fmt.items():
+        for c in _format_cells(sh, str(rng)):
+            c.number_format = str(f)
     if args.get("autofit", True):
-        for j in range(max((len(r) for r in rows), default=0)):
-            letter = get_column_letter(c0 + j)
-            width = max((len(str(c.value)) for c in sh[letter] if c.value is not None), default=8)
-            sh.column_dimensions[letter].width = min(60, max(8, width + 2))
-    wb.save(str(p))
+        cols = {c0 + j for j in range(max((len(r) for r in rows), default=0))}
+        widths: dict[int, int] = {}
+        for (_, col_i), c in sh._cells.items():  # existing cells only: sh['B'] would create one per row
+            if col_i in cols and c.value is not None:
+                widths[col_i] = max(widths.get(col_i, 0), len(str(c.value)))
+        for col_i in cols:
+            sh.column_dimensions[get_column_letter(col_i)].width = min(60, max(8, widths.get(col_i, 8) + 2))
+    _save_xlsx(wb, p)
     return f"Wrote {len(rows)} rows to {ws.rel(p)} › {sh.title} (formulas are computed when the file is opened).", ws.rel(p)
 
 
 def excel_chart(args: dict, ws: Workspace):
-    from openpyxl import load_workbook
     from openpyxl.chart import BarChart, LineChart, PieChart, Reference, ScatterChart, Series
     from openpyxl.utils.cell import range_boundaries
 
     p = _path(ws, args, (".xlsx", ".xlsm"), must_exist=True)
-    wb = load_workbook(str(p))
-    sh = wb[args["sheet"]] if args.get("sheet") else wb.active
+    wb = _load_xlsx(p)
+    sh = _find_sheet(wb, str(args["sheet"])) if args.get("sheet") else _first_sheet(wb)
+    if sh is None:
+        raise ToolError(f"no sheet {args['sheet']!r}; sheets: {', '.join(wb.sheetnames)}")
     kind = str(args.get("type", "column"))
     try:
         c1, r1, c2, r2 = range_boundaries(str(args["data"]))
@@ -295,31 +518,50 @@ def excel_chart(args: dict, ws: Workspace):
         chart.y_axis.title = args["y_title"]
     chart.width, chart.height = 18, 9
     sh.add_chart(chart, str(args.get("anchor", "H2")))
-    wb.save(str(p))
+    _save_xlsx(wb, p)
     return f"Added a {kind} chart to {ws.rel(p)} › {sh.title} at {args.get('anchor', 'H2')}.", ws.rel(p)
 
 
 # ------------------------------------------------------------------ PowerPoint
+def _fit_layouts(prs, old_w: int, old_h: int) -> None:
+    """The default template is 4:3. After resizing the slides, stretch the masters' and layouts' shapes too, so
+    titles and text boxes span (and centre on) the 16:9 slide instead of ending ~10 cm before its right edge.
+    Only shapes with their own position: the others inherit their master's, which is already stretched."""
+    fx, fy = prs.slide_width / old_w, prs.slide_height / old_h
+    for master in prs.slide_masters:
+        for owner in [master, *master.slide_layouts]:
+            for shape in owner.shapes:
+                el = shape._element
+                if getattr(el, "xfrm", None) is None or el.x is None or el.cx is None:
+                    continue
+                el.x, el.cx = round(el.x * fx), round(el.cx * fx)
+                if fy != 1 and el.y is not None and el.cy is not None:
+                    el.y, el.cy = round(el.y * fy), round(el.cy * fy)
+
+
 def pptx_write(args: dict, ws: Workspace):
     from pptx import Presentation
     from pptx.util import Cm, Pt
 
     p = _path(ws, args, (".pptx",))
     append = bool(args.get("append")) and p.is_file()
-    prs = Presentation(str(p)) if append else Presentation()
-    if not append:
-        prs.slide_width, prs.slide_height = Cm(33.867), Cm(19.05)  # 16:9
     slides = args.get("slides") or []
     if not isinstance(slides, list) or not slides:
         raise ToolError("`slides` is required: a list of slides")
-    layouts = {"title": 0, "content": 1, "section": 2, "two_content": 3, "title_only": 5, "blank": 6}
+    # layout name -> index in the default template (image and table slides use 'title only' + a shape)
+    layouts = {"title": 0, "content": 1, "section": 2, "two_content": 3, "title_only": 5, "blank": 6, "image": 5, "table": 5}
+    for i, s in enumerate(slides, 1):  # check all first: an unknown layout used to drop its bullets silently
+        if not isinstance(s, dict) or s.get("layout", "content") not in layouts:
+            raise ToolError(f"slide {i}: `layout` must be one of {', '.join(layouts)}")
+    prs = Presentation(str(p)) if append else Presentation()
+    if not append:
+        old_w, old_h = prs.slide_width, prs.slide_height
+        prs.slide_width, prs.slide_height = Cm(33.867), Cm(19.05)  # 16:9
+        _fit_layouts(prs, old_w, old_h)
     W, H = prs.slide_width, prs.slide_height
     for s in slides:
         kind = s.get("layout", "content")
-        if kind in ("image", "table"):
-            slide = prs.slides.add_slide(prs.slide_layouts[5])
-        else:
-            slide = prs.slides.add_slide(prs.slide_layouts[layouts.get(kind, 1)])
+        slide = prs.slides.add_slide(prs.slide_layouts[min(layouts[kind], len(prs.slide_layouts) - 1)])
         if slide.shapes.title is not None and s.get("title") is not None:
             slide.shapes.title.text = str(s.get("title", ""))
         ph = [x for x in slide.placeholders if x.placeholder_format.idx != 0]
