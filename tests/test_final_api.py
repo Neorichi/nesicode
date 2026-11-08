@@ -435,6 +435,16 @@ def test_the_release_workflow_installs_the_web_ui_before_running_the_tests():
     assert npm < tests
 
 
+def test_the_release_workflow_runs_the_web_tests_on_a_node_they_work_on():
+    """(check) Modules of web/src read the browser's `navigator` when they load, a global node has only from 21 on: on
+    the node 20 the workflow pinned, 5 of the web tests failed ("navigator is not defined") once they stopped skipping."""
+    yaml = pytest.importorskip("yaml")
+    steps = yaml.safe_load((ROOT / ".github" / "workflows" / "desktop.yml").read_text())["jobs"]["macos"]["steps"]
+    node = next(i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("actions/setup-node"))
+    tests = next(i for i, s in enumerate(steps) if "pytest" in str(s.get("run", "")))
+    assert node < tests and int(str(steps[node]["with"]["node-version"]).split(".")[0]) >= 21
+
+
 @pytest.mark.parametrize("module", ["test_fix_web_ui.py", "test_p2_web.py"])
 def test_the_web_ui_tests_fail_instead_of_skipping_in_ci_without_node_modules(tmp_path, module):
     (tmp_path / "tests").mkdir()
