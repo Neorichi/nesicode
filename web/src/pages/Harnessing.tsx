@@ -330,7 +330,11 @@ function RunDetail({ runId }: { runId: number }) {
       if (e instanceof ApiError && e.status === 410) setCopiesGone(true) // (its message says why: shown below)
       throw e
     })
-    setLastApplied(asApplied(r.changes) ?? {})
+    const changes = asApplied(r.changes) ?? {}
+    setLastApplied(changes)
+    // a retry's answer replaces the stored one of the apply before it at once (not only once a reload brings it: a
+    // reload that fails must not leave the old «sin aplicar» and its «Reintentar» on screen)
+    setRun((cur) => (cur && cur.id === runId ? { ...cur, result: { ...(cur.result ?? {}), applied: changes } } : cur))
     await load().catch(() => {})
   })
 

@@ -28,8 +28,9 @@ export default function Chat() {
   const navigate = useNavigate()
   const [thread, setThread] = useState<Thread | null>(null)
   const [loaded, setRuns] = useState<Run[]>([])
-  // Deleted meanwhile (in another tab, or with its project): its stream ends 'deleted', a reload answers 404. The page
-  // stays readable and says so; nothing in it runs any more, whatever a late reload or event says (no Stop, no queue).
+  // Deleted meanwhile (in another tab, or with its project): a reload of it answers 404 (see load; only that says so).
+  // The page stays readable and says so; nothing in it runs any more, whatever a late reload or event says (no Stop,
+  // no queue).
   const [gone, setGone] = useState(false)
   const runs = useMemo(() => (gone ? endedRuns(loaded) : loaded), [gone, loaded])
   const [live, setLive] = useState('')
@@ -169,7 +170,9 @@ export default function Chat() {
       onEnd: async (status) => {
         if (status !== 'done' && status !== 'max_steps' && status !== STREAM_LOST) freeze()
         resetLive()
-        if (status === 'deleted') setGone(true) // with its conversation or project: see `gone`
+        // 'deleted' says only that this run is no longer there as its stream knew it: its conversation (or project) was
+        // deleted — the reload then answers 404: `gone` —, or «Enviar ya» put it back in the queue before it started (a
+        // new place in it, while the conversation goes on). The reload tells which.
         const data = await load().catch(() => null)
         refreshThreads()
         // The connection gave up (server unreachable for a while) but the reply may go on: follow it again — now if
@@ -420,7 +423,7 @@ function ChangesButton({ tid, busy }: { tid: number; busy: boolean }) {
   const [applying, setApplying] = useState(false)
   const [tab, setTab] = useState<'changes' | 'files'>('changes')
   const [tree, setTree] = useState<TreeEntry[]>([])
-  const [file, setFile] = useState<{ path: string; content: string; binary: boolean; image?: boolean } | null>(null)
+  const [file, setFile] = useState<{ path: string; content: string; binary: boolean; image?: boolean; link?: boolean } | null>(null)
   const [fileErr, setFileErr] = useState('') // the entry picked can't be shown (a link out of the copy, deleted meanwhile…)
   const opening = useRef(0) // only the entry picked last may show
   const load = useCallback(async () => setCh(await api.get<Changes>(`/api/threads/${tid}/changes`)), [tid])
@@ -428,7 +431,7 @@ function ChangesButton({ tid, busy }: { tid: number; busy: boolean }) {
   const openFile = async (e: TreeEntry) => {
     const n = ++opening.current
     setFileErr('')
-    if (/\.(png|jpe?g|gif|webp)$/i.test(e.path)) return setFile({ path: e.path, content: '', binary: false, image: true })
+    if (/\.(png|jpe?g|gif|webp)$/i.test(e.path)) return setFile({ path: e.path, content: '', binary: false, image: true, link: e.link })
     try {
       const f = await api.get<{ path: string; content: string; binary: boolean }>(`/api/threads/${tid}/file?path=${encodeURIComponent(e.path)}`)
       if (n === opening.current) setFile(f)
@@ -437,6 +440,11 @@ function ChangesButton({ tid, busy }: { tid: number; busy: boolean }) {
       setFile(null) // never the previous file's text under this one's name
       setFileErr(openFileError(e, err instanceof ApiError ? err.status : 0, (err as Error).message))
     }
+  }
+  // an image is loaded by the browser itself: one it can't load (a link out of the copy, deleted meanwhile…) says so too
+  const imageFailed = (f: { path: string; link?: boolean }) => {
+    setFile(null)
+    setFileErr(openFileError(f, 404, t('No se pudo mostrar la imagen.')))
   }
   useEffect(() => {
     if (!busy) load()
@@ -485,7 +493,7 @@ function ChangesButton({ tid, busy }: { tid: number; busy: boolean }) {
                   ) : file ? (
                     <>
                       <div className="editor-head"><code>{file.path}</code></div>
-                      {file.image ? <img className="viewer-img" src={`/api/threads/${tid}/file?path=${encodeURIComponent(file.path)}`} alt={file.path} /> : <pre className="code viewer">{file.binary ? t('(binario)') : file.content}</pre>}
+                      {file.image ? <img className="viewer-img" src={`/api/threads/${tid}/file?path=${encodeURIComponent(file.path)}`} alt={file.path} onError={() => imageFailed(file)} /> : <pre className="code viewer">{file.binary ? t('(binario)') : file.content}</pre>}
                     </>
                   ) : (
                     <div className="empty">{t('Elige un fichero.')}</div>

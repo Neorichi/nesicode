@@ -14,6 +14,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -381,8 +382,9 @@ def test_zip_entries_left_out_of_an_upload_are_listed(tmp_path):
 
 def test_links_in_a_conversations_folder_are_marked_and_one_that_cannot_open_says_why(tmp_path):
     """web#5 (c): the «Archivos» tab lists links (link: true) as links. One that leads to a file of the copy opens;
-    one that leads out of it (absolute, or relative and dangling in the copy) answers 404, and the page says why —
-    instead of an unhandled error that left the previous file on screen under the new name."""
+    one that leads out of it (absolute, or relative and dangling in the copy) or to a folder (inside the copy too)
+    answers 404, and the page says why — instead of an unhandled error that left the previous file on screen under
+    the new name."""
     shared = tmp_path / "compartido"
     shared.mkdir()
     (shared / "comun.md").write_text("fuera\n")
@@ -394,17 +396,18 @@ def test_links_in_a_conversations_folder_are_marked_and_one_that_cannot_open_say
     os.symlink("../compartido/comun.md", ws / "b_fuera")
     os.symlink(shared / "comun.md", ws / "c_absoluto")
     (ws / "docs").mkdir()
+    os.symlink("docs", ws / "d_carpeta")  # (check) a folder of the copy: not a file either
     t = a.post(f"/api/projects/{p['id']}/threads", json={}).json()  # its own copy of the project, links as links
     tree = a.get(f"/api/threads/{t['id']}/tree").json()
     assert {e["path"]: bool(e.get("link")) for e in tree} == {"a_dentro": True, "b_fuera": True, "c_absoluto": True,
-                                                              "docs": False, "notas.txt": False}
+                                                              "d_carpeta": True, "docs": False, "notas.txt": False}
     opened = {}
     for e in tree:
         if not e["dir"]:
             r = a.get(f"/api/threads/{t['id']}/file", params={"path": e["path"]})
             opened[e["path"]] = (r.status_code, r.json().get("detail") or r.json().get("content"))
     assert opened == {"a_dentro": (200, "notas\n"), "notas.txt": (200, "notas\n"), "b_fuera": (404, "Fichero no encontrado"),
-                      "c_absoluto": (404, "Fichero no encontrado")}
+                      "c_absoluto": (404, "Fichero no encontrado"), "d_carpeta": (404, "Fichero no encontrado")}
     out = run_ts(tmp_path, f"""
       import {{ FileTree }} from {json.dumps(str(SRC / 'pages' / 'Chat.tsx'))}
       const tree = {json.dumps(tree)}
@@ -418,12 +421,15 @@ def test_links_in_a_conversations_folder_are_marked_and_one_that_cannot_open_say
     items = re.findall(r'<button class="tree-item ?(\w*)"[^>]*?( disabled="")?( title="[^"]*")?>(.*?)</button>', out["page"])
     assert [(text, bool(disabled), bool(title)) for _, disabled, title, text in items] == [
         ("↪ a_dentro", False, True), ("↪ b_fuera", False, True), ("↪ c_absoluto", False, True),
-        ("▸ docs", True, False), ("notas.txt", False, False)]
+        ("↪ d_carpeta", False, True), ("▸ docs", True, False), ("notas.txt", False, False)]
     assert [cls for cls, *_ in items].count("active") == 1
-    assert out["errors"] == {p: f"«{p}» es un enlace simbólico que apunta fuera de la carpeta de esta conversación (o a algo "
-                                 "que no existe): no se puede abrir aquí." for p in ("b_fuera", "c_absoluto")}
+    # (check) the folder link is told apart too: it is not "outside or nothing" (it was, before the check)
+    assert out["errors"] == {p: f"«{p}» es un enlace simbólico que no lleva a un fichero de esta conversación (apunta fuera de "
+                                 "su carpeta, a una carpeta o a algo que no existe): no se puede abrir aquí."
+                             for p in ("b_fuera", "c_absoluto", "d_carpeta")}
     assert out["other"] == ["Fichero no encontrado", "Error interno"]
-    assert out["en"].startswith("“c_absoluto” is a symbolic link that points outside this conversation's folder")
+    assert out["en"] == ("“c_absoluto” is a symbolic link that doesn't lead to a file of this conversation (it points "
+                         "outside its folder, to a folder or to something that doesn't exist): it can't be opened here.")
 
 
 # ---------------------------------------------------------------------------------------------- web#6 deleted
@@ -457,3 +463,47 @@ def test_a_deleted_conversation_never_shows_its_reply_running(tmp_path):
     assert 'class="typing"' in out["before"]  # (what it showed for good before)
     page = out["page"]
     assert 'class="typing"' not in page and "Texto a medias" in page and "Cancelado" in page
+
+
+def test_a_reply_put_back_in_the_queue_never_shows_its_conversation_deleted():
+    """web#6 (check): «Enviar ya» on a queued message while the reply before it was accepted but had not started (every
+    worker busy) puts that reply back in the queue, in a new place: its stream, pinned by the run's creation time, ends
+    'deleted' although nothing was deleted — the conversation goes on and its reload answers 200. Only that reload
+    answering 404 means the conversation is gone; the page took the stream's 'deleted' for it and showed «Esta
+    conversación se ha eliminado» instead of the composer and the queue of a conversation that went on."""
+    a = _user("again")
+    p = _project(a)
+    t = a.post(f"/api/projects/{p['id']}/threads", json={}).json()
+    now = time.time()
+    cur = db.insert("INSERT INTO runs (project_id, thread_id, kind, task, status, created_at) VALUES (?, ?, 'chat', 'uno', 'queued', ?)",
+                    (p["id"], t["id"], now))  # accepted, no worker has it yet
+    nxt = db.insert("INSERT INTO runs (project_id, thread_id, kind, task, status, created_at) VALUES (?, ?, 'chat', 'dos', 'waiting', ?)",
+                    (p["id"], t["id"], now + 1))
+    body: list[str] = []
+
+    def listen():  # what the page follows: the reply that is about to start
+        with a.stream("GET", f"/api/runs/{cur}/stream") as s:
+            for chunk in s.iter_text():
+                body.append(chunk)
+
+    th = threading.Thread(target=listen, daemon=True)
+    th.start()
+    time.sleep(0.5)
+    try:
+        assert a.post(f"/api/runs/{nxt}/send-now").status_code == 200
+        th.join(5)
+        assert not th.is_alive(), "the stream did not end"
+        assert '"status": "deleted"' in "".join(body)  # what the page is told...
+        assert a.get(f"/api/threads/{t['id']}").status_code == 200  # ...while the conversation is there
+        assert db.one("SELECT thread_id FROM runs WHERE id=?", (cur,))["thread_id"] == t["id"]  # (back in its queue)
+    finally:  # the mock model answers both; nothing of this test may still run during the next ones
+        deadline = time.time() + 30
+        while time.time() < deadline and db.one(
+                "SELECT 1 FROM runs WHERE id IN (?, ?) AND status IN ('queued', 'running', 'waiting')", (cur, nxt)):
+            time.sleep(0.1)
+    assert [r["status"] for r in db.all("SELECT status FROM runs WHERE id IN (?, ?) ORDER BY id", (cur, nxt))] == ["done", "done"]
+    # So the page decides "deleted" from its reload's 404 alone, never from how a stream ended.
+    src = (SRC / "pages" / "Chat.tsx").read_text(encoding="utf-8")
+    assert re.findall(r"setGone\(true\)", src) == ["setGone(true)"]
+    assert "if (e instanceof ApiError && e.status === 404) setGone(true)" in src
+    assert not re.search(r"status\s*===\s*'deleted'", src)

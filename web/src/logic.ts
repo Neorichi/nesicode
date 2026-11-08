@@ -354,12 +354,12 @@ export function canRetryApply(r: ApplyResult | null | undefined): boolean {
 // ------------------------------------------------------------------ a conversation's files
 /**
  * Why an entry of a conversation's folder («Archivos») could not be shown. A symbolic link opens when it leads to a
- * file of that folder; one that leads out of it (or nowhere) answers 404, which then says so; anything else is the
- * server's own message.
+ * file of that folder; one that leads out of it, to a folder (inside it too) or nowhere answers 404, which then says
+ * so; anything else is the server's own message.
  */
 export function openFileError(entry: { path: string; link?: boolean }, status: number, message: string): string {
   if (entry.link && status === 404)
-    return t('«{path}» es un enlace simbólico que apunta fuera de la carpeta de esta conversación (o a algo que no existe): no se puede abrir aquí.', { path: entry.path })
+    return t('«{path}» es un enlace simbólico que no lleva a un fichero de esta conversación (apunta fuera de su carpeta, a una carpeta o a algo que no existe): no se puede abrir aquí.', { path: entry.path })
   return message
 }
 
