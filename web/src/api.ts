@@ -129,7 +129,7 @@ export function relTime(ts: number): string {
 }
 
 export function money(usd?: number): string {
-  if (usd === undefined || usd === null) return '—'
+  if (typeof usd !== 'number' || !Number.isFinite(usd)) return '—' // (also an odd value from an event: never a crash)
   return usd < 0.01 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`
 }
 

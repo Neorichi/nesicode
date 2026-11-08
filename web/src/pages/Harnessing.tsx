@@ -2,11 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { ACTIVE, api, isAbort, money, relTime, statusLabel, STREAM_LOST, streamRun, type Run, type RunEvent } from '../api'
 import { useApp, useProject } from '../App'
+import ApplyReport from '../components/ApplyReport'
 import Diff from '../components/Diff'
 import Transcript from '../components/Transcript'
 import { useVisibleInterval } from '../hooks'
 import { t, translateError, useLang } from '../i18n'
-import { followAgainIn } from '../logic'
+import { applyCounts, followAgainIn, type ApplyResult } from '../logic'
 
 type Node = {
   label: string
@@ -61,7 +62,7 @@ function NodeCard({ node, selected, chosen, onClick }: { node: Node; selected: b
   const st = node.stage
   const ro = node.rollout
   const running = node.stageRunning || node.rolloutRunning
-  const ch = st?.changes
+  const ch = { added: [], modified: [], removed: [], ...st?.changes }
   return (
     <button className={`node ${selected ? 'sel' : ''} ${chosen ? 'chosen' : ''} ${running ? 'running' : ''}`} onClick={onClick}>
       <div className="node-top">
@@ -175,12 +176,34 @@ function HarnessDiffAgainstBase({ runId, harness }: { runId: number; harness: Re
   )
 }
 
+/** An apply result as stored in the run (result.applied) or sent with the 'applied' event; null when there is none. */
+const asApplied = (x: unknown): ApplyResult | null => (x && typeof x === 'object' && !Array.isArray(x) ? (x as ApplyResult) : null)
+
+/** What reached the project: the counts (left-out paths never counted) and, path by path, what was left out and why. */
+function AppliedBox({ applied }: { applied: ApplyResult }) {
+  const c = applyCounts(applied)
+  return (
+    <>
+      <div className="ok-box">
+        {t('Cambios de código aplicados al proyecto')}: <span className="add">+{c.added}</span> <span className="mod">~{c.modified}</span>{' '}
+        <span className="del">−{c.removed}</span>
+        {c.left > 0 && <span className="warn"> · {t('{n} sin aplicar', { n: c.left })}</span>}
+      </div>
+      <ApplyReport result={applied} />
+    </>
+  )
+}
+
 // Rendered with key={runId}: one instance per run, so Adopt/Apply always act on the run on screen.
 function RunDetail({ runId }: { runId: number }) {
   const { refreshProjects } = useApp()
   const [run, setRun] = useState<Run | null>(null)
   const [sel, setSel] = useState<string | null>(null)
   const [msg, setMsg] = useState('')
+  const [err, setErr] = useState('') // a failed action (e.g. 409: the project is busy) — the buttons stay usable
+  const [busy, setBusy] = useState(false)
+  const [lastApplied, setLastApplied] = useState<ApplyResult | null>(null) // the «Aplicar» answer until the reload has it
+  const [merged, setMerged] = useState(false) // the manual adopt merged the run's edits onto a newer version
   const loadSeq = useRef(0)
   const loadCtl = useRef<AbortController | null>(null)
   const [streamKey, setStreamKey] = useState(0) // bumped to follow the run again after its stream gave up
@@ -205,7 +228,7 @@ function RunDetail({ runId }: { runId: number }) {
   useEffect(() => {
     setRun(null)
     setSel(null)
-    load().catch((e) => setMsg((e as Error).message))
+    load().catch((e) => setErr((e as Error).message))
     return () => {
       loadSeq.current += 1
       loadCtl.current?.abort()
@@ -237,7 +260,7 @@ function RunDetail({ runId }: { runId: number }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId, !!active, streamKey])
 
-  if (!run) return msg ? <div className="error-box">{msg}</div> : <div className="muted">{t('Cargando…')}</div>
+  if (!run) return err ? <div className="error-box">{err}</div> : <div className="muted">{t('Cargando…')}</div>
   const events = run.events ?? []
   const nodes = buildNodes(events)
   const phases = events.filter((e) => e.type === 'phase').map((e) => e.phase)
@@ -253,26 +276,41 @@ function RunDetail({ runId }: { runId: number }) {
     [run.params.mode === 'sequential' ? 'Checkpoints' : t('Composiciones'), col((n) => /^(agg|c)\d/.test(n.label))],
   ]
   const lesson = events.find((e) => e.type === 'lesson')
-  const err = events.find((e) => e.type === 'error')
+  const failure = events.find((e) => e.type === 'error')
+  // the auto-apply's result (conflicts included), kept in the run's result and also sent as an 'applied' event
+  const applied = asApplied(res.applied) ?? lastApplied ?? asApplied([...events].reverse().find((e) => e.type === 'applied')?.changes)
+  const adoptedEv = [...events].reverse().find((e) => e.type === 'adopted')
+  const adoptMerged = merged || (!!adoptedEv?.merged && adoptedEv.version === res.adopted_version)
+  // why the auto-adopt didn't happen (the harness changed meanwhile in the same files, …): the manual button stays
+  const adoptSkipped: string = res.adopt_skipped || events.find((e) => e.type === 'adopt_skipped')?.reason || ''
 
-  const adopt = async () => {
+  // Adopt/Apply may be refused (409: another conversation is working on the project): say why, keep the buttons
+  const act = async (call: () => Promise<void>) => {
+    setBusy(true)
+    setErr('')
+    setMsg('')
     try {
-      const r = await api.post<{ version: number }>(`/api/runs/${runId}/adopt`)
-      setMsg(t('Harness adoptado como v{n}', { n: r.version }))
-      await Promise.all([load(), refreshProjects()])
+      await call()
     } catch (e) {
-      setMsg((e as Error).message)
+      setErr((e as Error).message)
+    } finally {
+      setBusy(false)
     }
   }
-  const apply = async () => {
-    try {
-      const r = await api.post<{ changes: any }>(`/api/runs/${runId}/apply`)
-      setMsg(t('Aplicados {n} cambios al proyecto', { n: r.changes.added.length + r.changes.modified.length + r.changes.removed.length }))
-      load()
-    } catch (e) {
-      setMsg((e as Error).message)
-    }
-  }
+  const adopt = () => act(async () => {
+    const r = await api.post<{ version: number; merged?: boolean }>(`/api/runs/${runId}/adopt`)
+    setMerged(!!r.merged)
+    refreshProjects().catch(() => {})
+    const fresh = await load().catch(() => null)
+    if (!fresh?.result?.adopted_version) // the reload doesn't show it (yet): say it here
+      setMsg(r.merged ? t('Harness adoptado como v{n}, combinado con los cambios que se hicieron en el harness mientras trabajaba', { n: r.version })
+        : t('Harness adoptado como v{n}', { n: r.version }))
+  })
+  const apply = () => act(async () => {
+    const r = await api.post<{ changes: ApplyResult }>(`/api/runs/${runId}/apply`)
+    setLastApplied(asApplied(r.changes) ?? {})
+    await load().catch(() => {})
+  })
 
   return (
     <div className="run-detail">
@@ -289,7 +327,8 @@ function RunDetail({ runId }: { runId: number }) {
             <Link to={`/p/${run.project_id}/c/${run.params.source.thread_id}`}>{t('la conversación')}</Link>
           </div>
         )}
-        {active && <button className="btn small" onClick={() => api.post(`/api/runs/${runId}/cancel`).catch((e) => setMsg((e as Error).message))}>{t('Cancelar')}</button>}
+        {active && <button className="btn small" onClick={() => api.post(`/api/runs/${runId}/cancel`).catch((e) => setErr((e as Error).message))}>{t('Cancelar')}</button>}
+        {err && run.status !== 'done' && <div className="error-box">{err}</div>}
       </div>
 
       <div className="phases">
@@ -300,7 +339,7 @@ function RunDetail({ runId }: { runId: number }) {
         ))}
       </div>
 
-      {err && <div className="error-box">{translateError(err.text)}</div>}
+      {failure && <div className="error-box">{translateError(failure.text)}</div>}
 
       <div className="pipeline">
         {columns.map(([title, list], i) => (
@@ -338,26 +377,39 @@ function RunDetail({ runId }: { runId: number }) {
 
       {sel && nodes.get(sel) && <NodeDetail runId={runId} node={nodes.get(sel)!} onClose={() => setSel(null)} />}
 
+      {run.status !== 'done' && applied && (
+        // stopped after its changes were applied: what reached the project still matters
+        <div className="result">
+          <h3>{t('Resultado')}</h3>
+          <AppliedBox applied={applied} />
+        </div>
+      )}
+
       {run.status === 'done' && (
         <div className="result">
           <h3>{t('Resultado')}</h3>
           <div className="row wrap">
             {res.harness_changed ? (
               res.adopted_version ? (
-                <span className="ok-box inline">{t('Harness adoptado como v{n}', { n: res.adopted_version })}</span>
+                <span className="ok-box inline">
+                  {adoptMerged
+                    ? t('Harness adoptado como v{n}, combinado con los cambios que se hicieron en el harness mientras trabajaba', { n: res.adopted_version })
+                    : t('Harness adoptado como v{n}', { n: res.adopted_version })}
+                </span>
               ) : (
-                <button className="btn primary" onClick={adopt}>{t('Adoptar el harness elegido')}</button>
+                <button className="btn primary" disabled={busy} onClick={adopt}>{t('Adoptar el harness elegido')}</button>
               )
             ) : (
               <span className="muted">{t('El resultado elegido usa el harness base: no hay cambios que adoptar.')}</span>
             )}
-            {res.applied ? (
-              <span className="ok-box inline">{t('Cambios de código aplicados al proyecto')}</span>
-            ) : (
-              <button className="btn" onClick={apply}>{t('Aplicar los cambios de código al proyecto')}</button>
-            )}
+            {!applied && <button className="btn" disabled={busy} onClick={apply}>{t('Aplicar los cambios de código al proyecto')}</button>}
           </div>
+          {res.harness_changed && !res.adopted_version && adoptSkipped && (
+            <div className="muted small">{t('No se adoptó automáticamente: {why}.', { why: translateError(adoptSkipped) })}</div>
+          )}
+          {applied && <AppliedBox applied={applied} />}
           {msg && <div className="ok-box">{msg}</div>}
+          {err && <div className="error-box">{err}</div>}
           <h4>{t('Cambios en el harness')}</h4>
           <Diff text={res.harness_diff ?? ''} empty={t('Sin cambios en el harness')} />
           {res.reflection?.edits && (

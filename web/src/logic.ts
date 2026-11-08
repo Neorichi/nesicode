@@ -138,9 +138,9 @@ export function retryText(e: RunEvent, count: number, active: boolean): string {
     + (reason ? ` (${reason})` : '')
 }
 
-/** Why the context was compacted, in words (the agent sends English codes). */
+/** Why the context was compacted, in words (the agent sends English codes; the usual 67% trigger needs none). */
 export function compactReason(reason?: string): string {
-  if (!reason) return ''
+  if (!reason || reason === 'threshold') return ''
   const known: Record<string, string> = {
     'no room for output': t('no quedaba sitio para la respuesta'),
     'context exceeded': t('el modelo avisó de que se superaba su contexto'),
@@ -214,4 +214,206 @@ export function normalizeBaseUrl(raw: string): string {
   const local = host === 'localhost' || host.endsWith('.local') || host === '::1' || host === '0.0.0.0'
     || /^(127|10)\.|^192\.168\.|^172\.(1[6-9]|2\d|3[01])\.|^169\.254\./.test(host)
   return `${local ? 'http' : 'https'}://${s}`
+}
+
+const list = <T>(x: unknown): T[] => (Array.isArray(x) ? (x as T[]) : [])
+
+// ------------------------------------------------------------------ applying changes to the project
+/** A change Apply left out: the project's file was not touched (harnessing's three-way apply). */
+export type Conflict = { path: string; reason: string; side_file?: string | null }
+/** What an Apply returns: the paths it changed, plus what it did not touch and why. */
+export type ApplyResult = { added?: string[]; modified?: string[]; removed?: string[]; skipped?: string[]; conflicts?: Conflict[] }
+
+/** Why a rollout's change was left out (apply_rollout's codes, in the CLI's words: cli.CONFLICT_WHY). */
+export function conflictWhy(reason: string): string {
+  const known: Record<string, string> = {
+    changed: t('cambió en el proyecto después de empezar la ejecución'),
+    exists: t('ya existe en el proyecto con otro contenido'),
+    unsafe: t('sale del proyecto por un enlace simbólico'),
+    error: t('no se pudo escribir'),
+  }
+  return known[reason] ?? String(reason ?? '')
+}
+
+// Apply's skipped paths come as "path: reason", the reason in English (workspace._why, or the system's message).
+const SKIP_WHY: [string, string][] = [
+  ['it is a symbolic link (links are not followed; use the path it points to)', 'es un enlace simbólico (no se siguen enlaces: usa la ruta a la que apunta)'],
+  ['a parent folder is a symbolic link or a file', 'una carpeta de su ruta es un enlace simbólico o un archivo'],
+  ['not found', 'no se encontró'],
+  ['not a regular file', 'no es un archivo normal'],
+  ['it is a directory now', 'ahora es una carpeta'],
+  ['Directory not empty', 'hay una carpeta con contenido en su lugar'],
+  ['Is a directory', 'es una carpeta'],
+  ['Permission denied', 'sin permiso para escribirlo'],
+  ['Operation not permitted', 'operación no permitida'],
+  ['No space left on device', 'no queda espacio en el disco'],
+  ['Read-only file system', 'el disco es de solo lectura'],
+  ['File name too long', 'el nombre es demasiado largo'],
+]
+
+/** "path: reason" → the path and the reason in the UI's language (an unknown reason is shown as it came). */
+export function skippedPath(entry: string): { path: string; reason: string } {
+  const s = String(entry ?? '')
+  for (const [en, es] of SKIP_WHY) if (s.endsWith(`: ${en}`)) return { path: s.slice(0, -(en.length + 2)), reason: t(es) }
+  const link = /^(.*): symlink to (.*) would point outside the project$/s.exec(s)
+  if (link) return { path: link[1], reason: t('es un enlace que apuntaría fuera del proyecto ({to})', { to: link[2] }) }
+  const i = s.indexOf(': ')
+  return i > 0 ? { path: s.slice(0, i), reason: s.slice(i + 2) } : { path: s, reason: '' }
+}
+
+/** What an Apply really changed: a path it left out (conflict or skipped) is never counted, whatever list holds it. */
+export function applyCounts(r: ApplyResult | null | undefined): { added: number; modified: number; removed: number; left: number } {
+  const conflicts = list<Conflict>(r?.conflicts)
+  const skipped = list<string>(r?.skipped)
+  const out = new Set([...conflicts.map((c) => c?.path), ...skipped.map((s) => skippedPath(s).path)])
+  const n = (xs: unknown) => list<string>(xs).filter((p) => !out.has(p)).length
+  return { added: n(r?.added), modified: n(r?.modified), removed: n(r?.removed), left: conflicts.length + skipped.length }
+}
+
+/** One line for an Apply result: "Aplicados: +2 ~1 −0 · 1 sin aplicar (detalle abajo)". */
+export function applySummary(r: ApplyResult | null | undefined): string {
+  const c = applyCounts(r)
+  const head = t('Aplicados: +{a} ~{m} −{r}', { a: c.added, m: c.modified, r: c.removed })
+  return c.left ? `${head} · ${t('{n} sin aplicar (detalle abajo)', { n: c.left })}` : head
+}
+
+// ------------------------------------------------------------------ connectors
+/**
+ * The words that switch on a connector in "Solo cuando lo pida" mode (GET /api/connectors' trigger_words), for its
+ * row: null when it is in another mode or the server doesn't say; [] when no word can switch it on.
+ */
+export function triggerWords(c: { usage?: string; trigger_words?: unknown }): string[] | null {
+  if ((c.usage || 'mention') !== 'mention' || !Array.isArray(c.trigger_words)) return null
+  return [...new Set(c.trigger_words.filter((w): w is string => typeof w === 'string' && !!w.trim()).map((w) => w.trim()))]
+}
+
+// ------------------------------------------------------------------ run events
+/**
+ * Event types the transcript draws with their own component, or leaves out on purpose: paired with another event
+ * (tool_result, approval_result), live-only (context, *_delta: the meter and the streaming text), the run's own
+ * bookkeeping (start, done) and harnessing's pipeline (shown by its own page).
+ */
+export const KNOWN_EVENTS = new Set([
+  'start', 'assistant', 'thinking', 'tool_call', 'tool_result', 'error', 'cancelled', 'done', 'llm_retry', 'context',
+  'context_learned', 'masked', 'compacted', 'compaction_error', 'image', 'file', 'notify', 'bot_created',
+  'connector_error', 'auto_harness', 'auto_harness_skipped', 'auto_harness_error', 'approval_request',
+  'approval_result', 'phase', 'stage', 'rollout', 'selected', 'applied', 'adopted', 'adopt_skipped', 'lesson',
+])
+
+/** The live 'compaction_error' (the summarizer's call failed, or its summary was rejected and is retried) in words. */
+export function compactionErrorText(text: string): string {
+  const s = String(text ?? '').trim()
+  const rejected = /^summary rejected: (.*)$/s.exec(s)
+  const known: Record<string, string> = {
+    empty: t('el resumen salió vacío'),
+    'cut at max_tokens before its last section': t('el resumen salió cortado'),
+    'unclosed reasoning block': t('el modelo se quedó razonando sin escribir el resumen'),
+  }
+  const why = rejected ? known[rejected[1].trim()] ?? rejected[1].trim() : s.slice(0, 300)
+  return t('No se pudo resumir el contexto ({why}): se reintenta o se sigue con un resumen de respaldo.', { why: why || '?' })
+}
+
+/**
+ * The live notice of a failed context summary, from one batch of a run's live items (top level only): the last
+ * 'compaction_error' while that compaction is still going; '' once it ended — every compaction ends with a live
+ * 'context' item, reason 'compacted', which often arrives in the same batch as the error (the fallback follows within
+ * ms) and is replayed with it on every reconnect; null when the batch says nothing about it (keep what is shown).
+ */
+export function compactionNotice(items: unknown[]): string | null {
+  let out: string | null = null
+  for (const i of Array.isArray(items) ? items : []) {
+    const e = i as { type?: unknown; depth?: unknown; reason?: unknown; text?: unknown } | null
+    if (!e || typeof e !== 'object' || e.depth) continue
+    if (e.type === 'compaction_error') out = String(e.text ?? '') || '?'
+    else if (e.type === 'context' && e.reason === 'compacted') out = ''
+  }
+  return out
+}
+
+/**
+ * A compact line for an event this version doesn't know (a newer server's): its own words if it has some, else ''
+ * (nothing to say). Known types and live deltas give ''.
+ */
+export function unknownEventNote(e: { type?: unknown; [k: string]: unknown }): string {
+  const type = typeof e?.type === 'string' ? e.type : ''
+  if (!type || KNOWN_EVENTS.has(type) || type.endsWith('_delta')) return ''
+  const pick = (...xs: unknown[]) => xs.find((x): x is string => typeof x === 'string' && !!x.trim())?.trim() ?? ''
+  const words = pick(e.text, e.message, e.reason, e.why, e.note, e.detail)
+  if (!words) return ''
+  const who = pick(e.connector, e.label)
+  return `${who ? `${who}: ` : ''}${translateError(words)}`.slice(0, 400)
+}
+
+// ------------------------------------------------------------------ config import preview
+type PreviewProvider = { name: string; kind?: string; base_url?: string }
+type PreviewConnector = { name: string; kind?: string; enabled?: boolean; command?: string; url?: string; usage?: string }
+/** POST /api/config/import with preview=1: what the file would import here, what it can't and why. */
+export type ImportPreview = {
+  providers?: string[]; connectors?: string[]; settings?: string[]; project_template?: string | null; telegram?: boolean
+  role_models?: Record<string, string>; bots?: string[]; notes?: string[]; skipped?: string[]
+  details?: { providers?: PreviewProvider[]; connectors?: PreviewConnector[]; settings?: Record<string, unknown>; check_command?: string }
+}
+export type PreviewItem = { label: string; code?: string; note?: string; warn?: boolean }
+
+const ROLE_NAME: Record<string, string> = {
+  executor_model: 'Chat', improver_model: 'Mejora', vision_model: 'Visión', image_model: 'Crear imágenes', transcribe_model: 'Transcripción',
+}
+const usageText = (u?: string) => (u === 'auto' ? t('Cuando le sea útil') : u === 'ask' ? t('Preguntarme siempre') : t('Solo cuando lo pida'))
+
+function settingItem(key: string, value: unknown): PreviewItem {
+  const label: Record<string, string> = {
+    language: t('Idioma'), exec_mode: t('Permisos de ejecución'), share_workspace: t('Compartir la carpeta del proyecto entre conversaciones'),
+    auto_harness: t('Auto-harnessing'), auto_harness_daily: t('Auto-harnessing: máximo al día'),
+    auto_harness_min_steps: t('Auto-harnessing: a partir de cuántos pasos'), auto_harness_min_errors: t('Auto-harnessing: a partir de cuántos errores'),
+    browser_usage: t('Cuándo puede usar tu Chrome'), hidden_providers: t('Proveedores ocultos'),
+  }
+  const mode: Record<string, string> = { auto: t('Auto'), ask_bash: t('Pedir para comandos'), ask_all: t('Pedir para todo') }
+  const shown = typeof value === 'boolean' ? (value ? t('sí') : t('no'))
+    : key === 'exec_mode' ? mode[String(value)] ?? String(value)
+    : key === 'browser_usage' ? usageText(String(value))
+    : key === 'language' ? (value === 'en' ? 'English' : 'Español')
+    : Array.isArray(value) ? value.join(', ') || '—'
+    : value && typeof value === 'object' ? JSON.stringify(value) : String(value ?? '')
+  return { label: label[key] ?? key, note: shown }
+}
+
+/**
+ * The preview as sections of lines for the confirm step: where each provider points, what each connector runs
+ * (and whether it arrives switched off), the preferences' values, the models by role (they replace the ones of every
+ * project), the project template, bots and the Telegram bot. Only non-empty sections.
+ */
+export function previewSections(p: ImportPreview): { title: string; items: PreviewItem[] }[] {
+  const d = p.details ?? {}
+  const providers = list<PreviewProvider>(d.providers).map((x) => ({
+    label: x.name, code: x.base_url || '', note: x.kind === 'anthropic' ? 'Anthropic' : t('Compatible con OpenAI'),
+  }))
+  const labels = list<string>(p.connectors)
+  const connectors = list<PreviewConnector>(d.connectors).map((c, i) => {
+    const local = c.kind === 'stdio'
+    return {
+      label: labels[i] && labels[i] !== c.name ? `${labels[i]} (${c.name})` : c.name,
+      code: (local ? c.command : c.url) || '',
+      note: [local ? t('ejecuta un comando en este equipo') : c.kind === 'builtin' ? t('integrado') : t('servidor remoto'),
+        c.enabled === false ? t('llega desactivado') : usageText(c.usage)].join(' · '),
+      warn: local && c.enabled !== false,
+    }
+  })
+  const settings = Object.entries(d.settings ?? {}).map(([k, v]) => settingItem(k, v))
+  const roles = Object.entries(p.role_models ?? {}).filter(([, v]) => v).map(([k, v]) => ({
+    label: t(ROLE_NAME[k] ?? k), code: String(v), note: t('se aplica a todos tus proyectos donde funcione'),
+  }))
+  const template: PreviewItem[] = p.project_template
+    ? [{ label: `«${p.project_template}»`, note: t('modelos, harness y comando de verificación para proyectos nuevos'), code: d.check_command || undefined }]
+    : []
+  const bots = list<string>(p.bots).map((name) => ({ label: name }))
+  const telegram: PreviewItem[] = p.telegram ? [{ label: t('Bot de Telegram'), note: t('sustituye al bot de Telegram de este equipo'), warn: true }] : []
+  return [
+    { title: t('Proveedores (con sus API keys)'), items: providers },
+    { title: t('Conectores'), items: connectors },
+    { title: t('Modelos por función'), items: roles },
+    { title: t('Preferencias'), items: settings },
+    { title: t('Plantilla de proyecto'), items: template },
+    { title: t('Bots'), items: bots },
+    { title: 'Telegram', items: telegram },
+  ].filter((s) => s.items.length)
 }
