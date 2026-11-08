@@ -928,3 +928,68 @@ def test_harnessing_copies_do_not_pile_up(env):
         assert (rd / "rollouts/base1/trajectory.txt").exists()
     for rd in new_done:  # the last few successful runs keep their copies for «Aplicar» later
         assert (rd / "source/big.bin").exists() and (rd / "rollouts/base1/ws/big.bin").exists()
+
+
+# ------------------------------------------------------------------ review: jobs that outlive a deleted conversation
+@pytest.mark.parametrize("old_call_returns_first", [False, True])
+def test_a_job_stuck_in_a_deleted_conversation_never_blocks_a_new_one(env, models, old_call_returns_first):
+    """The user deletes a conversation whose reply is stuck in a call that ignores Stop and starts a new one, which gets
+    the same thread id (SQLite reuses it) but another run id: it must start at once, whether the old call is still
+    stuck or has already come back into the deleted run (whose events can no longer be written)."""
+    gate = Gate()
+    models["mock/gate"] = gate.provider
+    e = env(2)
+    slow, fast = e.project("mock/gate"), e.project()
+    try:
+        other = e.thread(fast)
+        x = e.thread(slow)  # the newest conversation: its id is the one SQLite gives out again
+        stuck = e.post(slow, x, "se queda colgado")
+        gate.wait_entered()
+        assert e.wait(e.post(fast, other, "otra conversación")["id"])["status"] == "done"  # a newer run id
+        e.delete_thread(slow, x)
+        if old_call_returns_first:
+            gate.release.set()
+            assert e.jobs.pool.join(10)
+            assert not e.jobs._jobs and not e.jobs.cancels  # the dead job let go of everything
+        y = e.thread(fast)
+        assert y["id"] == x["id"]
+        new = e.post(fast, y, "hola de nuevo")
+        assert new["id"] != stuck["id"]
+        assert e.wait(new["id"], timeout=8)["status"] == "done"
+    finally:
+        gate.release.set()
+
+
+# ------------------------------------------------------------------ review: jobs-runtime#3, approvals of the real run
+def test_auto_improve_skips_a_turn_that_needed_approval_after_a_switch_to_auto(env, models):
+    """ask_bash conversation: the user approves a deploy command and then switches the conversation to auto before the
+    turn ends. The approval request lives in the run's events (the approver writes it there, not in the agent's own
+    list): the turn must not be re-run by harnessing rollouts that ask nobody."""
+
+    class Deploy(_Quiet):
+        n = 0
+
+        def step(self, on_event=None):
+            Deploy.n += 1
+            if Deploy.n == 1:
+                return Turn("", [ToolCall("c1", "bash", {"command": "echo 'POST /deploy' >> DEPLOY_LOG.txt"})], "tool_use", Usage(1, 1))
+            if Deploy.n == 2:
+                return Turn("", [ToolCall("c2", "bash", {"command": "echo comprobado"})], "tool_use", Usage(1, 1))
+            return Turn("desplegado", [], "end_turn", Usage(1, 1))
+
+    models["mock/deploy"] = lambda: _Prov(Deploy)
+    e = env(2)
+    e.db.execute("UPDATE users SET settings=? WHERE id=?",
+                 (json.dumps({"auto_harness": True, "auto_harness_min_steps": 2, "auto_harness_daily": 5}), e.uid))
+    p = e.project("mock/deploy")
+    t = e.thread(p, exec_mode="ask_bash")
+    r = e.post(p, t, "despliega")
+    req = e.wait_event(r["id"], "approval_request")
+    e.db.execute("UPDATE threads SET exec_mode='auto' WHERE id=?", (t["id"],))
+    assert e.jobs.decide(r["id"], req["id"], "allow")
+    assert e.wait(r["id"])["status"] == "done"
+    for h in e.db.all("SELECT id FROM runs WHERE kind='harness'"):
+        e.jobs.cancel(h["id"])
+    skipped = [x for x in e.events(r["id"]) if x["type"] == "auto_harness_skipped"]
+    assert "auto_harness" not in e.types(r["id"]) and skipped and "permiso" in skipped[0]["why"]
+    assert not e.db.all("SELECT id FROM runs WHERE kind='harness'")

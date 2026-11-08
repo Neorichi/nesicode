@@ -962,9 +962,13 @@ class Jobs:
 
     def _thread_busy(self, thread_id: int) -> bool:
         """(with _lock) Is a reply of this conversation queued or running? The jobs in memory count too: a row's status
-        can be changed under a running job (the API marks a run cancelled before it has stopped)."""
-        if any(j.thread_id == thread_id and j.started and not j.finished for j in self._jobs.values()):
-            return True
+        can be changed under a running job (the API marks a run cancelled before it has stopped). But only while their
+        run still exists in this conversation: a job stuck in a call that ignores Stop outlives a deleted conversation,
+        and a new conversation that gets the same id (SQLite reuses it) must not wait for it."""
+        for j in list(self._jobs.values()):
+            if j.thread_id == thread_id and j.started and not j.finished and \
+                    self.db.one("SELECT 1 FROM runs WHERE id=? AND thread_id=?", (j.run_id, thread_id)):
+                return True
         return bool(self.db.one("SELECT 1 FROM runs WHERE thread_id=? AND status IN ('queued', 'running') LIMIT 1", (thread_id,)))
 
     def _may_start(self, run: dict) -> bool:
@@ -1074,8 +1078,17 @@ class Jobs:
             if job.finished or not self._owns(job):
                 print(f"nesicode: a job for run {job.run_id} failed after it ended or lost the run:", exc)
                 return
-            self.emitter(job.run_id, job)({"type": "error", "text": f"{type(exc).__name__}: {exc}"})
-            self._finish(job.run_id, "error", job=job, error=traceback.format_exc()[-4000:])
+            error = traceback.format_exc()[-4000:]
+            try:  # (its row may be gone: the conversation was deleted while the job was stuck)
+                self.emitter(job.run_id, job)({"type": "error", "text": f"{type(exc).__name__}: {exc}"})
+            except Exception as exc2:
+                print(f"nesicode: could not record the error of run {job.run_id}:", exc2)
+            self._finish(job.run_id, "error", job=job, error=error)
+        finally:
+            with self._lock:  # an ended job owns nothing any more, whatever happened (else its conversation looks busy)
+                if self._owns(job):
+                    job.finished = True
+                    self._forget(job)
 
     def _chat(self, job: _Job) -> None:
         run = self._claim(job)
@@ -1386,7 +1399,9 @@ class Jobs:
             emit({"type": "auto_harness_skipped", "reason": reason,
                   "why": "la conversación pide permiso antes de ejecutar comandos y el harnessing los repetiría sin preguntar"})
             return
-        if any(e.get("type") == "approval_request" for e in res.events):
+        # (the approver writes its requests straight to the run's events, not into the agent's own list)
+        if any(e.get("type") == "approval_request" for e in res.events) or self.db.one(
+                "SELECT 1 FROM events WHERE run_id=? AND data LIKE ? LIMIT 1", (run["id"], '%"type": "approval_request"%')):
             emit({"type": "auto_harness_skipped", "reason": reason,
                   "why": "esta respuesta necesitó tu permiso para alguna acción y el harnessing la repetiría sin preguntar"})
             return
