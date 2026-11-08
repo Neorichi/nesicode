@@ -125,6 +125,30 @@ def test_walkers_never_follow_symlinks_out_of_the_cage(tmp_path):
     assert not (outside / "x.txt").exists()
 
 
+@posix_only
+def test_list_dir_never_lists_through_a_folder_swapped_for_a_link(tmp_path, monkeypatch):
+    # review: list_dir checked realpath() and THEN scandir'ed the path: a background process swapping the folder
+    # for a link to ~ in between got the home's names and sizes listed
+    outside = tmp_path / "home"
+    outside.mkdir()
+    (outside / "id_rsa").write_text("key")
+    ws = Workspace(tmp_path / "ws")
+    (ws.root / "d").mkdir()
+    (ws.root / "d" / "mine.txt").write_text("m")
+    real_scandir, calls = os.scandir, []
+
+    def swapping(p="."):
+        calls.append(p)
+        if len(calls) == 2:  # about to list d: swap it for a link to the outside dir
+            os.rename(ws.root / "d", ws.root / "d.real")
+            os.symlink(outside, ws.root / "d")
+        return real_scandir(p)
+
+    monkeypatch.setattr(os, "scandir", swapping)
+    out = list_dir(ws, {"path": ".", "depth": 3})
+    assert len(calls) >= 2 and "id_rsa" not in out and "mine.txt" in out
+
+
 def test_server_file_access_refuses_links_swapped_in_after_resolve(tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -228,6 +252,9 @@ def test_cage_read_policy_and_private_temp(tmp_path):
             assert "not permitted" in a.run(cmd + " 2>&1")[1], cmd
         if Path(os.path.expanduser("~/.local/share")).is_dir():
             assert "not permitted" in a.run(f"ls {os.path.expanduser('~/.local/share')} 2>&1")[1]
+        for var in ("/opt/homebrew/var", "/usr/local/var"):  # review: local databases of Homebrew services
+            if Path(var).is_dir():
+                assert "not permitted" in a.run(f"ls {var} 2>&1")[1], var
         # mktemp ignores TMPDIR on macOS: it now lands in the conversation's private temp dir, out of other cages' reach
         code, f = a.run("f=$(mktemp) && echo original > $f && echo $f")
         f = f.strip().splitlines()[-1]

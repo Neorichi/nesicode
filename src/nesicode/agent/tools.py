@@ -59,8 +59,11 @@ def list_dir(ws: Workspace, args: dict) -> str:
         raise ToolError(f"{args.get('path')!r} is not a directory")
     depth = max(1, min(_int(args, "depth", 2), 5))
     lines: list[str] = []
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 
-    def walk(d: Path, level: int) -> None:
+    def walk(d, level: int) -> None:
+        """d: a directory fd (POSIX: every level is opened relative to its parent without following a link, so
+        a folder a background process swaps for a link mid-walk is never listed through) or a path (Windows)."""
         pad = "  " * level
         try:
             with os.scandir(d) as it:
@@ -74,7 +77,8 @@ def list_dir(ws: Workspace, args: dict) -> str:
             try:
                 if e.is_symlink():  # shown, never followed: it may point out of the workspace
                     try:
-                        lines.append(f"{pad}{e.name} -> {os.readlink(e.path)}")
+                        target = os.readlink(e.name, dir_fd=d) if isinstance(d, int) else os.readlink(e.path)
+                        lines.append(f"{pad}{e.name} -> {target}")
                     except OSError:
                         lines.append(f"{pad}{e.name} -> ?")
                 elif e.is_dir(follow_symlinks=False):
@@ -82,14 +86,32 @@ def list_dir(ws: Workspace, args: dict) -> str:
                         lines.append(f"{pad}{e.name}/ (skipped)")
                         continue
                     lines.append(f"{pad}{e.name}/")
-                    if level + 1 < depth and ws.contains(e.path):
-                        walk(Path(e.path), level + 1)
+                    if level + 1 >= depth:
+                        continue
+                    if not isinstance(d, int):
+                        if ws.contains(e.path):
+                            walk(Path(e.path), level + 1)
+                        continue
+                    try:
+                        sub = os.open(e.name, flags, dir_fd=d)
+                    except OSError as exc:  # swapped for a link (or removed) since it was listed
+                        lines.append(f"{pad}  [unreadable: {exc.strerror or exc}]")
+                        continue
+                    try:
+                        walk(sub, level + 1)
+                    finally:
+                        os.close(sub)
                 else:
                     lines.append(f"{pad}{e.name} ({e.stat(follow_symlinks=False).st_size} B)")
             except OSError:
                 lines.append(f"{pad}{e.name} (?)")
 
-    walk(base, 0)
+    top = ws.open_dir(base)
+    try:
+        walk(base if top is None else top, 0)
+    finally:
+        if top is not None:
+            os.close(top)
     if len(lines) >= MAX_LIST:
         lines.append(f"... (truncated at {MAX_LIST} entries; list a subdirectory)")
     return "\n".join(lines) or "(empty directory)"

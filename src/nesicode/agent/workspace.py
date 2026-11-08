@@ -60,8 +60,10 @@ TOOLCHAIN_DIRS = (
 TOOLCHAIN_SECRETS = (".cargo/credentials", ".cargo/credentials.toml")  # registry tokens inside a toolchain dir
 # Shared places a caged command may neither read nor write: other disks (other projects), other users' homes
 # and /Users/Shared, the shared temp dirs (other programs' files and sockets, other conversations' mktemp
-# files) and the per-user temp and cache dirs.
-SHARED_DIRS = ("/Volumes", "/Users", "/private/tmp", "/private/var/tmp", "/private/var/folders")
+# files), the per-user temp and cache dirs, and the data of Homebrew/MacPorts services (the user's local
+# MySQL/PostgreSQL/MongoDB files and their logs; no toolchain reads them).
+SHARED_DIRS = ("/Volumes", "/Users", "/private/tmp", "/private/var/tmp", "/private/var/folders",
+               "/opt/homebrew/var", "/usr/local/var", "/opt/local/var")
 
 
 # Variables Windows programs need to start at all (PATH alone is not enough there).
@@ -773,6 +775,25 @@ class Workspace:
             return os.fdopen(_open_beneath(self.root, p), "rb")
         except OSError as exc:
             raise ToolError(f"cannot read {self.rel(p)}: {_why(exc)}") from None
+        except ValueError:
+            raise ToolError(f"path {str(p)!r} is outside the workspace") from None
+
+    def open_dir(self, p: Path) -> int | None:
+        """fd of the directory p, reached without following any link (POSIX; None where dir fds are missing).
+        Walking by fds means a folder swapped for a link mid-walk is refused, never listed through."""
+        if not _FD_WALK:
+            return None
+        try:
+            if Path(p) == self.root:
+                return os.open(self.root, os.O_RDONLY | _DIRECTORY | _CLOEXEC)
+            parts = _parts(self.root, p)
+            dfd = _parent_fd(self.root, parts)
+            try:
+                return os.open(parts[-1], os.O_RDONLY | _DIRECTORY | _NOFOLLOW | _CLOEXEC, dir_fd=dfd)
+            finally:
+                os.close(dfd)
+        except OSError as exc:
+            raise ToolError(f"cannot list {self.rel(p)}: {_why(exc)}") from None
         except ValueError:
             raise ToolError(f"path {str(p)!r} is outside the workspace") from None
 
