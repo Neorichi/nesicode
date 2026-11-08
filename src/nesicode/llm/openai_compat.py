@@ -44,6 +44,23 @@ NON_STREAM_READ_TIMEOUT = 600.0  # a plain JSON request only answers once the wh
 MAX_BODY = 64 * 1024 * 1024
 STOP = {"stop": "end_turn", "tool_calls": "tool_use", "function_call": "tool_use", "length": "max_tokens",
         "model_context_window_exceeded": "max_tokens", "content_filter": "refusal"}
+REASONING_KEYS = ("reasoning_content", "reasoning")  # the names servers give the reasoning of a reply
+# A 400/422 that refuses a field we sent without naming it (pydantic, JSON-schema and protobuf wordings)
+_FIELD_REFUSED = re.compile(r"extra (?:inputs?|fields?|keys?|properties)|not permitted|unrecogni[sz]ed|additional propert|"
+                            r"unknown (?:field|name|parameter|key|argument|variant)|unexpected (?:field|key|property|keyword)|"
+                            r"was unexpected|not allowed", re.I)
+
+
+def _strip_reasoning(messages: list[dict]) -> int:
+    """Remove replayed reasoning from every assistant message; returns the chars removed."""
+    n = 0
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "assistant":
+            for key in REASONING_KEYS:
+                if key in m:
+                    v = m.pop(key)
+                    n += len(v) if isinstance(v, str) else 0
+    return n
 
 
 class OpenAICompatConversation(Conversation):
@@ -56,8 +73,9 @@ class OpenAICompatConversation(Conversation):
         self.messages.append({"role": "user", "content": text})
 
     def add_assistant_text(self, text: str) -> None:
+        # Earlier turns (chat history) never carry their reasoning: it is gone, and only the current tool loop needs it.
         msg = {"role": "assistant", "content": text or "(no answer)"}
-        if self.provider.replays_reasoning:
+        if self.provider.needs_reasoning:
             msg["reasoning_content"] = ""  # DeepSeek's thinking mode rejects history without it (that reasoning is gone)
         self.messages.append(msg)
 
@@ -66,13 +84,21 @@ class OpenAICompatConversation(Conversation):
             content = ("ERROR: " if r.is_error else "") + (r.content or "(empty)")
             self.messages.append({"role": "tool", "tool_call_id": r.call_id, "content": content})
 
+    @property
+    def replays_reasoning(self) -> bool:
+        return self.provider.needs_reasoning or not self.provider.reasoning_refused
+
+    def take_dropped(self) -> int:
+        return self.provider.take_dropped()
+
     def mask_tool_results(self, keep_last: int, marker, *, keep_chars: int = 0, apply: bool = True) -> int:
         idx = [i for i, m in enumerate(self.messages) if m.get("role") == "tool"]
         last_reply = max((i for i, m in enumerate(self.messages) if m.get("role") == "assistant"), default=-1)
         pending = sum(1 for i in idx if i > last_reply)  # results the model has not seen yet: never masked
         sizes = [len(c) if isinstance(c := self.messages[i].get("content"), str) else 0 for i in idx]
         freed = 0
-        for k in self.maskable(sizes, pending, keep_last, keep_chars):
+        masked = self.maskable(sizes, pending, keep_last, keep_chars)
+        for k in masked:
             m = self.messages[idx[k]]
             old = m.get("content")
             if not isinstance(old, str):
@@ -82,6 +108,20 @@ class OpenAICompatConversation(Conversation):
                 freed += len(old) - len(new)
                 if apply:
                     m["content"] = new
+        if self.provider.needs_reasoning:  # DeepSeek must get its reasoning back: never dropped
+            return freed
+        # Same pass (one cache break): the reasoning of the replies older than the kept window goes too. The reply that
+        # issued the oldest kept result keeps it (it explains that round), and so does every newer one.
+        first_kept = idx[len(masked)] if len(masked) < len(idx) else len(self.messages)
+        keep_from = max((i for i in range(first_kept) if self.messages[i].get("role") == "assistant"), default=0)
+        for m in self.messages[:keep_from]:
+            if m.get("role") != "assistant":
+                continue
+            for key in REASONING_KEYS:
+                if isinstance(m.get(key), str) and m[key]:
+                    freed += len(m[key])
+                    if apply:
+                        del m[key]
         return freed
 
     def step(self, on_event: EventSink | None = None) -> Turn:
@@ -131,13 +171,18 @@ class OpenAICompatConversation(Conversation):
             # servers reject every later request otherwise). Other fields, e.g. Gemini's signatures, are kept.
             replay.append({**tc, "id": cid, "type": tc.get("type") or "function",
                            "function": {**fn, "name": name, "arguments": raw}})
-        thinking = msg.get("reasoning_content") or msg.get("reasoning") or ""
-        thinking = thinking if isinstance(thinking, str) else ""
+        key = next((k for k in REASONING_KEYS if isinstance(msg.get(k), str) and msg[k]), REASONING_KEYS[0])
+        thinking = msg.get(key) if isinstance(msg.get(key), str) else ""
         assistant: dict = {"role": "assistant", "content": text}
         if replay:
             assistant["tool_calls"] = replay
-        if self.provider.replays_reasoning:
-            assistant["reasoning_content"] = thinking
+        # Interleaved thinking: the reasoning goes back with this reply while the run's tool loop lasts (the model builds
+        # on it instead of re-deriving it every step), under the name the server used. A rebuilt conversation (history,
+        # compaction) starts without it; masking drops it from old replies; a server that refuses it stops getting it.
+        if self.provider.needs_reasoning:
+            assistant["reasoning_content"] = thinking  # DeepSeek: always (its thinking mode requires the field)
+        elif thinking and not self.provider.reasoning_refused:
+            assistant[key] = thinking
         self.messages.append(assistant)
         u = data.get("usage") if isinstance(data.get("usage"), dict) else {}
         details = u.get("prompt_tokens_details") if isinstance(u.get("prompt_tokens_details"), dict) else {}
@@ -154,6 +199,7 @@ class OpenAICompatProvider(Provider):
     stream = True  # SSE streaming (switched off if the server rejects it)
     stream_usage = True  # stream_options.include_usage (switched off if rejected)
     tokens_key = ""  # "max_tokens" | "max_completion_tokens" once a 400 has told us which one
+    reasoning_refused = False  # the server rejected replayed reasoning (then it is never sent again)
     guard_private = False  # vet the address actually connected to (user endpoints on multi-user servers)
 
     def __init__(self, name: str, base_url: str, api_key: str = "", extra_headers: dict | None = None, *,
@@ -165,12 +211,17 @@ class OpenAICompatProvider(Provider):
         if api_key:
             self.headers["Authorization"] = f"Bearer {api_key}"
         self.guard_private = guard_private
+        self._dropped = 0  # chars of replayed reasoning stripped after a refusal, not yet reported (take_dropped)
 
     @property
-    def replays_reasoning(self) -> bool:
-        """DeepSeek's thinking mode answers 400 unless assistant messages carry their reasoning_content back. Other
-        servers don't need it (it would only add tokens), so it stays off for them."""
+    def needs_reasoning(self) -> bool:
+        """DeepSeek's thinking mode answers 400 unless every assistant message carries reasoning_content back (empty
+        for history). Every other server gets the reasoning of the current tool loop only (see _take)."""
         return "deepseek" in f"{self.name} {self.base_url}".lower()
+
+    def take_dropped(self) -> int:
+        n, self._dropped = self._dropped, 0
+        return n
 
     def max_tokens_key(self, model: str) -> str:
         """OpenAI's own API and its reasoning models (o-series, gpt-5) take max_completion_tokens; most other servers
@@ -249,6 +300,15 @@ class OpenAICompatProvider(Provider):
         if key and not self.tokens_key and key in text and re.search(
                 r"unsupported|unrecognized|not supported|not allowed|not permitted|extra|unknown", text):
             self.tokens_key = "max_tokens" if key == "max_completion_tokens" else "max_completion_tokens"
+            return True
+        # Replayed reasoning the server does not take: strip it from every message, send again, never send it again
+        carries = not self.needs_reasoning and any(
+            isinstance(m, dict) and m.get("role") == "assistant" and any(k in m for k in REASONING_KEYS)
+            for m in req.get("messages") or [])
+        if carries and ("reasoning" in text or (_FIELD_REFUSED.search(text) and not re.search(
+                r"max_(?:completion_)?tokens|\btools?\b|tool_calls", text))):  # (the field may not even be named)
+            self.reasoning_refused = True
+            self._dropped += _strip_reasoning(req.get("messages") or [])  # the conversation's own list: its history too
             return True
         return False
 
@@ -674,6 +734,7 @@ class _Reply:
         self.name = name
         self.text: list[str] = []
         self.reasoning: list[str] = []
+        self.reasoning_key = ""  # the field the server streams its reasoning in (it is replayed under the same name)
         self.calls: dict[int, dict] = {}
         self.ids: dict[str, int] = {}
         self.last = -1  # the call that index-less deltas continue
@@ -716,10 +777,11 @@ class _Reply:
                     emit("text", content)
                     call.data = True  # output has started: from now on the idle limit applies (not on a role-only
                     # first chunk: hidden reasoning may follow it, and it keeps the longer first-byte limit)
-                thought = delta.get("reasoning_content") or delta.get("reasoning")
-                if isinstance(thought, str) and thought:
-                    self.reasoning.append(thought)
-                    emit("thinking", thought)
+                key = next((k for k in REASONING_KEYS if isinstance(delta.get(k), str) and delta[k]), "")
+                if key:
+                    self.reasoning_key = self.reasoning_key or key
+                    self.reasoning.append(delta[key])
+                    emit("thinking", delta[key])
                     call.data = True
                 for tc in delta.get("tool_calls") or []:
                     if isinstance(tc, dict):
@@ -773,7 +835,7 @@ class _Reply:
     def result(self) -> dict:
         message: dict = {"role": "assistant", "content": "".join(self.text)}
         if self.reasoning:
-            message["reasoning_content"] = "".join(self.reasoning)
+            message[self.reasoning_key or REASONING_KEYS[0]] = "".join(self.reasoning)
         if self.calls:
             message["tool_calls"] = [self.calls[i] for i in sorted(self.calls)]
         return {"choices": [{"index": 0, "message": message, "finish_reason": self.finish}], "usage": self.usage or {}}

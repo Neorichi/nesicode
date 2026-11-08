@@ -1,9 +1,10 @@
 """Claude via the official Anthropic SDK (streaming manual tool loop).
 
 Each request streams on a helper thread (`transport.pump`), so Stop aborts it at once: while connecting, while Claude
-streams a large tool input, and between retries. The retries are ours (the SDK's are off: its backoff cannot be
-cancelled and it does not cover errors that arrive mid-stream). Prompt caching: a breakpoint on the system prompt
-(which caches the tools too) and a rolling one on the last message."""
+streams a large tool input, and between retries. A stalled request (no bytes at all — the server's pings count as
+life — for the first-byte / idle limits) is aborted and retried, like the OpenAI-compatible path. The retries are ours
+(the SDK's are off: its backoff cannot be cancelled and it does not cover errors that arrive mid-stream). Prompt
+caching: a breakpoint on the system prompt (which caches the tools too) and a rolling one on the last message."""
 
 from __future__ import annotations
 
@@ -32,6 +33,8 @@ from .transport import (
     Call,
     Retryable,
     address_problem,
+    first_byte_timeout,
+    idle_timeout,
     proxied,
     pump,
     retry_after_seconds,
@@ -293,7 +296,9 @@ class AnthropicConversation(Conversation):
 
         partial = lambda: call.emitted > 0  # noqa: E731
         try:
-            final = pump(produce, call, cancel=getattr(self.options, "cancel", None), on_event=on_event)
+            # first-byte / idle watchdog: a dead connection is aborted and retried instead of waiting 600 s per read
+            final = pump(produce, call, cancel=getattr(self.options, "cancel", None), on_event=on_event,
+                         first_byte=first_byte_timeout(), idle=idle_timeout())
         except (LLMError, Retryable):
             raise
         except anthropic.APIStatusError as exc:
@@ -376,6 +381,31 @@ def _attach_trace(request) -> None:
         request.extensions["trace"] = call.trace
 
 
+class _Touching(httpx2.SyncByteStream):
+    """A response body that reports every chunk it receives to the request's Call. The SDK swallows the server's
+    `ping` events, so without this a long but healthy silence between content events (pings only) would look like a
+    stall to the idle watchdog."""
+
+    def __init__(self, inner, call: Call):
+        self.inner, self.call = inner, call
+
+    def __iter__(self):
+        for chunk in self.inner:
+            self.call.touch()
+            yield chunk
+
+    def close(self) -> None:
+        self.inner.close()
+
+
+def _watch_body(response) -> None:
+    """httpx2 response hook (same thread as the attempt): the headers arrived; every body chunk keeps it alive."""
+    call = getattr(_local, "call", None)
+    if call is not None:
+        call.touch()
+        response.stream = _Touching(response.stream, call)
+
+
 def _env_header_names() -> list[str]:
     """Headers the SDK adds from ANTHROPIC_CUSTOM_HEADERS (the server's own configuration)."""
     names = []
@@ -396,11 +426,13 @@ class AnthropicProvider(Provider):
         provider. isolated (user-defined providers): never the server's key, base URL or custom headers; an empty
         key stays empty."""
         http = anthropic.DefaultHttpxClient(
-            event_hooks={"request": [_attach_trace]},
+            event_hooks={"request": [_attach_trace], "response": [_watch_body]},
             # a fresh connection per request, so Stop can always reach (and close) its socket
             limits=httpx2.Limits(max_connections=100, max_keepalive_connections=0),
         )
-        kwargs: dict = {"max_retries": 0, "timeout": httpx2.Timeout(600.0, connect=CONNECT_TIMEOUT), "http_client": http}
+        # The read timeout is only a backstop: the first-byte / idle watchdog in _attempt acts first
+        read = max(600.0, max(first_byte_timeout(), idle_timeout()) + 60)
+        kwargs: dict = {"max_retries": 0, "timeout": httpx2.Timeout(read, connect=CONNECT_TIMEOUT), "http_client": http}
         if api_key is not None:
             kwargs["api_key"] = api_key
         if base_url:

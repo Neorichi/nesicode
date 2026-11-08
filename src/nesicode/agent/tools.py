@@ -538,7 +538,8 @@ SCHEMAS = {
         {"type": "object", "properties": {
             "path": {"type": "string"},
             "offset": {"type": "integer", "description": "1-based first line (default 1)."},
-            "limit": {"type": "integer", "description": "Max lines (default 2000)."},
+            "limit": {"type": "integer", "description": "Max lines (default 2000; fewer come back if the character "
+                                                         "budget per call runs out first)."},
         }, "required": ["path"]},
     ),
     "write_file": ToolSpec(
@@ -575,6 +576,19 @@ SCHEMAS = {
         }, "required": ["command"]},
     ),
 }
+
+
+def read_file_spec(budget: int | None = None) -> ToolSpec:
+    """read_file as the agent sees it: with the per-call character budget its context window allows (the loop keeps
+    at most that much of one output in context, cut at a line boundary)."""
+    base = SCHEMAS["read_file"]
+    if not budget:
+        return base
+    return ToolSpec(base.name, base.description + (
+        f" At most about {budget:,} characters come back per call: a longer read stops at a line boundary and ends "
+        "with the exact offset to continue from (read big files in slices with offset/limit; use `search` to find the "
+        "lines that matter first)."), base.parameters)
+
 
 BASIC_TOOLS: dict[str, Callable[[Workspace, dict], str]] = {
     "list_dir": list_dir,
@@ -661,7 +675,9 @@ SHARE_FILE = ToolSpec(
 
 SEARCH_HISTORY = ToolSpec(
     "search_history",
-    "Search this conversation's archive (earlier steps, compaction checkpoints, full tool outputs saved on disk) "
-    "with a regex or keywords. Use it whenever a detail was compacted away instead of guessing or redoing work.",
+    "Search this conversation's archive (earlier turns and steps with your reasoning, compaction checkpoints, full "
+    "tool outputs saved on disk) with a regex or keywords. Without an exact match it returns the lines with the most "
+    "of your keywords (your own words and the user's first), with file:line to read around them. Use it whenever a "
+    "detail was compacted away instead of guessing or redoing work.",
     {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
 )

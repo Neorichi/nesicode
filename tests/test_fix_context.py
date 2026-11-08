@@ -493,7 +493,8 @@ def test_checkpoint_reinjects_touched_files_skills_pending_round_and_nudge(tmp_p
     script = [("skill", [ToolCall("s1", "load_skill", {"name": "documents"})]),
               ("lee", [ToolCall("r1", "read_file", {"path": "notes.md"})]),
               ("edita", [ToolCall("e1", "edit_file", {"path": "app.py", "old": "PORT = 1", "new": "PORT = 8765"})]),
-              ("más", [ToolCall("b1", "bash", {"command": "echo " + "u" * 9_000})])]
+              # (14k: since phase 2 a 9k window keeps ~4k chars of an output, and this round must cross the trigger)
+              ("más", [ToolCall("b1", "bash", {"command": "echo " + "u" * 14_000})])]
 
     def policy(conv, rec):
         if rec["role"] == "summarizer":
@@ -710,7 +711,7 @@ def test_agent_mentions_earlier_turns_only_when_there_are_some(tmp_path, fake):
     _agent(Workspace(tmp_path / "a"), [], context_limit=32_000).run("hola")
     system = prov.log[-1]["messages"][0]["content"]
     assert "earlier turns" not in system.lower() and "history.md" not in system
-    assert "private reasoning is not kept between steps" in system  # facts go in visible text or a notes file
+    assert "private reasoning may be dropped between steps" in system  # facts go in visible text or a notes file
     _agent(Workspace(tmp_path / "b"), [], context_limit=32_000).run("sigue", [("antes", "respuesta")])
     system = prov.log[-1]["messages"][0]["content"]
     assert "# Earlier turns of this conversation" in system and "If something you need is not shown" in system
@@ -850,7 +851,8 @@ def test_provider_retries_become_visible_events(tmp_path, fake):
 def test_window_scaled_budgets():
     assert ctxm.min_output(16_384) < 8_192 and ctxm.safety_tokens(16_384) < 4_096
     assert ctxm.min_output(200_000) == 8_192 and ctxm.safety_tokens(200_000) == 4_096
-    assert ctxm.inline_limit(16_384) == 8_000 and ctxm.inline_limit(131_072) == 24_000 and ctxm.inline_limit(None) == 8_000
+    # (phase 2: small windows keep ~5% of their window per output, 4k chars at least — no longer 8k at 16k)
+    assert ctxm.inline_limit(16_384) == 4_000 and ctxm.inline_limit(131_072) == 24_000 and ctxm.inline_limit(None) == 8_000
     assert ctxm.MAX_COMPACTIONS >= 40
     # the "no room" trigger no longer fires before the 67% summary threshold on small windows
     for w in (16_384, 24_576, 32_768):

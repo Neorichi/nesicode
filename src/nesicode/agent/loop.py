@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 import re
 import threading
@@ -15,7 +14,8 @@ from ..llm import (DEFAULT_LIMITS, LLMError, ModelOptions, ToolCall, ToolResult,
                    parse_limit)
 from .hooks import Hooks
 from . import context as ctxm
-from .tools import BASIC_TOOLS, GENERATE_IMAGE, SCHEMAS, SEARCH_HISTORY, SHARE_FILE, SHOW_IMAGE, VIEW_IMAGE, delegate_tool, skill_tool
+from .tools import (BASIC_TOOLS, GENERATE_IMAGE, SCHEMAS, SEARCH_HISTORY, SHARE_FILE, SHOW_IMAGE, VIEW_IMAGE, delegate_tool,
+                    read_file_spec, skill_tool)
 from .vision import describe_image, generate_image, image_mime
 from .workspace import HARNESS_DIR, Cancelled, ToolError, Workspace
 
@@ -38,12 +38,21 @@ EMPTY_CUT_NOTE = (
     "[harness] Your previous reply hit the output limit ({cap:,} tokens) before any visible answer (the reasoning used it "
     "up). Keep the reasoning short now and write the answer, or make the next tool call."
 )
-READ_STREAK = 20  # tool calls in a row without writing anything before the one-time reminder
+READ_STREAK = 20  # tool calls in a row without writing anything before the reminder (once per streak; again after a
+# masking or a compaction while the streak goes on, at least READ_STREAK // 2 calls after the previous one)
 READ_STREAK_NOTE = (
-    "\n\n[harness] You have made {n} tool calls in a row without writing or editing any file. If you already have what "
-    "you need, start producing the deliverable now; save intermediate results (findings, exact values) to disk as you "
-    "go, so they survive Stop and context compaction."
+    "\n\n[harness] You have made {n} tool calls in a row without writing or editing any file. Write what you have now "
+    "and keep results on disk as you go (findings, exact values, partial results — in the deliverable or a notes file): "
+    "old tool outputs and your private reasoning may be cleared from the context, and the user can stop the turn at any "
+    "time.{rules}"
 )
+REQUEST_QUOTE = 1_200  # chars of the user's own words the reminder quotes
+MASK_NOTE = ("[harness] {what} cleared to free context (full outputs on disk; paths in the markers). Record any conclusion "
+             "you have not written down yet (e.g. in the deliverable or a notes file) before re-reading.")
+MASK_NOTE_REASONING = ("[harness] Your reasoning from earlier steps was cleared to free context. Record any conclusion you "
+                       "have not written down yet (e.g. in the deliverable or a notes file).")
+THINKING_CAP = 32_000  # chars of one reply's reasoning kept in the event log (its END: the conclusions sit there)
+TRAIL_MARK = "[PREVIOUS TURN — STEPS]"  # heads the step trail of the previous turn in the history (see _trim_answer)
 WRITE_TOOLS = {"write_file", "edit_file", "generate_image", "share_file"}
 _WRITES_RX = re.compile(r"(?<![0-9&>])>>?\s*[\w./~$\"'-]|\btee\b|\bsed\s+-i|\b(?:mv|cp|rm|mkdir|touch|patch)\s|"
                         r"\bgit\s+(?:commit|apply|am|merge|rebase|checkout|restore)\b")
@@ -91,8 +100,9 @@ def build_system(h: Harness, ws: Workspace, *, base: str | None = None, extra_to
         f"The workspace's absolute path is `{ws.root}`: give external tools (connectors) absolute paths inside it "
         "so the files they create stay in this conversation's folder.",
         f"Today is {time.strftime('%Y-%m-%d')}.",
-        "Your private reasoning is not kept between steps: put facts you will need later (exact values, findings, "
-        "decisions) in your visible replies or in a notes file.",
+        "Your private reasoning may be dropped between steps, and old tool outputs get cleared to save context: put "
+        "facts you will need later (exact values, findings, decisions) in your visible replies, the deliverable or a "
+        "notes file as soon as you have them.",
     ]
     if scripts:
         env.append(
@@ -109,9 +119,19 @@ def build_system(h: Harness, ws: Workspace, *, base: str | None = None, extra_to
 
 
 def _trim_answer(text: str, n: int) -> str:
-    note = "\n[... middle of this earlier turn omitted; search_history has it ...]\n"
     if len(text) <= n:
         return text
+    i = text.find(TRAIL_MARK)
+    if i >= 0:  # the previous turn's step trail ends where that turn stopped: its OLDEST steps go first
+        head = text[: i + len(TRAIL_MARK)]
+        gap = "\n[... older steps of this turn omitted here; search_history has them ...]\n"
+        room = n - len(head) - len(gap)
+        if room >= 600:
+            tail = text[len(text) - room:]
+            if 0 <= (nl := tail.find("\n")) < len(tail) // 2:
+                tail = tail[nl + 1:]
+            return head + gap + tail
+    note = "\n[... middle of this earlier turn omitted; search_history has it ...]\n"
     keep = max(0, n - len(note))
     head = keep * 2 // 5
     return text[:head] + note + text[len(text) - (keep - head):]
@@ -207,6 +227,8 @@ class Agent:
         self._parts: list[str] = []
         self._ro_streak = 0
         self._ro_reminded = False
+        self._ro_at = 0  # the streak when the last reminder was given
+        self._live: dict[str, list[str]] = {}  # deltas of the reply being streamed (kept if Stop or an error cuts it)
         self._usage = Usage()
         try:
             self.hooks = Hooks(harness_hooks(harness))
@@ -222,7 +244,8 @@ class Agent:
             self._emit({**event, "_persist": persist})
 
     def tool_specs(self):
-        specs = [SCHEMAS[n] for n in BASIC_TOOLS]
+        # read_file states the per-call budget this window gives it (see _inline_limit)
+        specs = [read_file_spec(self._inline_limit("read_file")) if n == "read_file" else SCHEMAS[n] for n in BASIC_TOOLS]
         if (st := skill_tool(self.harness)) is not None:
             specs.append(st)
         if self.depth == 0 and (dt := delegate_tool(self.harness)) is not None:
@@ -351,15 +374,58 @@ class Agent:
 
     def _notify_retry(self, info: dict) -> None:
         """Providers call this before retrying a request (slow or stalled endpoint): the user sees it."""
+        self._live = {}  # the retry streams the reply again from its start
         try:
             self.emit({"type": "llm_retry", **{k: v for k, v in dict(info or {}).items() if k != "type"}})
         except Exception:
             pass
 
+    def _save_partial(self) -> None:
+        """A reply cut short by Stop or an error: what had been streamed of it is persisted, marked interrupted (the UI
+        shows it, and the next turn's history and digest have it) — before the cancelled/error event."""
+        live, self._live = self._live, {}
+        thinking, text = "".join(live.get("thinking", ())), "".join(live.get("text", ()))
+        try:
+            if thinking.strip():
+                self.emit({"type": "thinking", "text": _keep_end(thinking, THINKING_CAP), "interrupted": True})
+            if text.strip():
+                self.emit({"type": "assistant", "text": text, "interrupted": True})
+        except Exception:
+            pass
+
+    def _end_background(self) -> None:
+        """The top-level run is over: what its commands left running in the background goes too."""
+        kill = getattr(self.ws, "kill_background", None)
+        if callable(kill):
+            try:
+                kill()
+            except Exception:
+                pass
+
+    def _streak_note(self) -> str:
+        """The read-only streak reminder, quoting the user's own words (the conversation's first message, where the
+        standing rules usually are, and the current one) within REQUEST_QUOTE chars."""
+        first = (self._history[0][0] if self._history else "").strip()
+        cur = (self._task_full or self._task).strip()
+        quotes = [(label, t) for label, t in (("first message of this conversation", first), ("current message", cur)) if t]
+        if len(quotes) == 2 and quotes[0][1] == quotes[1][1]:
+            quotes = quotes[1:]
+        caps = [len(t) for _, t in quotes]
+        if sum(caps) > REQUEST_QUOTE:
+            if len(caps) == 1:
+                caps = [REQUEST_QUOTE]
+            else:  # the shorter one whole (up to half), the other gets the rest
+                s = min(min(caps), REQUEST_QUOTE // 2)
+                caps = [s, REQUEST_QUOTE - s] if caps[0] <= caps[1] else [REQUEST_QUOTE - s, s]
+        rows = [f"- {label}: «{ctxm.clip(t, n, 'message')}»" for (label, t), n in zip(quotes, caps)]
+        rules = ("\nThe user's request, verbatim (excerpt) — follow its rules:\n" + "\n".join(rows)) if rows else ""
+        return READ_STREAK_NOTE.format(n=self._ro_streak, rules=rules)
+
     # ------------------------------------------------------------------ conversations
     def _open(self, provider, model, system, options, task, history_budget=None):
         conv = provider.conversation(model, system, self.tool_specs(), options)
         self._conv_chars, self._anchor, self._round_sizes = 0, None, []
+        _dropped(conv)  # (reasoning a server refused earlier was stripped from another conversation)
         for u, a in self._fit_history(self._history, system, history_budget):
             self._add_user(conv, u)
             self._add_assistant(conv, a)
@@ -425,21 +491,28 @@ class Agent:
         return ctxm.mask_marker(tool, rel, call_id in self._errors, desc, reread)(call_id, old)
 
     def _mask(self, conv, keep_last: int, keep_chars: int, min_tokens: int) -> int:
-        """Mask old tool outputs if that frees at least `min_tokens` (a dry run first: masking breaks the prompt
-        cache, so it only happens when it is worth it). Returns the chars freed."""
-        fn = conv.mask_tool_results
-        try:
-            budgeted = "apply" in inspect.signature(fn).parameters
-        except (TypeError, ValueError):
-            budgeted = False
-        if budgeted:
-            would = fn(keep_last, self._marker, keep_chars=keep_chars, apply=False)
-            if not would or would // 4 < min_tokens:
-                return 0
-            freed = fn(keep_last, self._marker, keep_chars=keep_chars, apply=True)
-        else:  # an implementation without dry run / size budget
-            freed = fn(max(keep_last, ctxm.KEEP_RESULTS), self._marker)
+        """Mask old tool outputs (and the reasoning of the replies before them) if that frees at least `min_tokens` (a
+        dry run first: masking breaks the prompt cache, so it only happens when it is worth it). The model is told in
+        one line, and the progress reminder may come again. Returns the chars freed."""
+        would = conv.mask_tool_results(keep_last, self._marker, keep_chars=keep_chars, apply=False)
+        if not would or would // 4 < min_tokens:
+            return 0
+        cleared = [0, 0]  # tool outputs masked, chars they freed (the rest of `freed` is reasoning)
+
+        def marker(call_id: str, old: str):
+            new = self._marker(call_id, old)
+            if new is not None and len(new) < len(old):
+                cleared[0] += 1
+                cleared[1] += len(old) - len(new)
+            return new
+        freed = conv.mask_tool_results(keep_last, marker, keep_chars=keep_chars, apply=True)
         self._conv_chars -= freed
+        if freed:
+            n = cleared[0]
+            what = (f"{n} earlier tool output{'s' if n != 1 else ''}"
+                    + (" and your reasoning from those steps were" if freed > cleared[1] else (" were" if n != 1 else " was")))
+            self._add_user(conv, MASK_NOTE.format(what=what) if n else MASK_NOTE_REASONING)
+            self._ro_reminded = False
         return freed
 
     # ------------------------------------------------------------------ layer 2: compaction
@@ -464,10 +537,10 @@ class Agent:
         tag = self._archive_tag()
         tr_rel = ""
         if work:
-            tr_rel = ctxm.write_context_file(
-                self.ws, f"{tag}-transcript-{n}.md",
+            tr_rel = self._archive_file(
+                f"{tag}-transcript-{n}.md",
                 f"# Transcript {n} ({tag})\n\n## The user's request\n{self._task_full}\n\n## Steps\n"
-                + ctxm.transcript(new_events, budget=None, subagents=True, args_cap=None) + "\n", self.archive)
+                + ctxm.transcript(new_events, budget=None, subagents=True, args_cap=None, thinking=True) + "\n")
         anchors = self._anchors(new_events)
         fallback = False
         if work:
@@ -480,12 +553,12 @@ class Agent:
         else:
             summary = self._summary or ""
         self._compactions = n
-        md_rel = ctxm.write_context_file(
-            self.ws, f"{tag}-compact-{n}.md",
+        md_rel = self._archive_file(
+            f"{tag}-compact-{n}.md",
             f"# Compactación {n}\n\n- Motivo: {reason}\n- Contexto: {used:,} de {lim:,} tokens\n"
             + (f"- Transcript completo de este tramo: {tr_rel}\n" if tr_rel else "")
             + (f"\n{summary}\n" if summary else "\n(Aún no había trabajo que resumir: la conversación se reconstruyó para "
-                                                "que quepa en la ventana de contexto.)\n"), self.archive)
+                                                "que quepa en la ventana de contexto.)\n"))
         if work or summary:
             conv = self._rebuild(provider, model, system, options, task, summary, anchors, new_events, tr_rel)
         else:  # nothing done yet in this run: the start of the conversation, re-fitted to the window (from the original)
@@ -498,11 +571,20 @@ class Agent:
         self._steps_at_compact = self._steps
         self._judge = True  # the provider's next real count says whether this compaction got under the trigger
         self._masked_at = 0
+        self._ro_reminded = False  # the progress reminder may come again if the read-only streak goes on
         self.emit({"type": "compacted", "used": used, "after": after, "limit": lim, "summary": summary[:20_000],
                    "path": md_rel, "transcript": tr_rel, "n": n, "reason": reason, **({"fallback": True} if fallback else {})})
         self._display = after
         self._ctx_event("compacted")
         return conv
+
+    def _archive_file(self, name: str, text: str) -> str:
+        """Write <archive>/context/<name>; "" if it cannot be written (e.g. a link planted in the archive) — the
+        compaction goes on without that copy."""
+        try:
+            return ctxm.write_context_file(self.ws, name, text, self.archive)
+        except Exception:
+            return ""
 
     def _anchors(self, events: list[dict]) -> dict:
         own = [e for e in events if not e.get("depth")]
@@ -593,8 +675,10 @@ class Agent:
         return "\n\n".join(parts)
 
     def _rebuild(self, provider, model, system, options, task, summary, anchors, new_events, tr_rel):
-        """New conversation: system + earlier turns (re-fitted) + checkpoint. Aims at ~35% of the window; above ~50%
-        the parts shrink in order (tail, files, skills, identifiers, history, unanswered results, summary, message)."""
+        """New conversation: system + earlier turns (re-fitted) + checkpoint, aiming at ~35% of the window so the next
+        compaction is far away even on 16k-32k windows: above it the parts shrink in order (tail, files, skills,
+        identifiers, history); the essentials (unanswered results, summary, the user's message) only while the rebuild
+        is still over half the window."""
         lim = self.context_limit
         window = lim * 4
         shares = {"history": 0.15, "task": 0.08, "pending": 0.12, "tail": 0.06, "files": 0.08, "skills": 0.03,
@@ -607,18 +691,24 @@ class Agent:
         tail_events = [e for e in new_events if e.get("id") not in pend_ids][-24:]
         git = ctxm.git_state(self.ws, int(window * shares["git"]))
         saved = {cid: info[1] for cid, info in self._saved.items()}
+        essential = ("pending", "summary", "task")  # shrunk only while the rebuild is over POST_COMPACT_MAX
         for _ in range(30):
             b = {k: min(int(window * shares[k] * scale[k]), caps.get(k, 10**9)) for k in shares}
             hist = self._fit_history(self._history, system, b["history"] // 4)
             msg = self._checkpoint(task, summary, anchors, tail_events, b, cache, git, saved, tr_rel)
             chars = sum(len(u) + len(a) + 32 for u, a in hist) + len(msg) + 16
             est = int((self._fixed_chars + chars) / self._cpt)
-            if est <= lim * ctxm.POST_COMPACT_MAX or all(scale[k] <= 0.125 for k in order):
+            if est <= lim * ctxm.POST_COMPACT_TARGET:
                 break
-            k = next(k for k in order if scale[k] > 0.125)
+            k = next((k for k in order if scale[k] > 0.125 and k not in essential), None)
+            if k is None and est > lim * ctxm.POST_COMPACT_MAX:
+                k = next((k for k in order if scale[k] > 0.125), None)
+            if k is None:
+                break
             scale[k] /= 2
         conv = provider.conversation(model, system, self.tool_specs(), options)
         self._conv_chars, self._anchor, self._round_sizes = 0, None, []
+        _dropped(conv)  # (reasoning a server refused earlier was stripped from another conversation)
         for u, a in hist:
             self._add_user(conv, u)
             self._add_assistant(conv, a)
@@ -649,8 +739,8 @@ class Agent:
                     rel = (self._saved.get(call.id) or ("", ""))[1]
                     full = cache.get(("out", rel)) if rel else None
                     if rel and full is None:
-                        try:
-                            full = cache[("out", rel)] = self.ws.resolve(rel).read_text(encoding="utf-8", errors="replace")
+                        try:  # never through a link planted in the archive
+                            full = cache[("out", rel)] = self.ws.read_bytes(self.ws.root / rel).decode("utf-8", "replace")
                         except Exception:
                             full = None
                     body = (ctxm.inline_output(full, rel, per, call.name, call.arguments) if full
@@ -662,7 +752,7 @@ class Agent:
             if tail:
                 lines.append("## Most recent steps (abridged — long outputs shortened; the full ones are archived)\n" + tail)
         lines.append(ctxm.files_block(self.ws, list(reversed(list(self._touched.items()))), b["files"], cache))
-        if self._skills_loaded and b["skills"] >= 300:
+        if self._skills_loaded:  # (a small budget still lists their names: the model knows to re-load them)
             bodies = {n: (s.get("body") or "") for n, s in skills(self.harness).items()}
             lines.append(ctxm.skills_block(bodies, self._skills_loaded, min(12_000, b["skills"])))
         lines.append(git)
@@ -700,6 +790,7 @@ class Agent:
     def _on_delta(self, kind: str, delta: str) -> None:
         if self.cancel.is_set():
             raise Cancelled()  # stop the model mid-reply (streaming providers)
+        self._live.setdefault(kind, []).append(delta)  # what the user has seen of this reply (see _save_partial)
         self.emit({"type": f"{kind}_delta", "text": delta}, persist=False)
 
     def _call_tool(self, call: ToolCall, usage: Usage) -> ToolResult:
@@ -746,28 +837,28 @@ class Agent:
                     self._skills_loaded.remove(name)
                 self._skills_loaded.append(name)
         if call.name in WRITE_TOOLS or (call.name == "bash" and _WRITES_RX.search(str(call.arguments.get("command", "")))):
-            self._ro_streak, self._ro_reminded = 0, False
+            self._ro_streak, self._ro_reminded, self._ro_at = 0, False, 0
         else:
             self._ro_streak += 1
 
     def _call_tool_inner(self, call: ToolCall, usage: Usage) -> ToolResult:
+        # Errors go through the hooks too (pre_tool warnings + post_tool rules), so a hint keyed to an error fires
         if call.parse_error:
-            return ToolResult(call.id, f"Tool call rejected: {call.parse_error}", True)
+            return ToolResult(call.id, self.hooks.finish(call.name, f"Tool call rejected: {call.parse_error}", []), True)
         block, warnings = self.hooks.before(call.name, call.arguments)
         if block:
-            return ToolResult(call.id, block, True)
+            return ToolResult(call.id, self.hooks.finish(call.name, block, warnings), True)
         if self.approve is not None:
             allowed, reason = self.approve(call)
             if not allowed:
-                return ToolResult(
-                    call.id,
-                    f"The user did not allow this {call.name} call ({reason}). Do not retry the same call; "
-                    "choose another approach or ask the user what to do.",
-                    True,
-                )
+                return ToolResult(call.id, self.hooks.finish(
+                    call.name, f"The user did not allow this {call.name} call ({reason}). Do not retry the same call; "
+                    "choose another approach or ask the user what to do.", warnings), True)
         other = self._other_chat_archive(call.arguments)
         if other:
-            return ToolResult(call.id, f"Error: {other} belongs to another conversation; each chat only sees its own history.", True)
+            return ToolResult(call.id, self.hooks.finish(
+                call.name, f"Error: {other} belongs to another conversation; each chat only sees its own history.",
+                warnings), True)
         try:
             if call.name in BASIC_TOOLS:
                 out = BASIC_TOOLS[call.name](self.ws, call.arguments)
@@ -814,10 +905,10 @@ class Agent:
                 raise ToolError(f"unknown tool {call.name!r}")
         except ToolError as exc:
             self._errors.add(call.id)
-            return ToolResult(call.id, f"Error: {exc}", True)
+            return ToolResult(call.id, self.hooks.finish(call.name, f"Error: {exc}", warnings), True)
         except Exception as exc:  # a tool bug must not kill the run
             self._errors.add(call.id)
-            return ToolResult(call.id, f"Error: {type(exc).__name__}: {exc}", True)
+            return ToolResult(call.id, self.hooks.finish(call.name, f"Error: {type(exc).__name__}: {exc}", warnings), True)
         if warnings:
             out = "\n".join(f"[hook] {w}" for w in warnings) + "\n" + out
         if len(out) > ctxm.SAVE_OVER:
@@ -904,6 +995,7 @@ class Agent:
         self._task = self._task_full = task
         self._tag, self._tag_ok = "", False  # archive files of this run get their own prefix (created on first use)
         self._request_rel = ""
+        self._live = {}
         try:
             provider, model = get_provider(self.model_spec, self.user_keys)
             if self.depth == 0:
@@ -948,6 +1040,7 @@ class Agent:
                     max_tokens = min(out_budget, room)
                     room_limited = max_tokens < out_budget
                     options.max_tokens = max(256 if self._nudged else 1_024, max_tokens)
+                self._live = {}
                 try:
                     turn = conv.step(on_event=self._on_delta)
                 except LLMError as exc:
@@ -957,6 +1050,7 @@ class Agent:
                     if not learned or self._limit_errors >= 3:
                         raise
                     # The model told us its real limit: remember it, re-fit everything to it and try again.
+                    self._live = {}  # the reply is asked for again after the compaction
                     self._limit_errors += 1
                     self._denser(str(exc))
                     if self.context_limit != learned:
@@ -966,6 +1060,8 @@ class Agent:
                         self.emit({"type": "context_learned", "limit": learned})
                     conv = self._compact(provider, model, system, options, self._task, self._est(), reason="context exceeded")
                     continue
+                self._live = {}  # the reply is complete: its text and reasoning are recorded below
+                self._conv_chars -= _dropped(conv)  # replayed reasoning the server refused (stripped from the history)
                 if self._judge and self.context_limit:  # first request after a compaction: did it get under the trigger?
                     self._judge = False
                     real = turn.usage.input_tokens or self._est()
@@ -975,7 +1071,7 @@ class Agent:
                         self._compact_off = True
                 if turn.usage.input_tokens:
                     self._calibrate(turn.usage.input_tokens)
-                self._conv_chars += _visible(turn) + 16
+                self._conv_chars += _visible(turn) + 16 + (len(turn.thinking or "") if _replays(conv) else 0)
                 cut = turn.stop_reason in ("max_tokens", "model_context_window_exceeded")
                 if cut and self.context_limit and (room_limited or turn.stop_reason == "model_context_window_exceeded") \
                         and self._can_compact() and self._est() > self.context_limit * 0.45:
@@ -989,8 +1085,8 @@ class Agent:
                 self._pending = []
                 self._limit_errors = 0  # context errors only count while they repeat without progress
                 usage.add(turn.usage)
-                if turn.thinking:
-                    self.emit({"type": "thinking", "text": turn.thinking[:8000]})
+                if turn.thinking:  # archived (history.md, the next turn's trail, compaction transcripts): its end matters
+                    self.emit({"type": "thinking", "text": _keep_end(turn.thinking, THINKING_CAP)})
                 if turn.text:
                     self.emit({"type": "assistant", "text": turn.text})
                 if turn.stop_reason in ("refusal", "content_filter"):  # never a silent empty "done"
@@ -1032,10 +1128,11 @@ class Agent:
                         "output": res.content[:30_000], "is_error": res.is_error,
                     })
                     results.append(res)
-                if self._ro_streak >= READ_STREAK and not self._ro_reminded and results:
+                if self._ro_streak >= READ_STREAK and not self._ro_reminded and results \
+                        and self._ro_streak - self._ro_at >= READ_STREAK // 2:  # (re-armed: not right after the last)
                     last = results[-1]
-                    results[-1] = ToolResult(last.call_id, last.content + READ_STREAK_NOTE.format(n=self._ro_streak), last.is_error)
-                    self._ro_reminded = True
+                    results[-1] = ToolResult(last.call_id, last.content + self._streak_note(), last.is_error)
+                    self._ro_reminded, self._ro_at = True, self._ro_streak
                 self._add_results(conv, results)
                 self._pending = list(zip(turn.tool_calls, results))
                 self._round_sizes.append(len(results))
@@ -1046,21 +1143,27 @@ class Agent:
                     self._add_user(conv, FINAL_NUDGE)
                     self._nudged = True
         except Cancelled:
+            self._save_partial()
             self.emit({"type": "cancelled"})
             return AgentResult(final_text, "cancelled", steps, usage, self.events)
         except LLMError as exc:
+            self._save_partial()
             if self.cancel.is_set():  # the provider wrapped our stop into its own error
                 self.emit({"type": "cancelled"})
                 return AgentResult(final_text, "cancelled", steps, usage, self.events)
             self.emit({"type": "error", "text": str(exc)})
             return AgentResult(final_text, "error", steps, usage, self.events, error=str(exc))
         except Exception as exc:
+            self._save_partial()
             if self.cancel.is_set():
                 self.emit({"type": "cancelled"})
                 return AgentResult(final_text, "cancelled", steps, usage, self.events)
             msg = f"{type(exc).__name__}: {exc}"
             self.emit({"type": "error", "text": msg})
             return AgentResult(final_text, "error", steps, usage, self.events, error=msg)
+        finally:
+            if self.depth == 0:  # sub-agents share the workspace: only the top-level run ends its background processes
+                self._end_background()
 
     def _after_step(self, conv, provider, model, system, options, turn, results):
         """Layers 1 and 2 after a step, then the context meter."""
@@ -1105,35 +1208,127 @@ class Agent:
 
 
 def _visible(turn) -> int:
-    """Characters of a reply that go back into the conversation (text + tool calls; not the reasoning)."""
+    """Characters of a reply that go back into the conversation (text + tool calls; the reasoning is counted apart)."""
     return len(turn.text or "") + sum(len(json.dumps(c.arguments, ensure_ascii=False)) + len(c.name) for c in turn.tool_calls)
 
 
-def trajectory_text(events: list[dict], max_chars: int = 30_000, obs_chars: int = 2_500, args_chars: int = 1_500) -> str:
-    """Readable trajectory in the [ACTION]/[OBSERVATION]/[ERROR] grammar (long items and the middle shortened)."""
-    lines: list[str] = []
-    half = max(200, obs_chars // 2 - 50)
-    for e in events:
-        who = f"({e['agent']}) " if e.get("agent") else ""
-        t = e.get("type")
-        if t == "assistant":
-            lines.append(f"[ASSISTANT] {who}{e['text']}")
-        elif t == "tool_call":
-            args = json.dumps(e.get("args", {}), ensure_ascii=False)
-            if len(args) > args_chars:
-                args = args[:args_chars] + "...}"
-            lines.append(f"[ACTION] {who}{e['name']} {args}")
-        elif t == "tool_result":
-            out = e.get("output", "")
-            if len(out) > obs_chars:
-                out = out[:half] + f"\n[... {len(out) - 2 * half:,} chars of this output omitted here ...]\n" + out[-half:]
-            tag = "[ERROR]" if e.get("is_error") else "[OBSERVATION]"
-            lines.append(f"{tag} {who}{out}")
-        elif t == "error":
-            lines.append(f"[ERROR] {who}{e['text']}")
-        elif t == "done":
-            lines.append(f"[END] status={e['status']} steps={e['steps']}")
-    text = "\n".join(lines)
+def _replays(conv) -> bool:
+    """Does this conversation send the replies' reasoning back to the model (so it counts in the context)?"""
+    try:
+        return bool(getattr(conv, "replays_reasoning", False))
+    except Exception:
+        return False
+
+
+def _dropped(conv) -> int:
+    take = getattr(conv, "take_dropped", None)
+    try:
+        return int(take()) if callable(take) else 0
+    except Exception:
+        return 0
+
+
+def _keep_end(text: str, n: int, what: str = "reasoning") -> str:
+    """The last ~n chars of `text` (where a reasoning's conclusions sit), saying how much came before."""
+    if len(text) <= n:
+        return text
+    return f"[… {len(text) - n:,} earlier chars of this {what} omitted …] " + text[len(text) - n:]
+
+
+DUMP_TOOLS = ("list_dir", "search", "search_history")  # listings: a few lines tell what they were
+DUMP_LINES = 6
+
+
+def _shorten(out: str, n: int, dump: bool = False) -> str:
+    """A tool output in about n chars: head and tail LINES, saying what is left out (a listing: its first lines)."""
+    lines = out.split("\n")
+    if dump and len(lines) > DUMP_LINES + 2:
+        head = "\n".join(ln[:240] for ln in lines[:DUMP_LINES])
+        return f"{head}\n[... {len(lines) - DUMP_LINES:,} more lines of this listing ...]"
+    if len(out) <= n:
+        return out
+    room = max(200, n - 80)
+    kept_head, size = [], 0
+    for ln in lines:
+        if size + len(ln) + 1 > room * 3 // 5:
+            break
+        kept_head.append(ln)
+        size += len(ln) + 1
+    kept_tail: list[str] = []
+    for ln in reversed(lines[len(kept_head):]):
+        if size + len(ln) + 1 > room:
+            break
+        kept_tail.insert(0, ln)
+        size += len(ln) + 1
+    hidden = len(lines) - len(kept_head) - len(kept_tail)
+    if not kept_head and not kept_tail:  # one huge line: cut by chars
+        return out[: room * 3 // 5] + f" [... {len(out) - room:,} chars of this output omitted here ...] " + out[-(room * 2 // 5):]
+    hidden_chars = len(out) - size
+    return "\n".join(kept_head + [f"[... {hidden:,} lines ({hidden_chars:,} chars) of this output omitted here ...]"]
+                     + kept_tail)
+
+
+def trajectory_text(events: list[dict], max_chars: int = 30_000, obs_chars: int = 2_500, args_chars: int = 1_500, *,
+                    thinking_chars: int = 0, fit: str = "middle", dumps: bool = False) -> str:
+    """Readable trajectory in the [ACTION]/[OBSERVATION]/[ERROR] grammar, long items shortened.
+
+    thinking_chars > 0 adds the reasoning events as [THINKING] lines (their END, where the conclusions sit). Over
+    max_chars, `fit` decides what goes: "middle" keeps the first third and the end (harnessing rollouts); "shrink" never
+    drops a step — observations, arguments and reasoning get shorter instead, the budget is soft (disk archives such as
+    history.md); "tail" keeps the newest steps whole and says how many older ones are not shown (the previous turn's
+    trail, which must end where that turn stopped). dumps=True keeps only the first lines of list_dir/search outputs."""
+    def render(obs: int, args_cap: int, think: int) -> list[tuple[str, str]]:
+        items: list[tuple[str, str]] = []
+        for e in events:
+            who = f"({e['agent']}) " if e.get("agent") else ""
+            t = e.get("type")
+            if t == "assistant":
+                cut = "(interrupted mid-reply) " if e.get("interrupted") else ""
+                items.append(("say", f"[ASSISTANT] {cut}{who}{e.get('text') or ''}"))
+            elif t == "thinking" and think and e.get("text"):
+                items.append(("think", f"[THINKING] {who}{_keep_end(str(e['text']), think)}"))
+            elif t == "tool_call":
+                args = json.dumps(e.get("args", {}), ensure_ascii=False)
+                if len(args) > args_cap:
+                    args = args[:args_cap] + "...}"
+                items.append(("action", f"[ACTION] {who}{e.get('name')} {args}"))
+            elif t == "tool_result":
+                out = _shorten(str(e.get("output") or ""), obs, dumps and e.get("name") in DUMP_TOOLS)
+                items.append(("obs", f"{'[ERROR]' if e.get('is_error') else '[OBSERVATION]'} {who}{out}"))
+            elif t == "error":
+                items.append(("say", f"[ERROR] {who}{e.get('text') or ''}"))
+            elif t == "done":
+                items.append(("say", f"[END] status={e.get('status')} steps={e.get('steps')}"))
+        return items
+
+    def size(items) -> int:
+        return sum(len(x) + 1 for _, x in items)
+
+    items = render(obs_chars, args_chars, thinking_chars)
+    if fit == "shrink":
+        obs, args_cap, think = obs_chars, args_chars, thinking_chars
+        while size(items) > max_chars and (obs > 300 or args_cap > 300 or think > 300):
+            obs, args_cap = max(300, obs // 2), max(300, args_cap // 2)
+            think = max(300, think // 2) if think else 0
+            items = render(obs, args_cap, think)
+        return "\n".join(x for _, x in items)
+    if fit == "tail" and size(items) > max_chars:
+        gap = "[... the first {n} tool call(s) of this turn are not shown here — search_history finds them ...]"
+        room = max_chars - len(gap) - 12
+        kept: list[tuple[str, str]] = []
+        used = 0
+        for it in reversed(items):
+            if used + len(it[1]) + 1 > room:
+                break
+            kept.insert(0, it)
+            used += len(it[1]) + 1
+        while kept and kept[0][0] == "obs":  # an output whose call is not shown
+            kept.pop(0)
+        if not kept and items:  # the newest item alone is too big: its start
+            kept = [(items[-1][0], items[-1][1][: max(200, room)] + " …")]
+        hidden = sum(1 for k, _ in items[: len(items) - len(kept)] if k == "action")
+        return "\n".join(([gap.format(n=hidden)] if hidden else []) + [x for _, x in kept])
+    text = "\n".join(x for _, x in items)
     if len(text) > max_chars:
         head = max_chars // 3
         text = text[:head] + "\n\n... (middle of trajectory omitted) ...\n\n" + text[-(max_chars - head):]

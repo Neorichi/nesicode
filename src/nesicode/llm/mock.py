@@ -69,15 +69,18 @@ class MockConversation(Conversation):
         for r in results:
             self.messages.append(("tool", r.content, r.call_id))
 
-    def mask_tool_results(self, keep_last: int, marker) -> int:
+    def mask_tool_results(self, keep_last: int, marker, *, keep_chars: int = 0, apply: bool = True) -> int:
         idx = [i for i, m in enumerate(self.messages) if m[0] == "tool"]
+        replies = [i for i, m in enumerate(self.messages) if m[0] == "assistant"]
+        pending = sum(1 for i in idx if i > replies[-1]) if replies else 0  # the round not answered yet stays
         freed = 0
-        for i in idx[: max(0, len(idx) - keep_last)]:
-            _, content, call_id = self.messages[i]
+        for k in self.maskable([len(self.messages[i][1]) for i in idx], pending, keep_last, keep_chars):
+            _, content, call_id = self.messages[idx[k]]
             new = marker(call_id, content)
             if new is not None and len(new) < len(content):
                 freed += len(content) - len(new)
-                self.messages[i] = ("tool", new, call_id)
+                if apply:
+                    self.messages[idx[k]] = ("tool", new, call_id)
         return freed
 
     def _reply(self, text: str, calls: list[ToolCall] | None = None, on_event=None) -> Turn:
