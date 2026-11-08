@@ -73,6 +73,47 @@ class AnthropicConversation(Conversation):
             }
         )
 
+    def mask_tool_results(self, keep_last: int, marker, *, keep_chars: int = 0, apply: bool = True) -> int:
+        """Masks the content of old tool_result blocks (string or text blocks; results with images are left alone).
+        Editing an earlier turn invalidates every later thinking block (Claude's history-editing check: a 400 on
+        enforced accounts), so when anything is masked every thinking block is dropped from the history too — the
+        model then simply continues without its earlier reasoning."""
+        slots = []  # (message index, block index) of every tool_result, oldest first
+        last_reply = max((i for i, m in enumerate(self.messages) if m.get("role") == "assistant"), default=-1)
+        for i, m in enumerate(self.messages):
+            if m.get("role") == "user" and isinstance(m.get("content"), list):
+                slots += [(i, j) for j, b in enumerate(m["content"]) if isinstance(b, dict) and b.get("type") == "tool_result"]
+
+        def text_of(block: dict) -> str | None:
+            c = block.get("content")
+            if isinstance(c, str):
+                return c
+            if isinstance(c, list) and all(isinstance(x, dict) and x.get("type") == "text" for x in c):
+                return "".join(x.get("text", "") for x in c)
+            return None  # images or other blocks: not masked
+
+        sizes = [len(text_of(self.messages[i]["content"][j]) or "") for i, j in slots]
+        pending = sum(1 for i, _ in slots if i > last_reply)
+        freed = 0
+        for k in self.maskable(sizes, pending, keep_last, keep_chars):
+            i, j = slots[k]
+            block = self.messages[i]["content"][j]
+            old = text_of(block)
+            if old is None:
+                continue
+            new = marker(block.get("tool_use_id", ""), old)
+            if new is not None and len(new) < len(old):
+                freed += len(old) - len(new)
+                if apply:
+                    self.messages[i]["content"][j] = {**block, "content": new}
+        if apply and freed:
+            for m in self.messages:
+                if m.get("role") == "assistant" and isinstance(m.get("content"), list):
+                    kept = [b for b in m["content"] if (b.get("type") if isinstance(b, dict) else getattr(b, "type", None))
+                            not in ("thinking", "redacted_thinking")]
+                    m["content"] = kept or [{"type": "text", "text": "(no visible reply)"}]
+        return freed
+
     def _params(self) -> dict:
         params: dict = {
             "model": self.model,
