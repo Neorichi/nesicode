@@ -11,13 +11,14 @@ import threading
 import time
 
 import pytest
-from test_p2_context import _client, _run
+from test_p2_context import _client, _run, agent, code, fake  # noqa: F401
 
 from nesicode.agent import Agent, Workspace
 from nesicode.agent import context as ctxm
 from nesicode.agent.hooks import Hooks
 from nesicode.harness import base_harness
 from nesicode.harness.base import LEGACY_RM_MATCHES, RM_MATCH
+from nesicode.llm.base import ToolCall, Turn, Usage
 
 ARCHIVE = ".nesicode/chats/1"
 
@@ -110,3 +111,33 @@ def test_stop_ends_search_history_soon_on_long_lines(tmp_path, shape):
     took = time.monotonic() - t0
     assert took < 2.0, f"search_history returned {took:.1f} s after it started (Stop at 0.3 s)"
     assert "stopped by the user" in res, res[-200:]
+
+
+# ====================================================================== ctx#2: CJK / base64 density
+@pytest.mark.parametrize("cpt", [1.3, 1.1])
+def test_summarizer_request_fits_the_window_on_cjk_dense_content(tmp_path, fake, cpt):
+    """CJK text and base64 run at 1-1.5 chars/token: a 1.5 floor on the measured density sized every summarizer request
+    over the window (40 of 41 rejected at 1.3, 44 of 44 at 1.1), and the retry measured the density but clamped it to the
+    same floor: every compaction fell back."""
+    rnd = random.Random(5)
+
+    def policy(conv, rec, on_event):
+        if rec["role"] == "summarizer":
+            return Turn("## Goal\nAuditar.\n## Next Step\nSeguir.", [], "end_turn", Usage(0, 300))
+        n = len(prov.executor())
+        if n >= 30:
+            return Turn("Fin.", [], "end_turn", Usage(0, 10))
+        text = f"Hallazgo {n}: " + " ".join(f"campo_{rnd.randint(0, 99)}={rnd.randint(0, 9999)}" for _ in range(120))
+        return Turn(text, [ToolCall(f"r{n}{j}", "read_file", {"path": f"src/m{(2 * n + j) % 7}.py"}) for j in range(2)],
+                    "tool_use", Usage(0, 300))
+    prov = fake(policy, window=131_072, cpt=cpt)
+    ws = Workspace(tmp_path / "ws")
+    (ws.root / "src").mkdir()
+    for i in range(7):
+        (ws.root / "src" / f"m{i}.py").write_text(code(rnd, 25_000))
+    events = []
+    agent(ws, events, context_limit=131_072, output_limit=32_768, max_steps=40).run("audita")
+    summ = [r for r in prov.log if r["role"] == "summarizer"]
+    assert summ, "no compaction happened"
+    assert not [r for r in summ if r["rejected"]], f"{sum(r['rejected'] for r in summ)}/{len(summ)} over the window"
+    assert not [e for e in events if e["type"] == "compacted" and e.get("fallback")]

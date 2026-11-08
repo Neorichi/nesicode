@@ -210,8 +210,9 @@ class Agent:
         self._anchor: tuple[int, int] | None = None  # (real prompt tokens of the last request, conversation chars then)
         self._cpt = ctxm.CHARS_PER_TOKEN  # chars per token seen in the provider's real counts (≤ the default)
         self._cpt_min = 3.0  # floor for that ratio; lowered when the provider proves the text is denser (_denser)
-        # the densest prompt measured in this run, without that floor (JSON/HTTP traffic, minified code, CJK: 2-3
-        # chars/token): sizes the summarizer's request, whose transcript is what the model read
+        # the densest prompt measured in this run, without that floor (JSON/HTTP traffic and minified code: 2-3
+        # chars/token; base64 and CJK text: 1-1.5): sizes the summarizer's request, whose transcript is what the model
+        # read. Its own floors only catch nonsense counts (1.0 from a whole prompt, 0.5 from the summarizer's own text)
         self._cpt_low = ctxm.CHARS_PER_TOKEN
         self._request_rel = ""  # where the user's full message was saved when it did not fit (written once per run)
         self._pending: list[tuple[ToolCall, ToolResult]] = []  # the tool round the model has not answered yet
@@ -342,7 +343,7 @@ class Agent:
         if input_tokens > 500:
             seen = (self._fixed_chars + self._conv_chars) / input_tokens
             self._cpt = max(self._cpt_min, min(ctxm.CHARS_PER_TOKEN, seen))
-            self._cpt_low = max(1.5, min(self._cpt_low, seen))
+            self._cpt_low = max(1.0, min(self._cpt_low, seen))
         self._anchor = (input_tokens, self._conv_chars)
 
     def _denser(self, error: str) -> None:
@@ -686,7 +687,7 @@ class Agent:
         if not learned and not sent:
             return False
         cpt = sent_chars / sent if sent else min(self._cpt, self._cpt_low) * 0.85
-        self._cpt_low = max(1.5, min(self._cpt_low, cpt))
+        self._cpt_low = max(0.5, min(self._cpt_low, cpt))  # (the provider counted exactly this text: trust it)
         if learned and learned < self.context_limit:
             self.context_limit = learned
             if self.on_limit:
