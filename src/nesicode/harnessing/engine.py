@@ -39,7 +39,10 @@ TRIM_NOTE = "\n\n... [evidence trimmed to fit the model's context window] ...\n\
 
 # A reply is read left to right: a <file> body is content (tags inside it are text); <notes> and inline
 # reasoning blocks are skipped, whatever tags they quote ("dropped -> <delete .../>", a <think> draft).
-TAG_RX = re.compile(r'<file path="([^"]+)">|<delete path="([^"]+)"\s*/>|<(notes|think|thinking|analysis)>')
+# The last group is a closing reasoning tag met outside any block (its opener was in the prompt).
+TAG_RX = re.compile(
+    r'<file path="([^"]+)">|<delete path="([^"]+)"\s*/>|<(notes|think|thinking|analysis)>|</(think|thinking)>'
+)
 REASONING_RX = re.compile(r"<(think|thinking|analysis)>.*?(?:</\1>|\Z)", re.S)
 CHOICE_RX = re.compile(r"<choice>\s*([A-Z])\s*</choice>")
 TRIGGER_RX = re.compile(r"load (?:the )?`([a-z0-9][a-z0-9_-]{0,47})` skill")
@@ -130,14 +133,23 @@ class Reply:
     complete: bool = False  # reached a closing </notes> (the end of a well-formed reply)
 
 
+ANSWER_BLOCKS = (('<file path="', "</file>"), ("<notes>", "</notes>"), ("<reasoning>", "</reasoning>"),
+                 ("<edits>", "</edits>"), ("<experience>", "</experience>"))
+
+
 def _after_orphan_close(text: str) -> str:
     """Some chat templates open <think> in the prompt, so the reply holds only the closing tag: what comes
-    before it is reasoning, not the answer."""
+    before it is reasoning, not the answer. A closing tag quoted inside an answer block ("candidate B leaked
+    </think>") is text: the last one outside every block is the real end of the reasoning."""
     for tag in ("think", "thinking"):
-        if f"</{tag}>" in text and f"<{tag}>" not in text:
-            head, tail = text.rsplit(f"</{tag}>", 1)
-            if head.rfind('<file path="') <= head.rfind("</file>"):  # not inside a file body (that is content)
-                text = tail
+        close = f"</{tag}>"
+        if close in text and f"<{tag}>" not in text:
+            i = len(text)
+            while (i := text.rfind(close, 0, i)) != -1:
+                head = text[:i]
+                if all(head.rfind(o) <= head.rfind(c) for o, c in ANSWER_BLOCKS):
+                    text = text[i + len(close):]
+                    break
     return text
 
 
@@ -147,12 +159,17 @@ def strip_reasoning(text: str) -> str:
 
 
 def scan_reply(reply: str) -> Reply:
-    """The edits of an improver reply, in order (see TAG_RX)."""
-    reply = _after_orphan_close(reply)
+    """The edits of an improver reply, in order (see TAG_RX).
+
+    Skipped as reasoning: a closed <think>/<thinking>/<analysis> block, one that opens the reply and never
+    closes (cut while thinking), and everything before a closing tag whose opener is not in the reply (chat
+    templates that open <think> in the prompt; drafts written there are not the answer). Tags quoted inside a
+    file body or the notes ("base1 leaked </think>") are text, and so is an opener named mid-reply that never
+    closes ("its <analysis> showed..."): neither may discard the edits around it."""
     files: list[tuple[str, str]] = []
     deletes: list[str] = []
     notes: list[str] = []
-    open_file, complete, pos = "", False, 0
+    open_file, complete, pos, reasoned = "", False, 0, False
     while m := TAG_RX.search(reply, pos):
         if m.group(1) is not None:
             end = reply.find("</file>", m.end())
@@ -165,14 +182,25 @@ def scan_reply(reply: str) -> Reply:
         elif m.group(2) is not None:
             deletes.append(m.group(2))
             pos = m.end()
+        elif m.group(4) is not None:  # a closing reasoning tag outside any block
+            if not reasoned:  # its opener was in the prompt: all so far was reasoning, drafts included
+                files, deletes, notes, complete, reasoned = [], [], [], False, True
+            pos = m.end()  # (after a reasoning block of the reply's own, it is just text)
         else:
             tag = m.group(3)
             end = reply.find(f"</{tag}>", m.end())
             if tag == "notes":
                 notes.append(reply[m.end():end if end != -1 else len(reply)].strip())
                 complete = complete or end != -1
-            if end == -1:  # an unclosed block runs to the end of the reply
-                break
+                if end == -1:  # unclosed notes run to the end of the reply
+                    break
+            else:
+                reasoned = True
+                if end == -1:
+                    if reply[:m.start()].strip():  # named mid-reply, never closed: prose, not a block
+                        pos = m.end()
+                        continue
+                    break  # reasoning that opens the reply and never closes: no answer follows
             pos = end + len(tag) + 3
     return Reply(files, deletes, "\n\n".join(n for n in notes if n), open_file, complete)
 
@@ -292,9 +320,10 @@ class HarnessingRun:
         self.usage = Usage()
         self._lock = threading.Lock()
         self.snapshot = self.run_dir / "source"
-        # every spelling of the run dir that can show up in output (as given / resolved, / or \), longest first
-        forms = {str(self.run_dir), self.run_dir.as_posix(), str(self.run_dir.resolve()), self.run_dir.resolve().as_posix()}
-        self._run_dirs = sorted(forms, key=len, reverse=True)
+        # every spelling of the run dir that can show up in output (absolute / resolved, / or \), longest first;
+        # never a relative one: "run" or "." would match ordinary words and dots
+        dirs = (self.run_dir.absolute(), self.run_dir.resolve())
+        self._run_dirs = sorted({f for d in dirs for f in (str(d), d.as_posix())}, key=len, reverse=True)
 
     # ---------------------------------------------------------------- utils
     def emit(self, event: dict) -> None:
@@ -640,10 +669,11 @@ class HarnessingRun:
             self.emit({"type": "phase", "phase": "reflect"})
             reflection = self._reflect(chosen)
             self._check_cancel()
+            self.cleanup_workspaces(keep=chosen)  # can take minutes with big projects (node_modules, .git)...
+            self._check_cancel()  # ...and a Stop pressed meanwhile still cancels: nothing applied or adopted
         except BaseException:
             self.cleanup_workspaces(snapshot=True)  # cancelled or failed: nothing will ever be applied
             raise
-        self.cleanup_workspaces(keep=chosen)
         adopted = self.harnesses.get(chosen, self.base)
         self.emit({"type": "phase", "phase": "done"})
         return {

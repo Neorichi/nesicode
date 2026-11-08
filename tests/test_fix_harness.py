@@ -664,3 +664,58 @@ def test_old_profile_wording_is_upgraded_not_kept_as_learned_text():
     assert prof.refresh_profile(old) == new and prof.refresh_profile(new) is None
     learned = dict(old, **{"memory.md": "- fact\n"})
     assert prof.refresh_profile(learned) == dict(new, **{"memory.md": "- fact\n"})
+
+
+# ------------------------------------------------------------------- review follow-ups
+def test_quoted_reasoning_tags_never_discard_a_proposal():
+    h = base_harness()
+    rule = h["guardrails.md"] + "- New rule.\n"
+    answer = f'<file path="guardrails.md">\n{rule}</file>\n'
+    replies = {
+        "notes quote a leaked closing tag": answer + "<notes>\nkept -> rule -> base1 leaked </think> in its answer\n</notes>",
+        "prose names an opener that never closes": "My <analysis> of the runs is in the notes.\n" + answer + "<notes>n</notes>",
+        "template reasoning, then notes quoting the tag": '<file path="memory.md">\n- DRAFT\n</file> no.</think>\n'
+                                                          + answer + "<notes>base1 printed </think></notes>",
+    }
+    for why, reply in replies.items():
+        new, touched = parse_edits(reply, h)
+        assert touched and "- New rule." in new["guardrails.md"], why
+        assert "DRAFT" not in new.get("memory.md", ""), why
+    # reasoning that opens the reply and never closes (cut while thinking) holds no answer
+    r = engine.scan_reply("<think>\nI will write:\n" + answer + "<notes>draft</notes>\nhmm")
+    assert r.files == [] and not r.complete
+
+
+def test_reflection_keeps_edits_that_quote_a_closing_think_tag(tmp_path, monkeypatch):
+    reply = ("<edits>\ncomponent: guardrails.md\nobserved: base1 printed </think> in its final answer\n</edits>\n"
+             "<experience>\ncue: reasoning models\nlesson: strip think tags\nevidence: base1\nconfidence: low\n</experience>")
+    use_improver(monkeypatch, lambda role, prompt, o: reply)
+    out = make_run(tmp_path)._reflect("base1")
+    assert "printed </think>" in out["edits"] and out["experience"]["lesson"] == "strip think tags"
+
+
+def test_stop_during_the_final_cleanup_cancels_the_run(tmp_path):
+    cancel = threading.Event()
+    hr = make_run(tmp_path, cancel=cancel)
+    orig = hr.cleanup_workspaces
+
+    def cleanup(keep=None, snapshot=False):
+        if keep is not None:
+            cancel.set()  # Stop pressed while the other copies are deleted (minutes with a big project)
+        orig(keep=keep, snapshot=snapshot)
+
+    hr.cleanup_workspaces = cleanup
+    with pytest.raises(RuntimeError, match="cancelled"):
+        hr.run()  # so jobs neither applies nor adopts
+    rd = tmp_path / "run"
+    assert not (rd / "source").exists() and not list(rd.glob("rollouts/*/ws"))
+
+
+def test_blind_never_rewrites_ordinary_text_for_a_relative_run_dir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "src").mkdir()
+    cfg = HarnessingConfig(task="t", executor_model="mock/demo", improver_model="mock/demo")
+    hr = HarnessingRun(cfg, base_harness=base_harness(), source_ws=Path("src"), run_dir=Path("r"))
+    ws = (tmp_path / "r/rollouts/base1/ws").resolve()
+    out = hr._blind(f"error: result was wrong ({ws}/t.py, rollouts/agg1/ws/t.py)")
+    assert out == "error: result was wrong (<workspace>/t.py, rollouts/<candidate>/ws/t.py)"
