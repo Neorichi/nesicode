@@ -134,12 +134,15 @@ def summary(doc: dict) -> dict:
         "telegram": bool(doc.get("telegram")),
         "role_models": {k: v for k, v in (doc.get("role_models") or {}).items() if v and k in ROLE_KEYS},
         "bots": [b["name"] for b in doc.get("bots") or []],
-        # what the names stand for: where providers point, what connectors run, the preferences' values
+        # what the names stand for: where providers point, what connectors run (and the environment variables their
+        # fields set), the preferences' values
         "details": {
             "providers": [{"name": p["name"], "kind": p.get("kind"), "base_url": p.get("base_url")} for p in doc.get("providers", [])],
             "connectors": [{"name": c["name"], "kind": c.get("kind"), "enabled": bool(c.get("enabled", 1)),
                             "command": " ".join([c.get("command") or "", *c.get("args", [])]).strip(), "url": c.get("url") or "",
-                            "usage": c.get("usage") or "mention"}
+                            "usage": c.get("usage") or "mention",
+                            "env": sorted({f["env"] for f in c.get("fields") or [] if isinstance(f, dict) and f.get("env")
+                                           and isinstance(f["env"], str)})}
                            for c in doc.get("connectors", [])],
             "settings": {k: v for k, v in (doc.get("settings") or {}).items() if k not in ("project_template", "pending_bots")},
             "check_command": (t or {}).get("check_command") or "",
@@ -263,6 +266,15 @@ def validate_import(doc: dict, *, auth_enabled: bool, check_url: Callable[[str],
         if catalog_stdio:
             fields = [{k: v for k, v in f.items() if k in ("key", "label", "secret", "header", "prefix", "env")}
                       for f in entry.get("fields", []) if not f.get("url_param")]
+        elif kind == "stdio":
+            # Any other command from a file is reviewed as the command line it shows, so nothing else of the file may
+            # reach its process: environment variables would run other code than that (NODE_OPTIONS=--import=…,
+            # PYTHONPATH, PATH, npm_config_registry…). It comes as the API makes one — no fields (a header means
+            # nothing to a local command) —, and the review names what was left out.
+            if dropped := sorted({f["env"] for f in fields if f.get("env")}):
+                notes.append(f"{tag}: se importa sin las variables de entorno que traía ({', '.join(dropped)[:200]}): "
+                             "con ellas su comando podría ejecutar código distinto del que revisas")
+            fields = []
         secret_keys = {f["key"] for f in fields if f.get("secret")}
         raw = c.get("secrets") if isinstance(c.get("secrets"), dict) else {}
         enabled = bool(c.get("enabled", True))

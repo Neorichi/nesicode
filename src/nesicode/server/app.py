@@ -59,6 +59,78 @@ db = DB(settings.db_path)
 vault = Vault(db)
 auth.migrate_legacy_keys(db)
 
+# The base harness's texts as v0.3.1 shipped them: every project created before carries them in its own versions.
+RM_GUARD_0_3 = r"rm\s+-rf\s+(/|~|\$HOME)(\s|$)"
+TOOL_GUIDANCE_0_3 = (
+    "- `edit_file` needs an exact, unique `old` string: read the file first and copy the text exactly.",
+    "- Use `search` to find code before reading whole directories.",
+    "- `bash` runs from the workspace root with a timeout; avoid interactive or long-running servers.",
+)
+
+
+def _rm_guard_upgraded(raw: str, new: str) -> str | None:
+    """hooks.json with v0.3.1's rm guard (a pre_tool rule whose `match` is exactly its regex) matching `new` instead —
+    every other rule, and the file's own layout, as they were — or None when it has no such rule."""
+    try:
+        hooks = json.loads(raw or "{}")
+    except ValueError:
+        return None
+    rules = hooks.get("pre_tool") if isinstance(hooks, dict) else None
+    old = [r for r in rules if isinstance(r, dict) and r.get("match") == RM_GUARD_0_3] if isinstance(rules, list) else []
+    if not old:
+        return None
+    for rule in old:
+        rule["match"] = new
+    text = raw.replace(json.dumps(RM_GUARD_0_3), json.dumps(new))  # only that string changes…
+    try:
+        if json.loads(text) == hooks:
+            return text
+    except ValueError:
+        pass
+    return json.dumps(hooks, indent=2, ensure_ascii=False) + "\n"  # …unless it was spelled otherwise: written anew
+
+
+def _upgrade_shipped_harness() -> None:
+    """What every project keeps of v0.3.1's base harness, brought up to today's. Its rm guard let `rm -rf ~/`,
+    `rm -fr ~`, `rm -rf /*`, `rm -r -f ~`, `rm -rf "$HOME"`, `rm --recursive --force /`… through: that exact regex
+    becomes today's wherever it is (a safety rule, like the credentials one: also in an older version restored later),
+    nothing else of hooks.json changes. Its tool guidance lacks today's lines (write conclusions down before old context
+    is dropped): they go right after the base lines, where a new project has them, into a tool guidance that still has
+    those lines, and only once — a project that already had them keeps them out if harnessing or the user removed them."""
+    base = base_harness()
+    rm_rule = None  # today's guard: the base rule that blocks what the old one let through
+    for rule in json.loads(base.get("plugins/hooks.json") or "{}").get("pre_tool", []):
+        try:
+            if rule.get("action") == "block" and re.search(rule.get("match") or "(?!)", "rm -rf ~/"):
+                rm_rule = rule["match"]
+                break
+        except re.error:
+            continue
+    extra = [line for line in base.get("tool_guidance.md", "").split("\n") if line.strip() and line not in TOOL_GUIDANCE_0_3]
+    seen = json.dumps(extra[0], ensure_ascii=False)[1:-1] if extra else ""  # (as harness_versions.files stores it)
+    for p in db.all("SELECT * FROM projects"):
+        try:
+            files, notes = current_harness(db, p), []
+            hooks = _rm_guard_upgraded(files.get("plugins/hooks.json", ""), rm_rule) if rm_rule else None
+            if hooks is not None:
+                files = {**files, "plugins/hooks.json": hooks}
+                notes.append("bloqueo de «rm -rf» de la raíz y del home más completo")
+            lines = files.get("tool_guidance.md", "").split("\n")
+            if (extra and not any(line in lines for line in extra) and all(line in lines for line in TOOL_GUIDANCE_0_3)
+                    and not db.one("SELECT 1 FROM harness_versions WHERE project_id=? AND instr(files, ?) > 0 LIMIT 1",
+                                   (p["id"], seen))):
+                at = lines.index(TOOL_GUIDANCE_0_3[-1]) + 1
+                files = {**files, "tool_guidance.md": "\n".join(lines[:at] + extra + lines[at:])}
+                notes.append("pauta para anotar cada conclusión antes de que se recorte el contexto")
+            if notes:
+                save_harness_version(db, p["id"], files, "base", "Nesicode: " + "; ".join(notes))
+        except Exception as exc:  # one odd project must never keep the app from starting
+            print(f"nesicode: could not upgrade the harness of project {p['id']}:", exc)
+
+
+# (first: the next upgrade recognises an untouched older base harness by today's hooks and tool guidance)
+_upgrade_shipped_harness()
+
 
 def _upgrade_base_harness() -> None:
     """Projects still on the untouched previous base harness get the new built-in `documents` skill."""
@@ -97,10 +169,14 @@ PROFILE_REFRESH_NOTE = "Perfil actualizado: el informe sigue el formato que pida
 def _refresh_profiles() -> None:
     """Projects whose harness still holds an earlier shipped wording of their profile's own texts (e.g. the security
     report step that hard-coded report.md) get today's, as a new version. Only those verbatim texts change, never
-    what the project learned (profiles.refresh_profile); later startups find nothing to do."""
+    what the project learned (profiles.refresh_profile). Once per project: a project that already got it and holds
+    the old wording again — the user restored an older version on purpose — keeps it (a later change of the shipped
+    texts needs a note of its own)."""
     from ..harness.profiles import refresh_profile
 
     for p in db.all("SELECT * FROM projects"):
+        if db.one("SELECT 1 FROM harness_versions WHERE project_id=? AND note=? LIMIT 1", (p["id"], PROFILE_REFRESH_NOTE)):
+            continue
         try:
             files = refresh_profile(current_harness(db, p))
             if files is not None:
@@ -1484,7 +1560,10 @@ def _connector_view(user_id: int) -> list[dict]:
         fields = []
         for f in loads(row["fields"], []):
             hint = vault.hint(user_id, f"connector:{row['name']}:{f['key']}") if f.get("secret") else None
-            fields.append({"key": f["key"], "label": f.get("label", f["key"]), "secret": bool(f.get("secret")), "hint": hint})
+            # where its value goes: the environment variable / HTTP header it sets (only those that are really set)
+            fields.append({"key": f["key"], "label": f.get("label", f["key"]), "secret": bool(f.get("secret")), "hint": hint,
+                           "env": f.get("env") if f.get("env") in cfg.env else None,
+                           "header": f.get("header") if f.get("header") in cfg.headers else None})
         out.append({
             "name": row["name"], "label": row["label"], "template": row["template"], "kind": row["kind"],
             "command": " ".join([row["command"], *loads(row["args"], [])]).strip(), "url": row["url"],
@@ -2775,10 +2854,11 @@ def cage_changes(base: dict, cage: Path, project: Path, max_chars: int = 80_000)
 
 
 def prepare_targets(root: Path, writes: list[str], removes: list[str]) -> None:
-    """Before copying changes onto the project (apply_cage / apply_changes write with plain open()): a path
-    whose folders go through a link — or meet a file, FIFO… where a folder should be — refuses the whole
-    apply; a link AT a path about to be written is removed first, so the copy replaces the link instead of
-    writing wherever it points. Call it holding the project lock (shared-workspace runs hold it too)."""
+    """Before a conversation's changes are copied onto the project (apply_cage writes with plain open() and is not
+    three-way; a harnessing run's «Aplicar» never uses this, see apply_run): a path whose folders go through a link —
+    or meet a file, FIFO… where a folder should be — refuses the whole apply; a link AT a path about to be written is
+    removed first, so the copy replaces the link instead of writing wherever it points. Call it holding the project
+    lock (shared-workspace runs hold it too)."""
     import stat as _stat
 
     blocked, links, writing = [], [], set(writes)
@@ -3175,17 +3255,14 @@ def apply_run(run_id: int, user: dict = Depends(current_user)):
     run, p = get_run(user, run_id)
     if run["kind"] != "harness" or run["status"] != "done":
         raise HTTPException(422, "Solo se pueden aplicar ejecuciones de harnessing terminadas")
-    from ..agent.workspace import diff_workspaces
-
-    selected = (loads(run["result"], {}) or {}).get("selected")
-    rd = run_dir(p, run_id)
-    after = rd / "rollouts" / str(selected) / "ws"
-    if selected and after.is_dir():  # the same links/odd-files check as a conversation's apply
-        with project_lock(p["id"]):
-            d = diff_workspaces(rd / "source", after, max_chars=0)
-            prepare_targets(project_ws(p), d["added"] + d["modified"], d["removed"])
+    # Straight to the three-way apply (apply_later → apply_rollout), never a conversation's prepare_targets first: the
+    # apply compares the project with the run's snapshot, so removing a link the result rewrote made the user's
+    # untouched file look deleted (a false 'changed' conflict, the file gone, the copies dropped), and a link the user
+    # made where the result adds a file was silently replaced. apply_rollout itself never writes through a link (a
+    # link on the way is that file's 'unsafe' conflict, the rest applies), replaces a link only where the project
+    # still matches the snapshot, and takes the project lock without waiting long (ProjectBusy -> 409).
     try:
-        return {"changes": jobs.apply_later(run_id, p)}  # (a lock still taken by then: ProjectBusy -> 409)
+        return {"changes": jobs.apply_later(run_id, p)}
     except FileNotFoundError as exc:  # (copies dropped once applied, or pruned: never "run it again" for applied ones)
         raise HTTPException(410, "Ya no se puede aplicar: las copias del proyecto de esta ejecución ya no existen (sus "
                                  "cambios ya se aplicaron, o se borraron para liberar espacio: solo se guardan las de las "

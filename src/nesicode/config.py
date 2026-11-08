@@ -9,12 +9,44 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def _read_dotenv(path: Path) -> str | None:
+    """The text of a .env as Windows tools write it too: UTF-8 with or without a BOM (PowerShell 5.1 `-Encoding UTF8`,
+    older Notepad), UTF-16 with a BOM (PowerShell 5.1 `echo … > .env`, Out-File) or the ANSI code page (Set-Content).
+    None, with a warning naming the file, when it cannot be read: the app still starts (this runs at import, before
+    the desktop app even opens its log)."""
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        print(f"nesicode: could not read {path} ({exc}); its settings were not loaded", file=sys.stderr)
+        return None
+    if data[:4] in (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff"):
+        encodings = ["utf-32"]
+    elif data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        encodings = ["utf-16"]
+    else:
+        import locale
+
+        encodings = ["utf-8-sig", locale.getpreferredencoding(False), "cp1252"]
+    for enc in encodings:
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    print(f"nesicode: {path} is not text in a known encoding (save it as UTF-8); its settings were not loaded",
+          file=sys.stderr)
+    return None
+
+
 def _load_dotenv(path: Path) -> None:
-    """Minimal .env loader: KEY=VALUE lines, existing env vars win."""
+    """Minimal .env loader: KEY=VALUE lines, existing env vars win. A line the environment cannot hold (no name, a NUL
+    character) is skipped: a .env must never keep the app from starting."""
     if os.environ.get("NESICODE_NO_DOTENV") == "1" or not path.is_file():
         return
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
+    text = _read_dotenv(path)
+    if text is None:
+        return
+    for raw in text.splitlines():
+        line = raw.strip().lstrip("\ufeff")  # (a BOM inside: files joined with `type a b > .env`)
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
@@ -24,7 +56,12 @@ def _load_dotenv(path: Path) -> None:
             value = value[1 : 1 + value[1:].find(value[0])]
         else:
             value = "" if value.startswith("#") else re.split(r"\s+#", value, maxsplit=1)[0].strip()
-        os.environ.setdefault(key, value)
+        if not key or "\0" in key + value:
+            continue
+        try:
+            os.environ.setdefault(key, value)
+        except (ValueError, OSError):  # a name the system refuses
+            continue
 
 
 def app_data_dir() -> Path:
