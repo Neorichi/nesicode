@@ -173,6 +173,63 @@ def test_apply_reports_a_path_through_a_linked_folder_and_applies_the_rest(tmp_p
     assert (rd / "source").is_dir()  # kept: once the links are gone, «Aplicar» again
 
 
+def test_apply_never_writes_through_a_project_link_that_leads_out_of_it(tmp_path):
+    """(check) What prepare_targets did for «Aplicar» before, now apply_rollout's job: a file the result changed whose
+    path in the project is a link out of it is never written through. The user's untouched link (as in the snapshot)
+    gives way to the result's file; one the user made since is theirs: a 'changed' conflict, the proposal beside it."""
+    c = _user("fg")
+    p = _project(c)
+    ws = Path(p["workspace"])
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    for name in ("guide.md", "victim.txt"):
+        (outside / name).write_text("outside\n")
+    os.symlink(outside / "guide.md", ws / "GUIDE.md")
+    (ws / "a.txt").write_text("orig\n")
+
+    def change(after):
+        for name in ("GUIDE.md", "a.txt"):
+            os.unlink(after / name)
+            (after / name).write_text("from the run\n")
+
+    rid, _ = _harness_run(p, change)
+    os.unlink(ws / "a.txt")
+    os.symlink(outside / "victim.txt", ws / "a.txt")  # the user's own change since the run started
+    r = c.post(f"/api/runs/{rid}/apply")
+    assert r.status_code == 200, r.text
+    assert r.json()["changes"]["modified"] == ["GUIDE.md"]
+    assert r.json()["changes"]["conflicts"] == [{"path": "a.txt", "reason": "changed", "side_file": "a.txt.nesicode-new"}]
+    assert [(outside / n).read_text() for n in ("guide.md", "victim.txt")] == ["outside\n", "outside\n"]
+    assert not (ws / "GUIDE.md").is_symlink() and (ws / "GUIDE.md").read_text() == "from the run\n"
+    assert os.readlink(ws / "a.txt") == str(outside / "victim.txt")
+    assert (ws / "a.txt.nesicode-new").read_text() == "from the run\n"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
+def test_apply_never_blocks_on_a_fifo_in_the_project():
+    """(check) A FIFO where the result changes a file was refused up front before (prepare_targets): opening it would
+    block «Aplicar» — the request and the project's lock — for good. It is a conflict now, and nothing waits."""
+    import threading
+
+    c = _user("fh")
+    p = _project(c)
+    ws = Path(p["workspace"])
+    (ws / "pipe").write_text("x\n")
+    rid, _ = _harness_run(p, lambda after: (after / "pipe").write_text("y\n"))
+    os.unlink(ws / "pipe")
+    os.mkfifo(ws / "pipe")
+    res = {}
+    t = threading.Thread(target=lambda: res.setdefault("r", c.post(f"/api/runs/{rid}/apply")), daemon=True)
+    t.start()
+    t.join(30)
+    if t.is_alive():  # unblock it before failing, so the session can end
+        with open(ws / "pipe", "w"):
+            pass
+        pytest.fail("«Aplicar» blocked on a FIFO")
+    assert res["r"].status_code == 200, res["r"].text
+    assert res["r"].json()["changes"]["conflicts"] == [{"path": "pipe", "reason": "changed", "side_file": "pipe.nesicode-new"}]
+
+
 # ------------------------------------------------------------------ runtime#4: the profile refresh runs once per project
 def test_the_profile_refresh_runs_once_and_never_undoes_a_restored_version():
     from nesicode.harness import profiles
