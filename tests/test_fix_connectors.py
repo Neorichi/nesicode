@@ -280,7 +280,7 @@ def test_mcp_crashed_stdio_server_is_noticed_and_restarted(mcp_server, mgr):
 class _HttpMcp:
     """A streamable-HTTP MCP server on 127.0.0.1 (in a thread); each instance has its own identity."""
 
-    def __init__(self, port: int):
+    def __init__(self, port: int, wrap=None):
         import uuid
 
         import uvicorn
@@ -294,7 +294,8 @@ class _HttpMcp:
             """Which server instance answered."""
             return ident
 
-        self.server = uvicorn.Server(uvicorn.Config(app.streamable_http_app(), host="127.0.0.1", port=port,
+        asgi = app.streamable_http_app()
+        self.server = uvicorn.Server(uvicorn.Config(wrap(asgi) if wrap else asgi, host="127.0.0.1", port=port,
                                                     log_level="error", timeout_graceful_shutdown=1))
         self.thread = threading.Thread(target=self.server.run, daemon=True)
         self.thread.start()
@@ -847,3 +848,208 @@ def test_pptx_16_9_slides_use_stretched_layouts(tmp_path):
         lefts, rights = [s.left for s in shapes], [s.left + s.width for s in shapes]
         assert abs((min(lefts) + max(rights)) / 2 - width / 2) < Cm(0.5)  # centred on the 16:9 slide
         assert width - max(rights) < Cm(3)  # no ~10 cm empty band on the right
+
+
+# ====================================================================== review: regressions found in the fixes above
+# Nesicode's own tool names, as connector_context adds them to the text the mention check reads
+_OWN_TOOLS = " ".join(["bash", "edit_file", "http_fetch", "list_dir", "load_skill", "read_file", "search", "search_history",
+                       "share_file", "view_image", "write_file"])
+
+
+def test_custom_connectors_ignore_tool_names_and_everyday_words():
+    from nesicode.connectors import mentioned
+
+    coding = "fix the failing test in parser.py " + _OWN_TOOLS
+    for label in ("Brave Search", "Web Search", "Exa search", "Image generator", "File server", "Jira Cloud", "Context7 docs"):
+        assert not _custom(coding, label), label  # 'search', 'image', 'file' come from the agent's own tools
+    assert not _custom("deploy it to the cloud", "Jira Cloud") and not _custom("actualiza los docs", "Context7 docs")
+    assert not _custom("revisa los archivos del proyecto", "Servidor de archivos")
+    assert _custom("busca con Brave el changelog", "Brave Search") and _custom("crea un ticket en Jira", "Jira Cloud")
+    assert _custom("sigue " + _OWN_TOOLS + " mcp__brave-search__brave_web_search", "Brave Search")  # its own tools: sticky
+    assert _custom("usa context7 para la API de React", "Context7 docs")
+    assert not _custom("compara React vs Vue", "VS Code") and _custom("ábrelo en VS Code", "VS Code")
+    for label in ("Datos", "API", "Local"):  # a one-word label stays its trigger, even a generic word (as before)
+        assert _custom(f"usa {label} para esto", label), label
+    assert not _custom("mcp__office__word_write mcp__github__search", "MCP")  # the fallback name never matches
+    for text in ("write the number in words", "mark my words", "in your words, what happened?", "a sentence with words"):
+        assert not mentioned(text, **OFFICE), text
+    assert mentioned("ábrelo con Word", **OFFICE) and mentioned("open it in Word", **OFFICE)
+
+
+def test_excel_number_format_refuses_huge_ranges_before_creating_cells(tmp_path):
+    from openpyxl import load_workbook
+
+    ws = Workspace(tmp_path / "ws")
+    call = _office(ws)
+    t0 = time.time()
+    for rng in ("A1:XFD1048576", "1:1048576", "B2:B200000"):  # openpyxl creates every cell of a range it is asked for
+        with pytest.raises(ToolError, match="more than"):
+            call("excel_write", path="big.xlsx", rows=[["a", 1], ["b", 2]], number_format={rng: "0%"})
+    assert time.time() - t0 < 3 and not (ws.root / "big.xlsx").exists()
+    call("excel_write", path="ok.xlsx", rows=[["a", 1], ["b", 2]], number_format={"B:B": "0%", "1:1": "@"})
+    sh = load_workbook(ws.root / "ok.xlsx").active
+    assert sh["B2"].number_format == "0%" and sh["A1"].number_format == "@" and sh.max_row == 2
+
+
+def _para(doc, *runs):
+    """A paragraph from runs; each run a list of: text, '\\t', '\\n', 'PIC' (a drawing) or 'PAGE' (page break)."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    p = doc.add_paragraph()
+    for parts in runs:
+        r = p.add_run()._r
+        for part in parts:
+            if part in ("\t", "\n", "PIC", "PAGE"):
+                el = OxmlElement({"\t": "w:tab", "\n": "w:br", "PIC": "w:drawing", "PAGE": "w:br"}[part])
+                if part == "PAGE":
+                    el.set(qn("w:type"), "page")
+            else:
+                el = OxmlElement("w:t")
+                el.text = part
+                el.set(qn("xml:space"), "preserve")
+            r.append(el)
+    return p
+
+
+def test_word_replace_reads_tabs_breaks_and_objects_like_word(tmp_path):
+    from docx import Document
+    from docx.oxml.ns import qn
+
+    ws = Workspace(tmp_path / "ws")
+    call = _office(ws)
+    d = Document()
+    _para(d, ["A"], ["\t"], ["B"])  # 'A<tab>B' is not 'AB'
+    _para(d, ["{{a"], ["\n", "b}}"])  # nor is '{{a<line break>b}}' '{{ab}}'
+    _para(d, ["{{c", "PIC", "d}}"])  # nor across a picture
+    _para(d, ["Fecha:", "\t", "{{fecha}}"])  # a find copied from office_read, with its tab
+    _para(d, ["Lista: {{items}} fin"])
+    d.save(ws.root / "t.docx")
+    text, _ = call("word_replace", path="t.docx", replacements=[
+        {"find": "AB", "replace": "X"}, {"find": "{{ab}}", "replace": "X"}, {"find": "{{cd}}", "replace": "X"},
+        {"find": "Fecha:\t{{fecha}}", "replace": "Fecha:\t1/1/2026"}, {"find": "{{items}}", "replace": "uno\ndos\tbis"}])
+    assert "'AB'×0" in text and "'{{ab}}'×0" in text and "'{{cd}}'×0" in text
+    assert "'Fecha:\\t{{fecha}}'×1" in text and "'{{items}}'×1" in text
+    out = Document(ws.root / "t.docx")
+    assert [p.text for p in out.paragraphs] == ["A\tB", "{{a\nb}}", "{{cd}}", "Fecha:\t1/1/2026", "Lista: uno\ndos\tbis fin"]
+    assert out.paragraphs[2]._p.find(f".//{qn('w:drawing')}") is not None
+    last = out.paragraphs[4]._p  # the replacement's line break and tab are real elements, in the same run
+    assert len(last.findall(f".//{qn('w:br')}")) == 1 and len(last.findall(f".//{qn('w:tab')}")) == 1
+    assert len(last.findall(qn("w:r"))) == 1
+
+
+def test_word_replace_matches_str_replace_on_what_word_shows():
+    """Random paragraphs (runs, tabs, breaks, page breaks, pictures, hyperlinks): after replacing, the text Word
+    shows is exactly str.replace of the text before, and the count is exact."""
+    import random
+
+    from docx import Document
+    from docx.oxml import OxmlElement
+
+    from nesicode.office import _atoms, _replace_in_paragraph
+
+    rnd = random.Random(1234)
+    for _ in range(200):
+        d = Document()
+        runs = [[rnd.choice(["\t", "\n", "PIC", "PAGE"]) if rnd.random() < .3 else "".join(rnd.choice("ab{}") for _ in range(rnd.randint(0, 4)))
+                 for _ in range(rnd.randint(1, 4))] for _ in range(rnd.randint(1, 5))]
+        p = _para(d, *runs)
+        if rnd.random() < .3:
+            h, r, t = OxmlElement("w:hyperlink"), OxmlElement("w:r"), OxmlElement("w:t")
+            t.text = rnd.choice(["ab", "{a", "b}"])
+            r.append(t)
+            h.append(r)
+            p._p.insert(rnd.randint(1, len(p._p)), h)
+        before = "".join(t for _, t in _atoms(p._p))
+        find = "".join(rnd.choice("ab{}\t\n") for _ in range(rnd.randint(1, 4)))
+        repl = "".join(rnd.choice("xy\t\n") for _ in range(rnd.randint(0, 4)))
+        assert _replace_in_paragraph(p._p, find, repl) == before.count(find)
+        after = "".join(t for _, t in _atoms(p._p))
+        assert after == before.replace(find, repl), (before, find, repl)
+        assert p.text == after.replace("\x00", "")  # python-docx reads the same text
+
+
+def test_mcp_session_loss_is_only_the_transports_own_answer():
+    from mcp.shared.exceptions import MCPError
+
+    from nesicode.connectors import _lost
+
+    for msg in ("Session not found", "Bad Request: No valid session ID provided", "Not Found: Invalid or expired session ID",
+                "Bad Request: Server not initialized", "Session terminated", "Session not found: e7e6e3d9f178"):
+        assert _lost(MCPError(-32600, msg)) == "gone", msg
+    for msg in ("tool failed: invalid session token for Jira", "Invalid session token", "Timed out while waiting for response"):
+        assert _lost(MCPError(-32600, msg)) == "", msg  # a tool's own error: it ran, never repeat it
+    assert _lost(MCPError(-32603, "Server returned an error response")) == "suspect"
+    assert _lost(MCPError(-32000, "Connection closed")) == "closed"
+
+
+def test_mcp_http_server_answering_plain_400_is_reconnected(mgr):
+    """python-sdk 1.x servers answer an unknown session with a plain-text 400 ('Server returned an error response'
+    in our client): after such a server restarts, the next call must start a new session."""
+    from nesicode.connectors import ConnectorConfig
+
+    def old_sdk(app):
+        async def wrapped(scope, receive, send):
+            if scope["type"] != "http":
+                return await app(scope, receive, send)
+            swapped = []
+
+            async def snd(msg):
+                if msg["type"] == "http.response.start" and msg["status"] == 404:
+                    swapped.append(1)
+                    body = b"Bad Request: No valid session ID provided"
+                    await send({"type": "http.response.start", "status": 400,
+                                "headers": [(b"content-type", b"text/plain"), (b"content-length", str(len(body)).encode())]})
+                    await send({"type": "http.response.body", "body": body})
+                elif not swapped:
+                    await send(msg)
+
+            await app(scope, receive, snd)
+        return wrapped
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    srv = _HttpMcp(port, wrap=old_sdk)
+    cfg = ConnectorConfig(name="old-sdk", kind="http", url=f"http://127.0.0.1:{port}/mcp")
+    try:
+        mgr.tools(1, cfg, timeout=20)
+        assert mgr.call(1, cfg, "who", {}).text == srv.ident
+        srv.stop()
+        srv = _HttpMcp(port, wrap=old_sdk)
+        with pytest.raises(Exception, match="error response"):  # not repeated: a 500 after running looks the same
+            mgr.call(1, cfg, "who", {})
+        assert mgr.status(1, cfg) == "error"
+        assert mgr.call(1, cfg, "who", {}).text == srv.ident and mgr.status(1, cfg) == "running"
+    finally:
+        srv.stop()
+
+
+def test_mcp_stop_waits_for_a_start_that_timed_out(mcp_server, mgr, tmp_path, monkeypatch):
+    import mcp.client.stdio as mstdio
+
+    monkeypatch.setattr(mstdio, "PROCESS_TERMINATION_TIMEOUT", 0.5)
+    pidfile = tmp_path / "mute.pid"
+    cfg = _stdio("mute", mcp_server, "mute", str(pidfile))
+    with pytest.raises(RuntimeError, match="no respondió"):
+        mgr.tools(1, cfg, timeout=1)
+    pid = int(pidfile.read_text())
+    mgr.stop(1, "mute")  # Probar / Eliminar right after: the old process is gone when stop() returns
+    assert not _alive(pid) and not mgr.dying
+
+
+def test_mcp_stop_while_starting_is_not_undone(mcp_server, mgr):
+    """stop() lands while tools() is finishing the start: tools() must not record the connector as started."""
+    from nesicode.connectors import _Connection
+
+    cfg = _stdio("racy", mcp_server)
+    conn = _Connection(cfg, 1)
+    conn.session = object()  # it had just answered initialize...
+    conn.ready.set()
+    conn.stop.set()  # ...when the user pressed Desactivar
+    mgr.conns[cfg.key(1)] = conn
+    with pytest.raises(RuntimeError, match="se detuvo"):
+        mgr.tools(1, cfg, timeout=5)
+    assert (1, "racy") not in mgr.started
+    with pytest.raises(RuntimeError, match="turned off"):
+        mgr.call(1, cfg, "pid", {})

@@ -114,17 +114,27 @@ ALIASES = {
 # Generic words that count only in a phrase that clearly names the product ('hazme un Word', 'in Word',
 # 'Word document', 'roadmap de Microsoft'). Regexes over the normalised text (see _norm).
 PHRASES = {
-    "office": [r"(?:un|una|el|al|del|de|en|con|usa|usar|use|using|in|into|with|mi|my|tu|your|este|ese) words?",
+    # singular only: the plural after these words is the English noun ('in words', 'mark my words', 'in your words')
+    "office": [r"(?:un|una|el|al|del|de|en|con|usa|usar|use|using|in|into|with|mi|my|tu|your|este|ese) word",
                r"words? (?:docs?|documents?|files?|templates?|documentos?|archivos?|ficheros?|plantillas?)"],
     "ms-roadmap": [r"(?:microsoft|m365|365|azure) roadmaps?",
                    r"roadmaps? (?:de |del |of |for )?(?:microsoft|m365|office 365|azure)"],
 }
 # Words that don't identify a custom connector on their own ('Linear de mi equipo', 'Servidor Jira', 'MCP local').
+# The second group: the words of Nesicode's own tool names, which the mention check sees in almost every conversation
+# (connector_context lists the tools used: 'search', 'read_file', 'view_image'…), and everyday words of coding and
+# office talk. 'Brave Search' must not switch on whenever the agent searched the code, nor 'Jira Cloud' at "the cloud".
 _GENERIC = frozenset("""
     a al an and at con de del e el en for in la las lo los mi mis my o of on or our para por su sus the their to tu tus
     u un una unas unos with y your api base cliente client company conector connector cuenta account data datos dev
     empresa equipo home interno internal local mcp new nueva nuevo oficina personal prod produccion production prueba
     pruebas remote remoto server servicio service servidor team test trabajo work casa
+    back bash bot chart click close create delegate delete dir edit fetch file files get history http image images list
+    load memory notify once open read replace report scan schedule screenshot scroll search set share skill tab tabs
+    type url view write
+    archivo archivos buscador busqueda cloud code codigo doc docs document documento documentos documents error errores
+    errors fichero ficheros google herramienta herramientas microsoft tool tools web
+    as be by do if is it me no se si so te up us vs we ya yo
 """.split())
 
 
@@ -153,7 +163,8 @@ def _phrase_re(words: list[str]) -> re.Pattern:
 def trigger_words(name: str = "", label: str = "", template: str = "") -> list[str]:
     """The words that switch an 'only when I ask' connector on (for the UI / the agent's suggestion)."""
     custom = template not in ALIASES
-    phrases = [label.split("(")[0], name] if custom else list(ALIASES[template]) + [name]
+    whole = label.split("(")[0]
+    phrases = [whole, name] if custom else list(ALIASES[template]) + [name]
     if custom:  # plus each distinctive word of its label and name ('Confluence empresa' → 'confluence')
         for src in (label, name):
             words = [w for w in _norm(src).split() if w not in _GENERIC]
@@ -161,10 +172,12 @@ def trigger_words(name: str = "", label: str = "", template: str = "") -> list[s
             # 2-letter words count when they are all there is ('DB', 'Mi DB') or carry a digit ('AWS S3')
             phrases += [w for w in words if len(w) >= 3 or _wide(w) or (len(w) == 2 and (short_only or any(c.isdigit() for c in w)))]
     out: list[str] = []
-    for ph in phrases:
+    for i, ph in enumerate(phrases):
         words = _norm(ph).split()
-        if not words or (len(words) == 1 and words[0] in _GENERIC):
-            continue  # e.g. the fallback name 'mcp' would match every MCP tool name in the context
+        # a lone generic word only counts when it is the whole label the user gave it ('Datos', 'API'), never the
+        # fallback name 'mcp', which would match every MCP tool name in the context
+        if not words or (len(words) == 1 and words[0] in _GENERIC and not (custom and i == 0 and words[0] != "mcp")):
+            continue
         size = len("".join(words))
         if size < 2 or (size == 2 and (len(words) > 1 or not (custom or _wide(words[0])))):
             continue
@@ -231,19 +244,29 @@ def _describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-# The server no longer knows our session (it restarted): the request was rejected without running.
-_SESSION_GONE = re.compile(r"session not found|no valid session|unknown session|invalid session|session (?:id )?(?:has )?expired", re.I)
+# The server no longer knows our session (it restarted): the request was rejected without running. The whole
+# message must be one of the transports' own answers ('Session not found', 'Bad Request: No valid session ID
+# provided', 'Not Found: Invalid or expired session ID', 'Bad Request: Server not initialized'…): a tool's error
+# that mentions a session ('invalid session token for Jira') ran, and must not be repeated.
+_SESSION_GONE = re.compile(r"(?:(?:bad request|not found|error)\s*:\s*)?(?:session not found|no valid session(?: id)?"
+                           r"(?: provided)?|(?:unknown|invalid|invalid or expired|expired) session(?: id)?|session (?:id )?"
+                           r"(?:has )?expired|session terminated|server not initialized)(?:[\s:=(]+[\w.-]{6,}\)?)?\W*", re.I)
 
 
 def _lost(exc: BaseException) -> str:
-    """'gone' when the server dropped our session, 'closed' when the connection died, '' for any other error."""
+    """'gone' when the server dropped our session, 'closed' when the connection died, 'suspect' when an HTTP server
+    answered an error status without a JSON-RPC error (python-sdk 1.x servers answer an unknown session with a plain
+    '400 Bad Request', but a crash after running the tool looks the same: never repeat it, reconnect next time), ''
+    for any other error."""
     while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
         exc = exc.exceptions[0]
     msg = str(getattr(exc, "message", "") or exc).strip()
-    if _SESSION_GONE.search(msg) or msg.lower() == "session terminated":
+    if _SESSION_GONE.fullmatch(msg):
         return "gone"
     if msg.lower() == "connection closed" or type(exc).__name__ in ("ClosedResourceError", "BrokenResourceError"):
         return "closed"
+    if msg.lower() == "server returned an error response":
+        return "suspect"
     return ""
 
 
@@ -400,6 +423,7 @@ class McpManager:
         self.thread.start()
         self.conns: dict[str, _Connection] = {}
         self.started: dict[tuple[int, str], str] = {}  # (user, connector name) -> key of the config tools() started
+        self.dying: set[_Connection] = set()  # dropped, their server still shutting down (stop() waits for them too)
         self.lock = threading.Lock()
 
     def _run(self, coro, timeout: float, cancel: threading.Event | None = None):
@@ -422,6 +446,9 @@ class McpManager:
         if self.conns.get(key) is conn:
             self.conns.pop(key, None)
         conn.stop.set()
+        if conn.task is not None and not conn.task.done() and conn not in self.dying:
+            self.dying.add(conn)
+            conn.task.add_done_callback(lambda _task: self.dying.discard(conn))
 
     async def _ensure(self, key: str, cfg: ConnectorConfig, user_id: int, timeout: float) -> _Connection:
         conn = self.conns.get(key)
@@ -438,7 +465,7 @@ class McpManager:
             self._drop(key, conn)  # it never answered: don't leave its process running
             tail = await conn.stderr.tail() if conn.stderr is not None else ""
             raise RuntimeError(f"el servidor MCP no respondió en {timeout:.0f} s" + (f"\n{tail}" if tail else "")) from None
-        if conn.session is None:
+        if conn.session is None or conn.stop.is_set():  # also a stop() that came in while it was starting
             raise RuntimeError(conn.error or "el servidor MCP se detuvo")
         return conn
 
@@ -473,7 +500,7 @@ class McpManager:
                     if lost == "gone" and attempt == 1:
                         self._drop(key, conn)
                         continue  # the server restarted and rejected the call unrun: once more, on a new session
-                    # dead: it shows as 'error' and the next call starts a fresh one (_ensure replaces it)
+                    # dead (or doubtful): it shows as 'error' and the next call starts a fresh one (_ensure replaces it)
                     conn.session = None
                     conn.stop.set()
                     if lost == "closed":  # the call may have run: never repeat it on our own
@@ -490,12 +517,11 @@ class McpManager:
         Until tools() starts it again, conversations already running can't restart it."""
         async def go():
             self.started.pop((user_id, name), None)
-            tasks = []
             for key, conn in list(self.conns.items()):
                 if conn.user_id == user_id and conn.cfg.name == name:
                     self._drop(key, conn)
-                    if conn.task is not None and not conn.task.done():
-                        tasks.append(conn.task)
+            # also the ones dropped before (a start that timed out, a lost session): they may still be shutting down
+            tasks = [c.task for c in self.dying if c.user_id == user_id and c.cfg.name == name and not c.task.done()]
             if tasks:  # wait (bounded) for the processes to exit: a restart must not overlap the old one
                 await asyncio.wait(tasks, timeout=8)
 

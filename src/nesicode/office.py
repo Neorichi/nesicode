@@ -282,46 +282,101 @@ def _ensure_style(d, name: str) -> bool:
     return True
 
 
-def _replace_in_paragraph(p_el, find: str, repl: str) -> int:
-    """Replace every `find` in one paragraph, also when Word split it across runs or it sits in a hyperlink.
-    Works on the w:t text nodes: a match spanning several nodes is written into the first one (keeping that
-    run's formatting) and cut from the others, so nothing else in the paragraph moves or repeats."""
-    from docx.oxml.ns import qn
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_DRAWN = {_W + "tab": "\t", _W + "ptab": "\t", _W + "cr": "\n", _W + "noBreakHyphen": "-"}  # as python-docx reads them
+_NO_WIDTH = {_W + t for t in ("rPr", "lastRenderedPageBreak", "softHyphen", "delText", "delInstrText", "instrText",
+                              "commentReference", "annotationRef")}
 
-    W_P, W_T = qn("w:p"), qn("w:t")
-    nodes = [t for t in p_el.iter(W_T) if next(t.iterancestors(W_P), None) is p_el]  # not nested text boxes
-    texts = [t.text or "" for t in nodes]
-    full = "".join(texts)
-    hits, i = [], full.find(find)
-    while i != -1:
-        hits.append(i)
-        i = full.find(find, i + len(find))
-    if not hits:
+
+def _atoms(p_el) -> list[list]:
+    """[element, text] for what one paragraph shows, in order: w:t nodes, tabs / line breaks / hyphens as the
+    character Word draws, and '\\x00' for anything else in a run (picture, field, page break, footnote mark): no
+    match may cross it. Nested paragraphs (text boxes) and tracked deletions are left out."""
+    out = []
+    for r in p_el.iter(_W + "r"):
+        owner = next((a for a in r.iterancestors() if a is p_el or a.tag in (_W + "p", _W + "del", _W + "moveFrom")), None)
+        if owner is not p_el:
+            continue
+        for el in r:
+            if not isinstance(el.tag, str) or el.tag in _NO_WIDTH:
+                continue
+            if el.tag == _W + "t":
+                out.append([el, el.text or ""])
+            elif el.tag == _W + "br":
+                out.append([el, "\n" if el.get(_W + "type") in (None, "textWrapping") else "\x00"])
+            else:
+                out.append([el, _DRAWN.get(el.tag, "\x00")])
+    return out
+
+
+def _set_text(t_el, text: str) -> None:
+    t_el.text = text
+    if text != text.strip():
+        t_el.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+
+
+def _replace_in_paragraph(p_el, find: str, repl: str) -> int:
+    """Replace every `find` in one paragraph as Word shows it, also when Word split it across runs or it sits in
+    a hyperlink. A match spanning several text nodes is written into the first one (keeping that run's formatting)
+    and cut from the others, so nothing else moves or repeats. Tabs and line breaks count as '\\t' / '\\n' (in
+    `find`, and in `repl`, where they become real tabs and breaks); a match never jumps over a tab, a break, a
+    picture or a field that is not in `find`."""
+    from docx.oxml import OxmlElement
+
+    if not find or "\x00" in find:
         return 0
-    starts, lens, pos = [], [len(s) for s in texts], 0
-    for s in texts:
+    atoms = _atoms(p_el)
+    orig = [t for _, t in atoms]
+    full = "".join(orig)
+    starts, pos = [], 0
+    for s in orig:
         starts.append(pos)
         pos += len(s)
-
-    def node_at(off: int) -> int:
-        return next(k for k in range(len(texts)) if starts[k] <= off < starts[k] + lens[k])
-
-    for h in reversed(hits):  # right to left: the offsets of earlier matches stay valid
-        a, b = node_at(h), node_at(h + len(find) - 1)
-        oa, ob = h - starts[a], h + len(find) - starts[b]
-        if a == b:
-            texts[a] = texts[a][:oa] + repl + texts[a][oa + len(find):]
-        else:
-            texts[a] = texts[a][:oa] + repl
-            for k in range(a + 1, b):
-                texts[k] = ""
-            texts[b] = texts[b][ob:]
-    for t, s in zip(nodes, texts):
-        if (t.text or "") != s:
-            t.text = s
-            if s != s.strip():
-                t.set(qn("xml:space"), "preserve")
-    return len(hits)
+    spans, i = [], full.find(find)
+    while i != -1:
+        end = i + len(find)
+        spans.append((i, end, [k for k in range(len(atoms)) if starts[k] < end and starts[k] + len(orig[k]) > i]))
+        i = full.find(find, end)
+    W_T = _W + "t"
+    for h, end, ks in reversed(spans):  # right to left: the offsets of earlier matches stay valid
+        first, last = ks[0], ks[-1]
+        f_el, l_el = atoms[first][0], atoms[last][0]
+        tail = atoms[last][1][end - starts[last]:] if l_el.tag == W_T else ""  # what follows the match in its node
+        if f_el.tag == W_T:
+            anchor, head = f_el, atoms[first][1][:h - starts[first]]
+        else:  # the match starts with a tab or a break: a new text node takes its place
+            anchor, head = OxmlElement("w:t"), ""
+            f_el.addprevious(anchor)
+        pieces = [p for p in re.split(r"(\t|\n)", repl) if p]
+        text0 = pieces.pop(0) if pieces and pieces[0] not in ("\t", "\n") else ""
+        if first == last and f_el.tag == W_T and tail:  # the rest of this node goes after the replacement
+            if pieces and pieces[-1] not in ("\t", "\n"):
+                pieces[-1] += tail
+            elif pieces:
+                pieces.append(tail)
+            else:
+                text0 += tail
+        _set_text(anchor, head + text0)
+        atoms[first][1] = head + text0 if f_el.tag == W_T else ""
+        at = anchor
+        for piece in pieces:  # tabs and line breaks of the replacement, in the anchor's run (its formatting)
+            el = OxmlElement({"\t": "w:tab", "\n": "w:br"}.get(piece, "w:t"))
+            if piece not in ("\t", "\n"):
+                _set_text(el, piece)
+            at.addnext(el)
+            at = el
+        for k in ks[1:] if f_el.tag == W_T else ks:  # the rest of the match: cut from its nodes
+            el = atoms[k][0]
+            if el.tag != W_T:
+                el.getparent().remove(el)
+                atoms[k][1] = ""
+            elif k == last and first != last:
+                _set_text(el, tail)
+                atoms[k][1] = tail
+            elif k != first:
+                _set_text(el, "")
+                atoms[k][1] = ""
+    return len(spans)
 
 
 def word_replace(args: dict, ws: Workspace):
@@ -407,17 +462,28 @@ def _last_row(sh) -> int:
 
 
 def _format_cells(sh, rng: str) -> list:
-    """The cells of 'B2:B20', 'C5', 'B' or '2' as a flat list (a single cell is not a tuple in openpyxl)."""
+    """The cells of 'B2:B20', 'C5', 'B' or '2' as a flat list (a single cell is not a tuple in openpyxl). The size is
+    checked first: looking a range up in openpyxl creates every cell in it ('A1:XFD1048576' is 17 billion cells, in
+    the server's own process)."""
     from openpyxl.utils.cell import range_boundaries
 
     ref = rng.strip().replace("$", "").upper()
+    bad = f"number_format: {rng!r} is not a cell or range (e.g. 'B2:B20' or 'C5')"
     try:
         c1, r1, c2, r2 = range_boundaries(ref)
-        sel = sh[ref]
     except Exception as exc:  # noqa: BLE001 - openpyxl raises several types for a bad reference
-        raise ToolError(f"number_format: {rng!r} is not a cell or range (e.g. 'B2:B20' or 'C5')") from exc
-    if None not in (c1, r1, c2, r2) and (c2 - c1 + 1) * (r2 - r1 + 1) > MAX_FORMAT_CELLS:
-        raise ToolError(f"number_format: {rng!r} has more than {MAX_FORMAT_CELLS:,} cells; format only the data range")
+        raise ToolError(bad) from exc
+    if c1 is None and r1 is None:
+        raise ToolError(bad)
+    # whole columns ('B', 'A:C') and whole rows ('2', '2:5') reach as far as the sheet's data does
+    size = (c2 - c1 + 1 if c1 is not None else sh.max_column) * (r2 - r1 + 1 if r1 is not None else sh.max_row)
+    limit = max(MAX_FORMAT_CELLS, sh.max_row * sh.max_column)  # never more new cells than that, or than the data has
+    if size > limit:
+        raise ToolError(f"number_format: {rng!r} has more than {limit:,} cells; format only the data range")
+    try:
+        sel = sh[ref]
+    except Exception as exc:  # noqa: BLE001
+        raise ToolError(bad) from exc
     if not isinstance(sel, tuple):
         return [sel]
     return [c for item in sel for c in (item if isinstance(item, tuple) else (item,))]
