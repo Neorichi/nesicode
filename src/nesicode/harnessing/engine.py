@@ -10,27 +10,40 @@ Both schedule 4k rollouts and 3k improvement stages, as in Harness^2.
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 import shutil
+import stat
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from ..agent import Agent, Workspace, apply_changes, copy_workspace, diff_workspaces, trajectory_text
-from ..harness import Harness, diff_summary, inventory, normalize, unified_diff, validate
-from ..llm import LLMError, ModelOptions, Usage, get_provider
+from ..agent import Agent, Workspace, copy_workspace, diff_workspaces, trajectory_text
+from ..harness import Harness, diff_summary, inventory, normalize, skills, unified_diff, validate
+from ..harness.profiles import marker_problems
+from ..llm import DEFAULT_LIMITS, LLMError, ModelOptions, Usage, get_provider, known_limits
 from . import prompts
+from .apply import apply_rollout
 
 Emit = Callable[[dict], None]
 STAGE_ATTEMPTS = 2
 OBS_TRUNC = 24_000
+IMPROVER_SYSTEM = "You improve the harness of an autonomous coding agent. Follow the mission exactly."
+IMPROVER_MAX_TOKENS = 32_000  # full rewritten files + notes (+ thinking where the model has it)
+CHARS_PER_TOKEN = 2.5  # pessimistic (diffs, JSON, hashes run below 3) so a trimmed prompt really fits
+PROMPT_MARGIN = 2_000  # tokens for the system prompt, framing and tokenizer differences
+TRIM_NOTE = "\n\n... [evidence trimmed to fit the model's context window] ...\n\n"
 
-FILE_RX = re.compile(r'<file path="([^"]+)">\n?(.*?)</file>', re.S)
-DELETE_RX = re.compile(r'<delete path="([^"]+)"\s*/>')
-NOTES_RX = re.compile(r"<notes>(.*?)</notes>", re.S)
+# A reply is read left to right: a <file> body is content (tags inside it are text); <notes> and inline
+# reasoning blocks are skipped, whatever tags they quote ("dropped -> <delete .../>", a <think> draft).
+TAG_RX = re.compile(r'<file path="([^"]+)">|<delete path="([^"]+)"\s*/>|<(notes|think|thinking|analysis)>')
+REASONING_RX = re.compile(r"<(think|thinking|analysis)>.*?(?:</\1>|\Z)", re.S)
+CHOICE_RX = re.compile(r"<choice>\s*([A-Z])\s*</choice>")
+TRIGGER_RX = re.compile(r"load (?:the )?`([a-z0-9][a-z0-9_-]{0,47})` skill")
+LABEL_PATH_RX = re.compile(r"(rollouts[\\/]+)(?:base|inv|dom|agg|c)\d+")
 
 
 @dataclass
@@ -47,7 +60,8 @@ class HarnessingConfig:
     executor_effort: str = "high"
     context_limit: int | None = None
     output_limit: int | None = None
-    improver_context: int | None = None
+    improver_context: int | None = None  # None: the known table for the improver model, else DEFAULT_LIMITS
+    improver_output: int | None = None
     improver_effort: str = "high"
 
 
@@ -65,6 +79,7 @@ class Rollout:
     check_code: int | None = None
     check_output: str = ""
     ws_path: Path | None = None
+    home: Path | None = None  # the rollout's private HOME (tool caches), removed with its copy
 
     def summary(self) -> dict:
         return {
@@ -106,17 +121,135 @@ class Stage:
         }
 
 
-def parse_edits(reply: str, current: Harness) -> tuple[Harness, bool]:
-    """Apply a reply's <file>/<delete> blocks to `current`. Returns (new, touched_anything)."""
+@dataclass
+class Reply:
+    files: list[tuple[str, str]]
+    deletes: list[str]
+    notes: str
+    open_file: str = ""  # a <file> block that never closed: the reply was cut
+    complete: bool = False  # reached a closing </notes> (the end of a well-formed reply)
+
+
+def _after_orphan_close(text: str) -> str:
+    """Some chat templates open <think> in the prompt, so the reply holds only the closing tag: what comes
+    before it is reasoning, not the answer."""
+    for tag in ("think", "thinking"):
+        if f"</{tag}>" in text and f"<{tag}>" not in text:
+            head, tail = text.rsplit(f"</{tag}>", 1)
+            if head.rfind('<file path="') <= head.rfind("</file>"):  # not inside a file body (that is content)
+                text = tail
+    return text
+
+
+def strip_reasoning(text: str) -> str:
+    """The answer part of a reply: no inline reasoning blocks (a <choice> drafted there is not the choice)."""
+    return REASONING_RX.sub("", _after_orphan_close(text))
+
+
+def scan_reply(reply: str) -> Reply:
+    """The edits of an improver reply, in order (see TAG_RX)."""
+    reply = _after_orphan_close(reply)
+    files: list[tuple[str, str]] = []
+    deletes: list[str] = []
+    notes: list[str] = []
+    open_file, complete, pos = "", False, 0
+    while m := TAG_RX.search(reply, pos):
+        if m.group(1) is not None:
+            end = reply.find("</file>", m.end())
+            if end == -1:
+                open_file = m.group(1)
+                break
+            body = reply[m.end():end]
+            files.append((m.group(1), body[1:] if body.startswith("\n") else body))
+            pos = end + len("</file>")
+        elif m.group(2) is not None:
+            deletes.append(m.group(2))
+            pos = m.end()
+        else:
+            tag = m.group(3)
+            end = reply.find(f"</{tag}>", m.end())
+            if tag == "notes":
+                notes.append(reply[m.end():end if end != -1 else len(reply)].strip())
+                complete = complete or end != -1
+            if end == -1:  # an unclosed block runs to the end of the reply
+                break
+            pos = end + len(tag) + 3
+    return Reply(files, deletes, "\n\n".join(n for n in notes if n), open_file, complete)
+
+
+def _apply_edits(r: Reply, current: Harness) -> tuple[Harness, bool]:
     new = dict(current)
     touched = False
-    for path, body in FILE_RX.findall(reply):
+    for path, body in r.files:
         new[path.strip().lstrip("./")] = body if body.endswith("\n") or not body else body + "\n"
         touched = True
-    for path in DELETE_RX.findall(reply):
+    for path in r.deletes:
         new.pop(path.strip().lstrip("./"), None)
         touched = True
     return normalize(new), touched
+
+
+def parse_edits(reply: str, current: Harness) -> tuple[Harness, bool]:
+    """Apply a reply's <file>/<delete> blocks to `current`. Returns (new, touched_anything)."""
+    return _apply_edits(scan_reply(reply), current)
+
+
+def cut_problem(r: Reply, stop_reason: str) -> str:
+    """Why a reply must be rejected as cut off at the output limit ("" if it is complete)."""
+    if r.open_file:
+        where = f'`<file path="{r.open_file}">` never closed'
+    elif stop_reason == "max_tokens" and not r.complete:
+        where = "it stopped before its closing </notes>"
+    else:
+        return ""
+    return (f"Your reply was cut off at the output limit ({where}), so none of it was used. Write fewer or shorter "
+            "files: only the files you change, each as compact as it can be, and keep the <notes> short.")
+
+
+def check_proposal(old: Harness, new: Harness) -> list[str]:
+    """What an edit of `old` must not do beyond validate(): break the profile markers, delete a skill that a
+    trigger still names, or add a trigger for a skill that does not exist (e.g. its file was never written)."""
+    errs = marker_problems(old, new)
+    trig = new.get("system_prompt.md", "") + "\n" + new.get("guardrails.md", "")
+    for name in sorted(set(skills(old)) - set(skills(new))):
+        if f"`{name}`" in trig:
+            errs.append(f"You deleted skills/{name}/SKILL.md but system_prompt.md or guardrails.md still names "
+                        f"`{name}`: delete that trigger too, or keep the skill.")
+    before = set(TRIGGER_RX.findall(old.get("system_prompt.md", "") + "\n" + old.get("guardrails.md", "")))
+    for name in sorted(set(TRIGGER_RX.findall(trig)) - before - set(skills(new))):
+        errs.append(f"A trigger tells the agent to load the `{name}` skill, but skills/{name}/SKILL.md does not "
+                    "exist: write the skill or drop the trigger.")
+    return errs
+
+
+def remove_tree(path: Path) -> None:
+    """Best-effort rmtree that also removes read-only entries (git objects on Windows, read-only dirs)."""
+    path = Path(path)
+    if not os.path.lexists(path):
+        return
+    if path.is_symlink() or not path.is_dir():
+        path.unlink(missing_ok=True)
+        return
+    root = os.path.realpath(path)
+
+    def retry(func, p, exc):
+        for q in (os.path.dirname(p), p):  # POSIX needs a writable parent; Windows a non-read-only entry
+            real = os.path.realpath(q)
+            if (real == root or real.startswith(root + os.sep)) and not os.path.islink(q):
+                try:
+                    os.chmod(q, stat.S_IRWXU if os.path.isdir(q) else stat.S_IREAD | stat.S_IWRITE)
+                except OSError:
+                    pass
+        if func in (os.unlink, os.remove, os.rmdir):
+            try:
+                func(p)
+            except OSError:
+                pass
+
+    for _ in range(2):  # the second pass gets into directories whose permissions the first one fixed
+        shutil.rmtree(path, onexc=retry)
+        if not os.path.lexists(path):
+            return
 
 
 def harness_block(h: Harness, title: str = "CURRENT HARNESS") -> str:
@@ -159,6 +292,9 @@ class HarnessingRun:
         self.usage = Usage()
         self._lock = threading.Lock()
         self.snapshot = self.run_dir / "source"
+        # every spelling of the run dir that can show up in output (as given / resolved, / or \), longest first
+        forms = {str(self.run_dir), self.run_dir.as_posix(), str(self.run_dir.resolve()), self.run_dir.resolve().as_posix()}
+        self._run_dirs = sorted(forms, key=len, reverse=True)
 
     # ---------------------------------------------------------------- utils
     def emit(self, event: dict) -> None:
@@ -168,21 +304,47 @@ class HarnessingRun:
         if self.cancel.is_set():
             raise RuntimeError("cancelled")
 
+    def _check_paths(self) -> None:
+        """The run dir holds copies of the project, so it must not overlap it: a copy into itself never ends,
+        and `source/` or `rollouts/` landing on the project would replace (delete) it."""
+        src, rd = self.source_ws.resolve(), self.run_dir.resolve()
+        if src == rd or rd.is_relative_to(src) or src.is_relative_to(rd):
+            raise ValueError(f"the run directory {rd} must be outside the workspace {src} (and not contain it)")
+
     def _add_usage(self, u: Usage) -> None:
         with self._lock:
             self.usage.add(u)
+
+    def _parallel(self, fn: Callable, items: list, width: int) -> list:
+        """map() over threads. Ctrl+C while waiting stops the workers too, instead of waiting for every agent
+        and command to finish (the executor joins its threads before the interrupt can propagate)."""
+        with ThreadPoolExecutor(max_workers=max(1, width)) as pool:
+            try:
+                return list(pool.map(fn, items))
+            except BaseException as exc:
+                if not isinstance(exc, Exception):
+                    self.cancel.set()
+                raise
+
+    def _blind(self, text: str) -> str:
+        """Hide which rollout produced `text`: absolute paths name it (…/rollouts/<label>/ws)."""
+        for rd in self._run_dirs:
+            text = re.sub(re.escape(rd) + r"[\\/]+rollouts[\\/]+[\w-]+[\\/]+ws(?![\w.-])", "<workspace>", text)
+            text = text.replace(rd, "<run>")
+        return LABEL_PATH_RX.sub(r"\1<candidate>", text)
 
     # ------------------------------------------------------------- rollouts
     def _rollout(self, label: str, h: Harness) -> Rollout:
         self._check_cancel()
         self.harnesses[label] = h
-        ro = Rollout(label=label, status="running")
-        self.rollouts[label] = ro
-        self.emit({"type": "rollout", "label": label, "status": "running"})
         rdir = self.run_dir / "rollouts" / label
         ws_path = rdir / "ws"
+        ro = Rollout(label=label, status="running", ws_path=ws_path)
+        self.rollouts[label] = ro
+        self.emit({"type": "rollout", "label": label, "status": "running"})
         copy_workspace(self.snapshot, ws_path)
         ws = Workspace(ws_path)
+        ro.home = ws.home
         agent = Agent(
             model=self.cfg.executor_model, harness=h, workspace=ws, user_keys=self.user_keys,
             max_steps=self.cfg.max_steps, effort=self.cfg.executor_effort, cancel=self.cancel,
@@ -192,13 +354,13 @@ class HarnessingRun:
         ro.status, ro.final_text, ro.steps, ro.error = res.status, res.final_text, res.steps, res.error
         ro.usage = res.usage
         ro.delivered = res.delivered
-        ro.ws_path = ws_path
         ro.trajectory = trajectory_text(res.events, OBS_TRUNC)
         d = diff_workspaces(self.snapshot, ws_path)
         ro.changes = d
-        if self.cfg.check_command.strip() and res.status != "cancelled":
+        if self.cfg.check_command.strip() and res.status != "cancelled" and not self.cancel.is_set():
             code, out = ws.run(self.cfg.check_command, timeout=600)
-            ro.check_code, ro.check_output = code, out[-6000:]
+            # blinded before it is cut, so no half path can give the rollout away later
+            ro.check_code, ro.check_output = code, self._blind(out)[-6000:]
         self._add_usage(res.usage)
         (rdir / "trajectory.txt").write_text(ro.trajectory, encoding="utf-8")
         (rdir / "events.json").write_text(json.dumps(res.events, ensure_ascii=False), encoding="utf-8")
@@ -208,14 +370,12 @@ class HarnessingRun:
             "" if ro.check_code is None else f"exit code: {ro.check_code}\n{ro.check_output}", encoding="utf-8"
         )
         self.emit({"type": "rollout", **ro.summary()})
+        self._check_cancel()  # Stop during this rollout ends the run here (its record above stays)
         return ro
 
     def _rollout_many(self, items: list[tuple[str, Harness]]) -> None:
-        if not items:
-            return
-        width = max(1, min(len(items), self.cfg.rollout_width))
-        with ThreadPoolExecutor(max_workers=width) as pool:
-            list(pool.map(lambda it: self._rollout(*it), items))
+        if items:
+            self._parallel(lambda it: self._rollout(*it), items, min(len(items), self.cfg.rollout_width))
 
     # ------------------------------------------------------------- evidence
     def _rollout_evidence(self, label: str, *, harness_vs: Harness | None = None, notes: str = "") -> str:
@@ -265,15 +425,30 @@ class HarnessingRun:
         return "\n\n".join(parts)
 
     # --------------------------------------------------------------- stages
-    def _improver(self, role: str, prompt: str) -> tuple[str, Usage]:
+    def _improver_limits(self, model: str) -> tuple[int, int]:
+        known = known_limits(model) or DEFAULT_LIMITS
+        return self.cfg.improver_context or known[0], self.cfg.improver_output or known[1]
+
+    def _improver(self, role: str, prompt: str) -> tuple[str, Usage, str]:
+        """One improver call -> (text, usage, stop_reason), sized to the improver's own window and output cap."""
+        self._check_cancel()
         provider, model = get_provider(self.cfg.improver_model, self.user_keys)
-        if self.cfg.improver_context:
-            budget = int(self.cfg.improver_context * 3 * 0.8)  # ~3 chars per token, keep 20% for the answer
-            if len(prompt) > budget:
-                keep = budget // 2
-                prompt = prompt[:keep] + "\n\n... [evidence trimmed to fit the model's context window] ...\n\n" + prompt[-keep:]
-        system = "You improve the harness of an autonomous coding agent. Follow the mission exactly."
-        return provider.complete(model, system, prompt, ModelOptions(effort=self.cfg.improver_effort, role=role, max_tokens=32000))
+        context, output = self._improver_limits(model)
+        max_tokens = max(1_024, min(IMPROVER_MAX_TOKENS, output, context // 4))
+        budget = int((context - max_tokens - PROMPT_MARGIN) * CHARS_PER_TOKEN)
+        if len(prompt) > budget:
+            keep = max(0, budget - len(TRIM_NOTE)) // 2
+            prompt = prompt[:keep] + TRIM_NOTE + prompt[len(prompt) - keep:]
+        options = ModelOptions(effort=self.cfg.improver_effort, role=role, max_tokens=max_tokens, cancel=self.cancel)
+        conv = provider.conversation(model, IMPROVER_SYSTEM, [], options)
+        conv.add_user(prompt)
+        try:
+            turn = conv.step()
+        finally:
+            self._check_cancel()  # Stop pressed meanwhile: an error or a late reply both mean "cancelled"
+        if turn.stop_reason == "refusal":
+            raise LLMError("the model declined this request (refusal)")
+        return turn.text, turn.usage, turn.stop_reason
 
     def _stage(self, label: str, dim: str, job: str, fallback: Harness, context: str) -> Stage:
         self._check_cancel()
@@ -286,21 +461,26 @@ class HarnessingRun:
             if err:
                 prompt += f"\n\n# YOUR PREVIOUS ATTEMPT WAS REJECTED\n\n{err}\n\nFix it and reply again with full files."
             try:
-                reply, usage = self._improver(role, prompt)
+                reply, usage, stop = self._improver(role, prompt)
             except LLMError as exc:
                 stage.error = str(exc)
                 break
             stage.usage.add(usage)
             self._add_usage(usage)
-            notes = NOTES_RX.search(reply)
-            new, touched = parse_edits(reply, fallback)
-            problems = validate(new)
+            r = scan_reply(reply)
+            new, touched = _apply_edits(r, fallback)
+            problems = [cut] if (cut := cut_problem(r, stop)) else []
+            if not problems:
+                try:
+                    problems = validate(new) + check_proposal(fallback, new)
+                except Exception as exc:  # a malformed proposal is a rejected attempt, never a crashed run
+                    problems = [f"The proposal could not be validated ({type(exc).__name__}: {exc}); write well-formed files."]
             if problems:
                 err = "\n".join(f"- {p}" for p in problems)
                 stage.error = err
                 continue
             stage.harness = new
-            stage.notes = notes.group(1).strip() if notes else reply.strip()[:4000]
+            stage.notes = r.notes or strip_reasoning(reply).strip()[:4000]
             stage.kept_base = not touched or new == fallback
             stage.error = ""
             break
@@ -314,8 +494,7 @@ class HarnessingRun:
         return stage
 
     def _stages_parallel(self, specs: list[tuple[str, str, str, Harness, str]]) -> list[Stage]:
-        with ThreadPoolExecutor(max_workers=max(1, len(specs))) as pool:
-            return list(pool.map(lambda s: self._stage(*s), specs))
+        return self._parallel(lambda s: self._stage(*s), specs, len(specs))
 
     # ----------------------------------------------------------------- modes
     def _run_parallel(self, base_labels: list[str]) -> list[str]:
@@ -371,6 +550,7 @@ class HarnessingRun:
 
     # ------------------------------------------------------------ selection
     def _select(self, labels: list[str]) -> tuple[str, str]:
+        self._check_cancel()
         cands = [l for l in labels if l in self.rollouts]
         rng = random.Random(self.seed)
         shuffled = cands[:]
@@ -379,28 +559,34 @@ class HarnessingRun:
         blocks = []
         for l in shuffled:
             ro = self.rollouts[l]
-            check = "" if ro.check_code is None else f"\nCheck `{self.cfg.check_command}` exit code: {ro.check_code}\n```\n{ro.check_output[-2500:]}\n```"
+            # Blind for real: the rollout's absolute path (…/rollouts/<label>/ws) would name it. Blinded, then cut.
+            check = "" if ro.check_code is None else (
+                f"\nCheck `{self.cfg.check_command}` exit code: {ro.check_code}\n```\n{self._blind(ro.check_output)[-2500:]}\n```"
+            )
+            diff = self._blind(ro.changes.get("diff", ""))[:12_000]
             blocks.append(
                 f"## Candidate {ids[l]}\nstatus: {ro.status}, delivered: {'yes' if ro.delivered else 'NO'}{check}\n"
-                f"### Changes\n```diff\n{ro.changes.get('diff', '')[:12_000] or '(no file changes)'}\n```\n"
-                f"### Final answer\n{ro.final_text[:3000] or '(none)'}"
+                f"### Changes\n```diff\n{diff or '(no file changes)'}\n```\n"
+                f"### Final answer\n{self._blind(ro.final_text)[:3000] or '(none)'}"
             )
         prompt = prompts.select(len(shuffled)) + f"\n\n# THE TASK\n\n{self.cfg.task}\n\n" + "\n\n".join(blocks)
         fallback = next((l for l in labels[::-1] if self.rollouts.get(l) and self.rollouts[l].delivered), labels[0])
         try:
-            reply, usage = self._improver("selector", prompt)
+            reply, usage, _ = self._improver("selector", prompt)
             self._add_usage(usage)
         except LLMError as exc:
             return fallback, f"selector failed ({exc}); fell back to {fallback}"
-        m = re.search(r"<choice>\s*([A-Z])\s*</choice>", reply)
+        reply = strip_reasoning(reply)
+        choices = CHOICE_RX.findall(reply)
         reason = re.search(r"<reasoning>(.*?)</reasoning>", reply, re.S)
         by_id = {v: k for k, v in ids.items()}
-        if not m or m.group(1) not in by_id:
+        if not choices or choices[-1] not in by_id:
             return fallback, "selector reply had no valid <choice>; fell back"
-        return by_id[m.group(1)], (reason.group(1).strip() if reason else reply.strip()[:2000])
+        return by_id[choices[-1]], (reason.group(1).strip() if reason else reply.strip()[:2000])
 
     # ----------------------------------------------------------- reflection
     def _reflect(self, chosen: str) -> dict:
+        self._check_cancel()
         parts = [
             prompts.experience(self.cfg.domain),
             f"# THE TASK\n\n{self.cfg.task}",
@@ -413,10 +599,11 @@ class HarnessingRun:
             if l.startswith("base"):
                 parts.append(self._rollout_evidence(l))
         try:
-            reply, usage = self._improver("reflector", "\n\n".join(parts))
+            reply, usage, _ = self._improver("reflector", "\n\n".join(parts))
             self._add_usage(usage)
         except LLMError as exc:
             return {"edits": "", "experience": None, "error": str(exc)}
+        reply = strip_reasoning(reply)
         edits = re.search(r"<edits>(.*?)</edits>", reply, re.S)
         exp_m = re.search(r"<experience>(.*?)</experience>", reply, re.S)
         exp = None
@@ -432,21 +619,31 @@ class HarnessingRun:
 
     # ------------------------------------------------------------------ run
     def run(self) -> dict:
+        """The whole run. Raises RuntimeError("cancelled") when Stop was pressed at any point; then (and on any
+        failure) no workspace copy is left behind. On success the snapshot and the chosen copy stay (for a later
+        apply) and the other copies go; trajectories, diffs and checks always stay."""
+        self._check_paths()
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        copy_workspace(self.source_ws, self.snapshot)
-        for src, rel in self.extra_files:
-            if Path(src).is_dir():
-                shutil.copytree(src, self.snapshot / rel, dirs_exist_ok=True)
-        k = self.cfg.k
-        self.emit({"type": "phase", "phase": "base"})
-        base_labels = [f"base{i}" for i in range(1, k + 1)]
-        self._rollout_many([(l, self.base) for l in base_labels])
-        finals = self._run_parallel(base_labels) if self.cfg.mode == "parallel" else self._run_sequential(base_labels)
-        self.emit({"type": "phase", "phase": "select"})
-        chosen, reason = self._select(base_labels + finals)
-        self.emit({"type": "selected", "label": chosen, "reason": reason[:4000]})
-        self.emit({"type": "phase", "phase": "reflect"})
-        reflection = self._reflect(chosen)
+        try:
+            copy_workspace(self.source_ws, self.snapshot)
+            for src, rel in self.extra_files:
+                if Path(src).is_dir():
+                    shutil.copytree(src, self.snapshot / rel, dirs_exist_ok=True)
+            k = self.cfg.k
+            self.emit({"type": "phase", "phase": "base"})
+            base_labels = [f"base{i}" for i in range(1, k + 1)]
+            self._rollout_many([(l, self.base) for l in base_labels])
+            finals = self._run_parallel(base_labels) if self.cfg.mode == "parallel" else self._run_sequential(base_labels)
+            self.emit({"type": "phase", "phase": "select"})
+            chosen, reason = self._select(base_labels + finals)
+            self.emit({"type": "selected", "label": chosen, "reason": reason[:4000]})
+            self.emit({"type": "phase", "phase": "reflect"})
+            reflection = self._reflect(chosen)
+            self._check_cancel()
+        except BaseException:
+            self.cleanup_workspaces(snapshot=True)  # cancelled or failed: nothing will ever be applied
+            raise
+        self.cleanup_workspaces(keep=chosen)
         adopted = self.harnesses.get(chosen, self.base)
         self.emit({"type": "phase", "phase": "done"})
         return {
@@ -468,13 +665,21 @@ class HarnessingRun:
         }
 
     def apply_selected(self, chosen: str, target: Path) -> dict:
+        """Apply the chosen rollout's file changes to `target`, three-way (see apply.py): files changed there
+        since the run started are never overwritten or deleted; they come back as "conflicts"."""
         ro = self.rollouts.get(chosen)
-        if not ro or not ro.ws_path:
+        if not ro or not ro.ws_path or not ro.ws_path.exists():
             return {}
-        return apply_changes(self.snapshot, ro.ws_path, target)
+        return apply_rollout(self.snapshot, ro.ws_path, target)
 
-    def cleanup_workspaces(self) -> None:
-        """Drop rollout workspace copies (trajectories and diffs stay)."""
-        for ro in self.rollouts.values():
-            if ro.ws_path and ro.ws_path.exists():
-                shutil.rmtree(ro.ws_path, ignore_errors=True)
+    def cleanup_workspaces(self, keep: str | None = None, snapshot: bool = False) -> None:
+        """Drop rollout workspace copies (and their private HOMEs) except `keep`'s; with snapshot=True also the
+        project snapshot, after which nothing can be applied. Trajectories, diffs and checks stay."""
+        run_dir = self.run_dir.resolve()
+        for label, ro in list(self.rollouts.items()):
+            if ro.home and ro.home.resolve().is_relative_to(run_dir):  # only a HOME this run owns
+                remove_tree(ro.home)
+            if label != keep and ro.ws_path:
+                remove_tree(ro.ws_path)
+        if snapshot:
+            remove_tree(self.snapshot)
