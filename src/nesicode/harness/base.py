@@ -36,20 +36,44 @@ TOOL_GUIDANCE = """\
 - Your private reasoning and old tool outputs may be dropped to save context: write each conclusion to the deliverable or a notes file as soon as you reach it.
 """
 
+# rm with any flags (-rf, -fr, -r -f, --recursive...) and among its arguments the root, the home or everything in them:
+# /, /*, ~, ~/, ~/*, $HOME, ${HOME}/*, quoted or not. Not `rm -rf build/`. Its arguments end at the line (a newline, or
+# `\n` in the JSON form): `rm -rf dist` + `cd ~` is fine. The argument scan never crosses an argument where another
+# match could start — a standalone `rm`, or one right after a quote, `(`, `{` or a backtick (`"rm`, `x(rm`): the last
+# such `rm` before the target is the one that matches. Without that, a command of many such words (`echo rm rm …`,
+# `echo "rm "rm …`) took quadratic time, holding the GIL — one tool call froze the server for minutes.
+RM_MATCH = (r"""(?:^|[\s;&|({`"'])rm(?:[ \t]+(?!(?:[^\s;&|\\]*[({`"'])?rm[ \t])[^\s;&|\\]+)*?[ \t]+["']?"""
+            r"""(?:/\*?|~/?\*?|\$\{?HOME\}?/?\*?)["']?(?=$|[\s;&|)`"'])""")
+# Earlier spellings of that rule (stored in the harnesses of projects created with them): the agent runs RM_MATCH
+# instead (upgrade_hooks). Same verdicts; only the time differs.
+LEGACY_RM_MATCHES = (
+    r"""(?:^|[\s;&|({`"'])rm(?:\s+[^\s;&|]+)*?\s+["']?(?:/\*?|~/?\*?|\$\{?HOME\}?/?\*?)["']?(?=$|[\s;&|)`"'])""",
+    r"""(?:^|[\s;&|({`"'])rm(?:[ \t]+[^\s;&|\\]+)*?[ \t]+["']?(?:/\*?|~/?\*?|\$\{?HOME\}?/?\*?)["']?(?=$|[\s;&|)`"'])""",
+    r"""(?:^|[\s;&|({`"'])rm(?:[ \t]+(?!rm[ \t])[^\s;&|\\]+)*?[ \t]+["']?(?:/\*?|~/?\*?|\$\{?HOME\}?/?\*?)["']?"""
+    r"""(?=$|[\s;&|)`"'])""",
+)
+
 HOOKS = {
     "pre_tool": [
         {
             "tool": "bash",
-            # rm with any flags (-rf, -fr, -r -f, --recursive...) and among its arguments the root, the home
-            # or everything in them: /, /*, ~, ~/, ~/*, $HOME, ${HOME}/*, quoted or not. Not `rm -rf build/`.
-            # Its arguments end at the line (a newline, or `\n` in the JSON form): `rm -rf dist` + `cd ~` is fine.
-            "match": r"""(?:^|[\s;&|({`"'])rm(?:[ \t]+[^\s;&|\\]+)*?[ \t]+["']?(?:/\*?|~/?\*?|\$\{?HOME\}?/?\*?)["']?(?=$|[\s;&|)`"'])""",
+            "match": RM_MATCH,
             "action": "block",
             "message": "Blocked: refusing to delete a root or home directory.",
         }
     ],
     "post_tool": [{"tool": "*", "action": "truncate", "max_chars": 20000}],
 }
+
+
+def upgrade_hooks(rules: dict) -> dict:
+    """Hook rules with any earlier spelling of the shipped rm rule replaced by the current one (a copy)."""
+    out = dict(rules)
+    for phase in ("pre_tool", "post_tool"):
+        if isinstance(out.get(phase), list):
+            out[phase] = [{**r, "match": RM_MATCH} if isinstance(r, dict) and r.get("match") in LEGACY_RM_MATCHES else r
+                          for r in out[phase]]
+    return out
 
 
 DOCUMENTS_SKILL = """\

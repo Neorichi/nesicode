@@ -413,19 +413,21 @@ def _nested_repeat(pattern: str) -> bool:
     return walk(tree, False)
 
 
-def _search_regex(pattern: str):
+def _search_regex(pattern: str, flags: int = 0):
     """re.search already tries every start position, so a leading `.*` only adds quadratic backtracking
     (`.*TODO.*` on a minified bundle froze the server): drop it, the set of matching lines is the same."""
     m = re.match(r"(?:\.\*\??)+", pattern)
     if m and pattern[m.end() : m.end() + 1] not in ("*", "+", "?", "{"):
         try:
-            return re.compile(pattern[m.end() :])
+            return re.compile(pattern[m.end() :], flags)
         except re.error:
             pass
-    return re.compile(pattern)
+    return re.compile(pattern, flags)
 
 
-def _match(rx, line: str, deadline: float):
+def _match(rx, line: str, deadline: float, cancel=None):
+    """The first match of `rx` in `line`; None also once the deadline passes or `cancel` (Stop) is set between two
+    windows of a long line."""
     if len(line) <= SEARCH_WINDOW:
         return rx.search(line)
     for start in range(0, len(line), SEARCH_WINDOW - SEARCH_OVERLAP):  # bounded work per call; the GIL is free between
@@ -441,7 +443,7 @@ def _match(rx, line: str, deadline: float):
             m = rx.search(line, m.start() + 1, stop) if m.start() + 1 < stop else None
         if m is not None and (m.end() < stop or stop == len(line)):
             return m
-        if time.monotonic() > deadline:
+        if time.monotonic() > deadline or (cancel is not None and cancel.is_set()):
             return None
     return None
 
@@ -487,7 +489,7 @@ def search(ws: Workspace, args: dict) -> str:
         except ValueError:
             continue  # binary
         for i, line in enumerate(_lines(text), 1):
-            m = _match(rx, line, deadline)
+            m = _match(rx, line, deadline, cancel)
             if m:
                 s = line.strip()
                 if len(s) > 240:  # show the match, not the start of a minified line

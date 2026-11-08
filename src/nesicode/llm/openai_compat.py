@@ -22,6 +22,7 @@ from .base import (
     ToolResult,
     Turn,
     Usage,
+    scoped,
 )
 from .transport import (
     CONNECT_TIMEOUT,
@@ -41,9 +42,15 @@ from .transport import (
 
 CUT = "output was cut off at max_tokens; resend a smaller call"
 NON_STREAM_READ_TIMEOUT = 600.0  # a plain JSON request only answers once the whole reply is ready
-MAX_BODY = 64 * 1024 * 1024
+MAX_BODY = 64 * 1024 * 1024  # one reply, JSON or streamed (a streamed one never reaches this legitimately)
+MAX_SSE_LINE = 8 * 1024 * 1024  # one line of an event stream (a whole tool call in one delta is far below)
+# finish_reason -> Turn.stop_reason. Z.ai: model_context_window_exceeded, sensitive (its safety filter); Mistral:
+# model_length (the context filled up mid-reply). Values not listed pass through (and end the turn).
 STOP = {"stop": "end_turn", "tool_calls": "tool_use", "function_call": "tool_use", "length": "max_tokens",
-        "model_context_window_exceeded": "max_tokens", "content_filter": "refusal"}
+        "model_context_window_exceeded": "max_tokens", "model_length": "max_tokens", "content_filter": "refusal",
+        "sensitive": "refusal"}
+# The server failed while it generated (Z.ai network_error, vLLM/SGLang abort): what came is not the answer, retry.
+FAILED = {"error", "network_error", "abort"}
 REASONING_KEYS = ("reasoning_content", "reasoning")  # the names servers give the reasoning of a reply
 # A 400/422 that refuses a field we sent without naming it (pydantic, JSON-schema and protobuf wordings)
 _FIELD_REFUSED = re.compile(r"extra (?:inputs?|fields?|keys?|properties)|not permitted|unrecogni[sz]ed|additional propert|"
@@ -121,7 +128,18 @@ class OpenAICompatConversation(Conversation):
         # issued the oldest kept result keeps it (it explains that round), and so does every newer one.
         first_kept = idx[len(masked)] if len(masked) < len(idx) else len(self.messages)
         keep_from = max((i for i in range(first_kept) if self.messages[i].get("role") == "assistant"), default=0)
-        for m in self.messages[:keep_from]:
+        return freed + self._drop_reasoning(self.messages[:keep_from], apply)
+
+    def strip_reasoning(self, keep: int, apply: bool = True) -> int:
+        if self.provider.needs_reasoning:  # DeepSeek must get its reasoning back: never dropped
+            return 0
+        replies = [m for m in self.messages if m.get("role") == "assistant"]
+        return self._drop_reasoning(replies[: max(0, len(replies) - keep)], apply)
+
+    @staticmethod
+    def _drop_reasoning(messages: list[dict], apply: bool) -> int:
+        freed = 0
+        for m in messages:
             if m.get("role") != "assistant":
                 continue
             for key in REASONING_KEYS:
@@ -169,8 +187,9 @@ class OpenAICompatConversation(Conversation):
             fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
             name = str(fn.get("name") or "")
             args, err, raw = _arguments(fn.get("arguments"))
-            # Cut by the output cap: invalid arguments, or a last call that has its name but no arguments yet
-            if finish == "length" and (err or (n == len(tool_calls) - 1 and fn.get("arguments") in (None, ""))):
+            # Cut by the output cap (or a full context): invalid arguments, or a last call that has its name but no
+            # arguments yet
+            if STOP.get(finish) == "max_tokens" and (err or (n == len(tool_calls) - 1 and fn.get("arguments") in (None, ""))):
                 err = CUT
             cid = self.provider.unique_call_id(tc.get("id"))
             calls.append(ToolCall(id=cid, name=name, arguments=args, parse_error=err))
@@ -268,12 +287,17 @@ class OpenAICompatProvider(Provider):
                 req = self._prepare(body)
                 try:
                     if self.stream:
-                        return self._stream(req, cancel, on_event)
-                    return self._post_once("/chat/completions", req, cancel, timeouts), False
+                        data, streamed = self._stream(req, cancel, on_event)
+                    else:
+                        data, streamed = self._post_once("/chat/completions", req, cancel, timeouts), False
                 except _Status as exc:
                     if not self._adapt(exc, req):
                         raise exc.error(self.name) from None
                     last = exc
+                    continue
+                if not streamed:  # (a streamed reply was checked as it arrived: _Reply.add)
+                    _check_finish(data)
+                return data, streamed
             raise last.error(self.name)  # type: ignore[union-attr]
 
         return with_retries(attempt, label=self.name, cancel=cancel, notify=getattr(options, "notify", None),
@@ -425,14 +449,15 @@ class OpenAICompatProvider(Provider):
         except ValueError:
             return r.text.strip()
 
-    def generate_image(self, model: str, prompt: str) -> tuple[bytes, str]:
+    def generate_image(self, model: str, prompt: str, *, cancel=None, notify=None) -> tuple[bytes, str]:
         import base64
         import binascii
 
+        cancel, notify = scoped(cancel, notify)  # (a tool's request: the agent's Stop and retry notices)
         body = {"model": model, "prompt": prompt, "n": 1, "response_format": "b64_json"}
         for attempt in range(3):
             try:
-                data = self.post("/images/generations", body)
+                data = self.post("/images/generations", body, cancel, notify=notify)
                 break
             except LLMError as exc:
                 text = str(exc).lower()
@@ -461,22 +486,27 @@ class OpenAICompatProvider(Provider):
         if item.get("url"):
             # The URL comes from the provider: same network policy as endpoints (checked at connect time, no
             # redirects into private networks), a size cap, and the bytes must really be an image.
-            return fetch_image(str(item["url"]), strict=self.guard_private)
+            return fetch_image(str(item["url"]), strict=self.guard_private, cancel=cancel)
         raise LLMError(f"{self.name} returned no image")
 
-    def vision(self, model: str, prompt: str, image: bytes, mime: str) -> tuple[str, Usage]:
+    def vision(self, model: str, prompt: str, image: bytes, mime: str, *, cancel=None, notify=None) -> tuple[str, Usage]:
         import base64
 
+        cancel, notify = scoped(cancel, notify)  # (a tool's request: the agent's Stop and retry notices)
         url = f"data:{mime};base64,{base64.b64encode(image).decode()}"
         data = self.post("/chat/completions", {"model": model, "messages": [{"role": "user", "content": [
             {"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": url}},
-        ]}]})
+        ]}]}, cancel, notify=notify)
         try:
-            text = data["choices"][0]["message"]["content"] or ""
+            message = data["choices"][0]["message"]
+            if not isinstance(message, dict):
+                raise TypeError("message is not an object")
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError(f"unexpected vision response from {self.name}: {str(data)[:300]}") from exc
-        u = data.get("usage") or {}
-        return text, Usage(int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0))
+        # the text only: some vision models answer in content parts (Mistral's Magistral: thinking + text)
+        text = _text(message.get("content"))
+        u = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        return text, Usage(_int(u.get("prompt_tokens")), _int(u.get("completion_tokens")))
 
 
 # ---------------------------------------------------------------------- helpers
@@ -521,9 +551,18 @@ def _int(value) -> int:
 
 
 def _text(content) -> str:
-    if isinstance(content, list):  # some servers return content parts
-        return "".join(p["text"] for p in content if isinstance(p, dict) and isinstance(p.get("text"), str))
+    if isinstance(content, list):  # some servers return content parts (their reasoning parts are not the answer)
+        return "".join(p["text"] for p in content if isinstance(p, dict) and isinstance(p.get("text"), str)
+                       and p.get("type") not in ("thinking", "reasoning"))
     return content if isinstance(content, str) else ""
+
+
+def _check_finish(data) -> None:
+    """A plain JSON reply the server says it failed to generate (FAILED) is retried, never taken as the answer."""
+    choices = data.get("choices") if isinstance(data, dict) else None
+    choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    if choice.get("finish_reason") in FAILED:
+        raise Retryable(f"the provider reported an error in its reply (finish_reason={choice['finish_reason']})")
 
 
 def _arguments(raw) -> tuple[dict, str, str]:
@@ -617,7 +656,7 @@ def _read_reply(resp: httpx.Response, call: Call, emit, name: str) -> tuple[dict
     that ignore `stream`). HTML or other non-API answers raise LLMError (wrong URL, proxy, captive portal)."""
     ctype = resp.headers.get("content-type", "").lower()
     decoder, reply = _SSE(), _Reply(name)
-    head, mode, raw, sample = b"", "", bytearray(), b""
+    head, mode, raw, sample, size = b"", "", bytearray(), b"", 0
     try:
         for chunk in resp.iter_bytes():
             call.touch()
@@ -630,10 +669,11 @@ def _read_reply(resp: httpx.Response, call: Call, emit, name: str) -> tuple[dict
                     raise LLMError(_not_api(name, ctype, head))
                 mode = "json" if start in (b"{", b"[") and "event-stream" not in ctype else "sse"
                 chunk, head, sample = head, b"", head[:200]
+            size += len(chunk)  # streamed or not, one reply has a size cap (an endless stream must not fill memory)
+            if size > MAX_BODY:
+                raise LLMError(f"{name}: the reply is larger than {MAX_BODY // 2**20} MB")
             if mode == "json":
                 raw += chunk
-                if len(raw) > MAX_BODY:
-                    raise LLMError(f"{name}: the reply is larger than {MAX_BODY // 2**20} MB")
                 continue
             for event, data in decoder.feed(chunk):
                 reply.add(event, data, emit, call)
@@ -660,37 +700,53 @@ def _read_reply(resp: httpx.Response, call: Call, emit, name: str) -> tuple[dict
 
 class _SSE:
     """Server-sent events -> (event, data) pairs. Handles LF/CRLF/CR line ends (also split across chunks),
-    comments, multi-line data, and servers that leave out the blank line between events."""
+    comments, multi-line data, and servers that leave out the blank line between events. A line still without its
+    end is kept in pieces, never re-scanned or re-copied per chunk (linear time), and at most MAX_SSE_LINE long."""
 
     _EOL = re.compile(r"\r\n|\r|\n")
 
     def __init__(self):
         self._utf8 = codecs.getincrementaldecoder("utf-8")("replace")
-        self._buf = ""
+        self._pending: list[str] = []  # the current line so far (no end of line in it, except maybe a final \r)
+        self._size = 0
         self._event = ""
         self._data: list[str] = []
 
     def feed(self, chunk: bytes) -> list[tuple[str, str]]:
-        self._buf += self._utf8.decode(chunk)
-        return self._lines(final=False)
+        text = self._utf8.decode(chunk)
+        if "\n" not in text and "\r" not in text:
+            self._hold(text)
+            return []
+        return self._lines(self._take() + text, final=False)
 
     def flush(self) -> list[tuple[str, str]]:
-        self._buf += self._utf8.decode(b"", final=True)
-        out = self._lines(final=True)
-        if self._buf:
-            out += self._line(self._buf)
-            self._buf = ""
+        out = self._lines(self._take() + self._utf8.decode(b"", final=True), final=True)
+        rest = self._take()
+        if rest:
+            out += self._line(rest)
         return out + self._dispatch()
 
-    def _lines(self, final: bool) -> list[tuple[str, str]]:
+    def _hold(self, text: str) -> None:
+        if text:
+            self._pending.append(text)
+            self._size += len(text)
+            if self._size > MAX_SSE_LINE:
+                raise LLMError(f"the reply stream sent a line longer than {MAX_SSE_LINE // 2**20} MB without an end of "
+                               "line (a broken or hostile server)")
+
+    def _take(self) -> str:
+        text, self._pending, self._size = "".join(self._pending), [], 0
+        return text
+
+    def _lines(self, buf: str, final: bool) -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = []
-        buf, pos = self._buf, 0
+        pos = 0
         while (m := self._EOL.search(buf, pos)) is not None:
             if m.group() == "\r" and m.end() == len(buf) and not final:
                 break  # maybe the first half of a CRLF split across chunks
             out += self._line(buf[pos:m.start()])
             pos = m.end()
-        self._buf = buf[pos:]
+        self._hold(buf[pos:])
         return out
 
     def _line(self, line: str) -> list[tuple[str, str]]:
@@ -795,8 +851,9 @@ class _Reply:
                         self._tool(tc)
                         call.data = True
             if choice.get("finish_reason"):
-                if choice["finish_reason"] == "error":
-                    raise Retryable("the provider reported an error in the middle of the reply")
+                if choice["finish_reason"] in FAILED:
+                    raise Retryable(f"the provider reported an error in the middle of the reply "
+                                    f"(finish_reason={choice['finish_reason']})")
                 self.finish = str(choice["finish_reason"])
 
     def _tool(self, tc: dict) -> None:

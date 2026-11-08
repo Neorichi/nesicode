@@ -28,6 +28,7 @@ from .base import (
     ToolSpec,
     Turn,
     Usage,
+    request_scope,
 )
 from .mock import MockProvider
 from .openai_compat import OpenAICompatProvider
@@ -123,6 +124,10 @@ def build_provider(kind: str, name: str, base_url: str, api_key: str) -> Provide
     guard = not private_providers_allowed()
     if kind == "anthropic":
         default = base_url.rstrip("/") in ("", "https://api.anthropic.com")
+        if default and not api_key:  # Anthropic's own API always needs a key: say so instead of a bare 401
+            raise LLMError(f"the provider «{name}» has no API key: add one in Ajustes del proyecto → Proveedores, or delete "
+                           "that provider to use the server's built-in one (providers you define never use the server's "
+                           "ANTHROPIC_API_KEY)")
         return AnthropicProvider(api_key=api_key or "", base_url=None if default else base_url, isolated=True,
                                  guard_private=guard)
     if kind == "openai":
@@ -253,12 +258,13 @@ def fetch_limits(kind: str, base_url: str, api_key: str, model: str, timeout: fl
                 best = cand if not best or cand["context"] < best["context"] else best  # several backends: the smallest is safe
         if best:
             return best
-        # OpenRouter-style /models with context_length
+        # OpenRouter-style /models with context_length (vLLM and SGLang: max_model_len)
         listed = body(httpx.get(base + "/models", headers=headers, timeout=timeout)).get("data")
         if isinstance(listed, list):
             for m in listed:
                 if isinstance(m, dict) and m.get("id") == model:
-                    c = m.get("context_length") or m.get("context_window") or m.get("max_context_length")
+                    c = (m.get("context_length") or m.get("context_window") or m.get("max_context_length")
+                         or m.get("max_model_len"))
                     if c:
                         top = m.get("top_provider") or {}
                         return {"context": int(c), "output": int(top.get("max_completion_tokens") or 0) or None}
@@ -287,6 +293,11 @@ LIMIT_PATTERNS = [
     r"exceeds? the configured limit of ([0-9][0-9,]*) tokens",
     r"context (?:window|length) (?:is|of) (?:only )?([0-9][0-9,]*)",  # LM Studio: "context length of only 4096"
     r"exceeds? (?:the )?(?:model'?s? )?(?:maximum )?(?:context|token) (?:limit|length) (?:of )?([0-9][0-9,]*)",
+    # SGLang, when the input alone is too long: "The input (40000 tokens) is longer than the model's context length
+    # (32768 tokens)."
+    r"context length \(([0-9][0-9,]*) tokens\)",
+    # vLLM's backstop: "The decoder prompt (length 40000) is longer than the maximum model length of 32768."
+    r"maximum model length of ([0-9][0-9,]*)",
 ]
 
 
@@ -343,5 +354,5 @@ __all__ = [
     "Conversation", "LLMError", "ModelOptions", "Provider", "ToolCall", "ToolResult", "ToolSpec",
     "Turn", "Usage", "PROVIDERS", "get_provider", "split_model", "provider_available", "KINDS",
     "TEMPLATES", "build_provider", "list_models", "server_provider_config", "split_any",
-    "fetch_limits", "known_limits", "DEFAULT_LIMITS", "parse_limit", "probe_limit",
+    "fetch_limits", "known_limits", "DEFAULT_LIMITS", "parse_limit", "probe_limit", "request_scope",
 ]

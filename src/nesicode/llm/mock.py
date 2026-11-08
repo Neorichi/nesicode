@@ -143,7 +143,7 @@ class MockProvider(Provider):
     def conversation(self, model, system, tools, options: ModelOptions) -> Conversation:
         return MockConversation(model, system, tools, options)
 
-    def generate_image(self, model, prompt):
+    def generate_image(self, model, prompt, *, cancel=None, notify=None):
         import struct
         import zlib
 
@@ -159,5 +159,5 @@ class MockProvider(Provider):
     def transcribe(self, model, audio, filename, language=""):
         return f"transcripción de prueba ({len(audio)} bytes)"
 
-    def vision(self, model, prompt, image, mime):
+    def vision(self, model, prompt, image, mime, *, cancel=None, notify=None):
         return f"A {mime} image of {len(image)} bytes (mock vision).", Usage(10, 10)

@@ -26,6 +26,7 @@ from .base import (
     ToolResult,
     Turn,
     Usage,
+    scoped,
 )
 from .transport import (
     CONNECT_TIMEOUT,
@@ -139,11 +140,15 @@ def _whole_json(raw: str) -> bool:
         return False
 
 
-def _status_error(exc: anthropic.APIStatusError, partial: bool) -> Exception:
+KEYLESS = ("this provider has no API key saved: add one in Ajustes del proyecto → Proveedores (providers you define "
+           "never use the server's ANTHROPIC_API_KEY)")
+
+
+def _status_error(exc: anthropic.APIStatusError, partial: bool, keyless: bool = False) -> Exception:
     status, kind = exc.status_code, exc.type
     message = exc.api_message or exc.message
     if status == 401:
-        return LLMError(f"Anthropic authentication failed: {message}")
+        return LLMError(f"Anthropic authentication failed: {message}" + (f" — {KEYLESS}" if keyless else ""))
     retry_after = retry_after_seconds(exc.response.headers)
     if status == 429 or kind == "rate_limit_error":
         return Retryable(f"rate limit: {message}", retry_after, partial)
@@ -156,11 +161,13 @@ def _status_error(exc: anthropic.APIStatusError, partial: bool) -> Exception:
 
 
 class AnthropicConversation(Conversation):
-    def __init__(self, client: anthropic.Anthropic, first_party: bool, model, system, tools, options, policy=None):
+    def __init__(self, client: anthropic.Anthropic, first_party: bool, model, system, tools, options, policy=None,
+                 keyless: bool = False):
         super().__init__(model, system, tools, options)
         self.client = client
         self.first_party = first_party
         self.policy = policy  # vets the address connected to (user endpoints on multi-user servers)
+        self.keyless = keyless  # a provider the user defined without a key (a 401 then says so)
         self.messages: list[dict] = []
 
     def add_user(self, text: str) -> None:
@@ -302,7 +309,7 @@ class AnthropicConversation(Conversation):
         except (LLMError, Retryable):
             raise
         except anthropic.APIStatusError as exc:
-            raise _status_error(exc, partial()) from exc
+            raise _status_error(exc, partial(), self.keyless) from exc
         except (anthropic.APIConnectionError, httpx2.TransportError) as exc:
             if call.blocked:
                 raise LLMError(f"Anthropic: {call.blocked}") from exc
@@ -449,17 +456,22 @@ class AnthropicProvider(Provider):
                 kwargs["default_headers"] = headers
         self.client = anthropic.Anthropic(**kwargs)
         self.first_party = (self.client.base_url.host or "") == "api.anthropic.com"
-        if guard_private and not proxied(str(self.client.base_url)):
+        self.keyless = isolated and not api_key
+        # (the SDK's client decides whether a request goes through a proxy: its rules decide whether to vet the peer)
+        if guard_private and not proxied(str(self.client.base_url), "anthropic"):
             self.policy = lambda ip: address_problem(ip, strict=True)
 
     def conversation(self, model, system, tools, options: ModelOptions) -> Conversation:
-        return AnthropicConversation(self.client, self.first_party, model, system, tools, options, policy=self.policy)
+        return AnthropicConversation(self.client, self.first_party, model, system, tools, options, policy=self.policy,
+                                     keyless=self.keyless)
 
-    def vision(self, model: str, prompt: str, image: bytes, mime: str) -> tuple[str, Usage]:
+    def vision(self, model: str, prompt: str, image: bytes, mime: str, *, cancel=None, notify=None) -> tuple[str, Usage]:
         import base64
 
-        conv = AnthropicConversation(self.client, self.first_party, model, "", [], ModelOptions(effort="low", max_tokens=16000),
-                                     policy=self.policy)
+        cancel, notify = scoped(cancel, notify)  # (a tool's request: the agent's Stop and retry notices)
+        opts = ModelOptions(effort="low", max_tokens=16000, cancel=cancel, notify=notify)
+        conv = AnthropicConversation(self.client, self.first_party, model, "", [], opts, policy=self.policy,
+                                     keyless=self.keyless)
         conv.messages.append({"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": mime, "data": base64.b64encode(image).decode()}},
             {"type": "text", "text": prompt},

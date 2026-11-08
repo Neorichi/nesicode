@@ -154,28 +154,49 @@ def attachments_note(ws: Workspace, attachments: list[dict], vision: str, keys: 
 
 
 HISTORY_TURN_CHARS = 400_000  # soft budget of one turn in history.md (a disk file: steps are shortened, never dropped)
+HISTORY_FULL_TURNS = 40  # the first turn and the newest ones get that budget; older ones a smaller one
+HISTORY_OLD_TURN_CHARS = 40_000
+# The whole file, in UTF-8 BYTES: under what search_history reads of one file (ARCHIVE_READ_MAX, bytes) — the newest
+# turns are at its end, so a longer file would hide exactly them (CJK text is 3 bytes a char). Past it, older turns
+# keep only the user's message and the answer, each clipped to HISTORY_CLIPPED_CHARS.
+HISTORY_MAX_BYTES = 36_000_000
+HISTORY_CLIPPED_CHARS = 3_000
 TRAIL_MAX_CHARS = 240_000  # the previous turn's trail: ~20-25% of the window, but never more than this (1M windows)
 
 
 def _write_thread_history(db: DB, ws: Workspace, run: dict, archive: str) -> None:
     """Earlier turns of this conversation (in queue order, only the ones that ran), complete with their steps and
-    reasoning, so `search_history` can find anything that only survives as a summary in the model's context. A long
-    turn keeps every step: its observations, arguments and reasoning get shorter (head/tail lines), never its middle."""
+    reasoning, so `search_history` can find anything that only survives as a summary in the model's context. Every
+    turn conversation_history hands the agent is here: the turns its context leaves out ("search_history finds
+    them") must be searchable. A long turn keeps every step: its observations, arguments and reasoning get shorter
+    (head/tail lines), never its middle. Turns older than the newest HISTORY_FULL_TURNS get a smaller budget (a very
+    long one, its first and last steps); past HISTORY_MAX_BYTES the oldest keep only the user's words and the answer,
+    clipped (their outputs stay whole in the archive's outputs/)."""
     from ..agent import trajectory_text
+    from ..agent.context import clip, write_context_file
 
-    rows = _earlier_turns(db, run, limit=40)
+    rows = _earlier_turns(db, run)  # the same turns conversation_history hands over
     if not rows:
         return
-    parts = ["# Historial de esta conversación (turnos anteriores)"]
-    for r in rows:
-        events = _turn_events(db, r["id"], 5_000)
-        steps = trajectory_text(events, HISTORY_TURN_CHARS, obs_chars=6_000, args_chars=3_000, thinking_chars=3_000,
-                                fit="shrink")
-        parts.append(f"## Turno #{r['id']} ({r['status']})\n### Usuario\n{r['task']}\n### Pasos\n"
-                     f"{steps}\n### Respuesta final\n{r['final_text']}")
+    blocks: list[str] = []
+    used = 0
+    for k in range(len(rows) - 1, -1, -1):  # newest first: they matter most if the file must stay small
+        r = rows[k]
+        full = k == 0 or len(rows) - k < HISTORY_FULL_TURNS
+        task, answer = r["task"] or "", r["final_text"] or ""
+        if used > HISTORY_MAX_BYTES and k:
+            steps = "(steps not kept here: this conversation's history is very long; its saved outputs are in outputs/)"
+            task, answer = clip(task, HISTORY_CLIPPED_CHARS, "message"), clip(answer, HISTORY_CLIPPED_CHARS, "answer")
+        else:
+            events = _turn_events(db, r["id"], 5_000 if full else 1_000)
+            steps = trajectory_text(events, HISTORY_TURN_CHARS if full else HISTORY_OLD_TURN_CHARS,
+                                    obs_chars=6_000 if full else 2_000, args_chars=3_000 if full else 1_000,
+                                    thinking_chars=3_000 if full else 1_000, fit="shrink")
+        blocks.append(f"## Turno #{r['id']} ({r['status']})\n### Usuario\n{task}\n### Pasos\n"
+                      f"{steps}\n### Respuesta final\n{answer}")
+        used += len(blocks[-1].encode("utf-8", "replace"))
+    parts = ["# Historial de esta conversación (turnos anteriores)"] + blocks[::-1]
     try:
-        from ..agent.context import write_context_file
-
         write_context_file(ws, "history.md", "\n\n".join(parts), archive)
     except Exception:
         pass
@@ -322,7 +343,7 @@ def conversation_history(db, run: dict, window: int | None = None) -> tuple[list
     it never takes that slot): built from its END within ~20% of the model's context window (25% if it was stopped),
     with its reasoning, each output shortened and listings cut to a few lines. Messages removed from the queue never
     appear. Returns (history, the last turn that did work if it was stopped)."""
-    from ..agent.context import redact, run_digest
+    from ..agent.context import clip_summary, redact, run_digest, summary_target
     from ..agent.loop import TRAIL_MARK, trajectory_text
 
     rows = _earlier_turns(db, run)
@@ -377,11 +398,16 @@ def conversation_history(db, run: dict, window: int | None = None) -> tuple[list
                 interrupted = {"id": r["id"], "status": r["status"], "steps": n}
         elif n and len(rows) - i <= 3:  # (its last words are the answer itself)
             answer += "\n\n[Key steps of this turn]\n" + run_digest(ev, 2_500, actions=not trail, last_words=False)
-        checkpoint = next((e.get("summary") for e in reversed(ev) if e.get("type") == "compacted" and not e.get("depth")
-                           and e.get("summary")), "")
-        if checkpoint and (i == last_work or len(rows) - i <= 3):
-            answer += ("\n\n[This turn compacted its context; its last checkpoint summary:]\n"
-                       + redact(checkpoint[:6_000]))
+        compacted = next((e for e in reversed(ev) if e.get("type") == "compacted" and not e.get("depth")
+                          and e.get("summary")), None)
+        if compacted and (i == last_work or len(rows) - i <= 3):
+            # about the size it was written to (the summary target of the window), cut in its middle (said) and always
+            # with its Next Step — the section written for resuming
+            checkpoint = str(compacted["summary"])
+            shown = clip_summary(checkpoint, max(6_000, min(20_000, summary_target(window or _context_window(db, run)) * 4)))
+            where = (f"\n[The whole checkpoint is saved in {compacted['path']} — read_file it for the part omitted above.]"
+                     if shown != checkpoint and compacted.get("path") else "")
+            answer += "\n\n[This turn compacted its context; its last checkpoint summary:]\n" + redact(shown) + where
         if trail:
             answer += f"\n\n{TRAIL_MARK}\n" + trail
         history.append((r["task"], answer))

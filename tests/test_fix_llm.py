@@ -691,8 +691,11 @@ def test_user_anthropic_provider_never_receives_the_server_credentials(srv, monk
     # an Anthropic-compatible endpoint saved with the official URL is not redirected by ANTHROPIC_BASE_URL either
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway.operator.internal")
     prov, _ = get_provider("mine/claude-x", {"mine": {"kind": "anthropic", "base_url": "https://api.anthropic.com",
-                                                      "api_key": ""}})
-    assert str(prov.client.base_url).startswith("https://api.anthropic.com") and prov.client.api_key == ""
+                                                      "api_key": "sk-ant-mine"}})
+    assert str(prov.client.base_url).startswith("https://api.anthropic.com") and prov.client.api_key == "sk-ant-mine"
+    # saved WITHOUT a key, the official API is refused with the reason (final review llm#8), never sent keyless
+    with pytest.raises(LLMError, match="no API key"):
+        get_provider("mine/claude-x", {"mine": {"kind": "anthropic", "base_url": "https://api.anthropic.com", "api_key": ""}})
     # the server's own provider keeps using the server's key
     builtin, _ = get_provider("anthropic/claude-opus-5-5")
     assert builtin.client.api_key == "sk-ant-OPERATOR-SECRET"

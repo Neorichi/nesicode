@@ -10,8 +10,9 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from ..harness import Harness, hooks as harness_hooks, skills, sub_agents
+from ..harness.base import upgrade_hooks
 from ..llm import (DEFAULT_LIMITS, LLMError, ModelOptions, ToolCall, ToolResult, Usage, get_provider, known_limits,
-                   parse_limit)
+                   parse_limit, request_scope)
 from .hooks import Hooks
 from . import context as ctxm
 from .tools import (BASIC_TOOLS, GENERATE_IMAGE, SCHEMAS, SEARCH_HISTORY, SHARE_FILE, SHOW_IMAGE, VIEW_IMAGE, delegate_tool,
@@ -209,6 +210,10 @@ class Agent:
         self._anchor: tuple[int, int] | None = None  # (real prompt tokens of the last request, conversation chars then)
         self._cpt = ctxm.CHARS_PER_TOKEN  # chars per token seen in the provider's real counts (≤ the default)
         self._cpt_min = 3.0  # floor for that ratio; lowered when the provider proves the text is denser (_denser)
+        # the densest prompt measured in this run, without that floor (JSON/HTTP traffic and minified code: 2-3
+        # chars/token; base64 and CJK text: 1-1.5): sizes the summarizer's request, whose transcript is what the model
+        # read. Its own floors only catch nonsense counts (1.0 from a whole prompt, 0.5 from the summarizer's own text)
+        self._cpt_low = ctxm.CHARS_PER_TOKEN
         self._request_rel = ""  # where the user's full message was saved when it did not fit (written once per run)
         self._pending: list[tuple[ToolCall, ToolResult]] = []  # the tool round the model has not answered yet
         self._round_sizes: list[int] = []
@@ -228,10 +233,11 @@ class Agent:
         self._ro_streak = 0
         self._ro_reminded = False
         self._ro_at = 0  # the streak when the last reminder was given
+        self._strip_noted = False  # the model was told its older reasoning is cleared (small windows)
         self._live: dict[str, list[str]] = {}  # deltas of the reply being streamed (kept if Stop or an error cuts it)
         self._usage = Usage()
-        try:
-            self.hooks = Hooks(harness_hooks(harness))
+        try:  # (a project created with an earlier, quadratic spelling of the base rm rule runs the current one)
+            self.hooks = Hooks(upgrade_hooks(harness_hooks(harness)))
         except (ValueError, json.JSONDecodeError):
             self.hooks = Hooks({})
 
@@ -335,7 +341,9 @@ class Agent:
         """The provider counted `input_tokens` for what we sent: anchor the next estimates on it, and remember how dense
         the prompt was (code is ~3.3 chars/token) so the fit check right after a rebuild does not undercount."""
         if input_tokens > 500:
-            self._cpt = max(self._cpt_min, min(ctxm.CHARS_PER_TOKEN, (self._fixed_chars + self._conv_chars) / input_tokens))
+            seen = (self._fixed_chars + self._conv_chars) / input_tokens
+            self._cpt = max(self._cpt_min, min(ctxm.CHARS_PER_TOKEN, seen))
+            self._cpt_low = max(1.0, min(self._cpt_low, seen))
         self._anchor = (input_tokens, self._conv_chars)
 
     def _denser(self, error: str) -> None:
@@ -432,6 +440,7 @@ class Agent:
     def _open(self, provider, model, system, options, task, history_budget=None):
         conv = provider.conversation(model, system, self.tool_specs(), options)
         self._conv_chars, self._anchor, self._round_sizes = 0, None, []
+        self._strip_noted = False  # (a new conversation: no reasoning cleared from it yet)
         _dropped(conv)  # (reasoning a server refused earlier was stripped from another conversation)
         for u, a in self._fit_history(self._history, system, history_budget):
             self._add_user(conv, u)
@@ -579,7 +588,8 @@ class Agent:
         self._judge = True  # the provider's next real count says whether this compaction got under the trigger
         self._masked_at = 0
         self._ro_reminded = False  # the progress reminder may come again if the read-only streak goes on
-        self.emit({"type": "compacted", "used": used, "after": after, "limit": lim, "summary": summary[:20_000],
+        self.emit({"type": "compacted", "used": used, "after": after, "limit": lim,
+                   "summary": ctxm.clip_summary(summary, 20_000),  # (the next message resumes from its Next Step)
                    "path": md_rel, "transcript": tr_rel, "n": n, "reason": reason, **({"fallback": True} if fallback else {})})
         self._display = after
         self._ctx_event("compacted")
@@ -620,24 +630,28 @@ class Agent:
 
     def _summarize(self, provider, model, task, new_events, anchors) -> str:
         """The summarizer sees what the model saw (outputs as they were inline; the oldest elided first if they do not
-        fit, each elision said). Stop works during the call; a summary cut short, empty or stuck in reasoning is
-        retried once with a smaller transcript; "" means use the fallback."""
-        lim = self.context_limit
-        # generous (reasoning models spend it thinking) but at most a fifth of the window, so the summarizer's input
-        # can hold what the model had when the 67% trigger fired
-        out_tokens = max(1_024, min(self.output_limit or 32_768, 32_768, max(12_000, int(lim * 0.15)), int(lim * 0.2)))
-        target = ctxm.summary_target(lim)
-        earlier = ctxm.earlier_turns(self._history, min(20_000, int(lim * 4 * 0.06)))
-        room = int((lim - out_tokens - ctxm.safety_tokens(lim)) * min(ctxm.CONSERVATIVE_CPT, self._cpt)) - len(ctxm.SUMMARY_SYSTEM)
+        fit, each elision said). Its request is sized with the densest chars/token measured in this run; one the window
+        still rejects is sized again from the prompt size the provider reports and sent once more. Stop works during
+        the call; a summary cut short, empty or stuck in reasoning is retried once with a smaller transcript; "" means
+        use the fallback."""
         saved = {cid: info[1] for cid, info in self._saved.items()}
         thinking = getattr(provider, "name", "") != "anthropic"  # reasoning notes help; Claude's are not re-sent
-        for attempt in range(2):
+        shrink, resized = 1, False
+        for _ in range(3):
+            lim = self.context_limit
+            # generous (reasoning models spend it thinking) but at most a fifth of the window, so the summarizer's input
+            # can hold what the model had when the 67% trigger fired
+            out_tokens = max(1_024, min(self.output_limit or 32_768, 32_768, max(12_000, int(lim * 0.15)), int(lim * 0.2)))
+            cpt = min(ctxm.CONSERVATIVE_CPT, self._cpt, self._cpt_low * 0.95)
+            room = int((lim - out_tokens - ctxm.safety_tokens(lim)) * cpt) - len(ctxm.SUMMARY_SYSTEM)
+            target = ctxm.summary_target(lim) // shrink
+            earlier = ctxm.earlier_turns(self._history, min(20_000, int(lim * 4 * 0.06)))
             base = ctxm.summary_prompt(task, "", self._summary, anchors, earlier=earlier,
-                                       date=time.strftime("%Y-%m-%d"), target=target // (attempt + 1))
-            budget = max(2_000, (room - len(base)) // (attempt + 1))
+                                       date=time.strftime("%Y-%m-%d"), target=target)
+            budget = max(2_000, (room - len(base)) // shrink)
             prompt = ctxm.summary_prompt(task, ctxm.transcript(new_events, budget=budget, saved=saved, thinking=thinking),
                                          self._summary, anchors, earlier=earlier, date=time.strftime("%Y-%m-%d"),
-                                         target=target // (attempt + 1))
+                                         target=target)
             opts = ModelOptions(effort="low", role="summarizer", max_tokens=out_tokens, cancel=self.cancel)
             setattr(opts, "max_attempts", 2)  # a fallback exists: retries only lengthen the wait
             setattr(opts, "notify", self._notify_retry)
@@ -649,6 +663,9 @@ class Agent:
                 if self.cancel.is_set():
                     raise Cancelled() from exc
                 self.emit({"type": "compaction_error", "text": str(exc)[:300]}, persist=False)
+                if not resized and self._summary_too_big(str(exc), len(ctxm.SUMMARY_SYSTEM) + len(prompt)):
+                    resized = True  # the same stretch again, sized from what the provider measured
+                    continue
                 return ""
             if self.cancel.is_set():
                 raise Cancelled()
@@ -657,7 +674,26 @@ class Agent:
             if not problem:
                 return text
             self.emit({"type": "compaction_error", "text": f"summary rejected: {problem}"}, persist=False)
+            if shrink > 1:
+                return ""
+            shrink = 2
         return ""
+
+    def _summary_too_big(self, error: str, sent_chars: int) -> bool:
+        """Was the summarizer's request rejected as too big for the window? Then learn what its text really costs: the
+        prompt size the error reports (else 15% denser than assumed) and the window, when it names a smaller one — the
+        same model answers the executor, so that limit is the run's too. False for any other error."""
+        learned, sent = parse_limit(error), ctxm.prompt_tokens(error)
+        if not learned and not sent:
+            return False
+        cpt = sent_chars / sent if sent else min(self._cpt, self._cpt_low) * 0.85
+        self._cpt_low = max(0.5, min(self._cpt_low, cpt))  # (the provider counted exactly this text: trust it)
+        if learned and learned < self.context_limit:
+            self.context_limit = learned
+            if self.on_limit:
+                self.on_limit(learned)
+            self.emit({"type": "context_learned", "limit": learned})
+        return True
 
     def _fallback_summary(self, new_events: list[dict]) -> str:
         """Bounded and honest: the last good summary marked as OLDER, plus what the agent stated since (verbatim)."""
@@ -715,6 +751,7 @@ class Agent:
             scale[k] /= 2
         conv = provider.conversation(model, system, self.tool_specs(), options)
         self._conv_chars, self._anchor, self._round_sizes = 0, None, []
+        self._strip_noted = False  # (a new conversation: no reasoning cleared from it yet)
         _dropped(conv)  # (reasoning a server refused earlier was stripped from another conversation)
         for u, a in hist:
             self._add_user(conv, u)
@@ -777,12 +814,7 @@ class Agent:
 
     @staticmethod
     def _clip_summary(summary: str, n: int) -> str:
-        if len(summary) <= n:
-            return summary
-        i = summary.rfind("## Next Step")
-        nxt = summary[i:] if i >= 0 else ""
-        nxt = nxt[: n // 3]
-        return ctxm.clip(summary[: i] if i >= 0 else summary, max(400, n - len(nxt)), "summary") + ("\n" + nxt if nxt else "")
+        return ctxm.clip_summary(summary, n)
 
     # ------------------------------------------------------------------ tools
     def _other_chat_archive(self, args: dict) -> str | None:
@@ -876,15 +908,17 @@ class Agent:
                     raise ToolError(f"unknown skill {name!r}; available: {', '.join(sorted(skills(self.harness)))}")
                 out = sk["body"]
             elif call.name == "view_image" and self.vision_model:
-                out = describe_image(
-                    self.ws, str(call.arguments.get("path", "")), self.vision_model, self.user_keys,
-                    str(call.arguments.get("question", "")),
-                )
+                with request_scope(self.cancel, self._notify_retry):  # Stop ends the vision request at once
+                    out = describe_image(
+                        self.ws, str(call.arguments.get("path", "")), self.vision_model, self.user_keys,
+                        str(call.arguments.get("question", "")),
+                    )
             elif call.name == "generate_image" and self.image_model:
-                rel = generate_image(
-                    self.ws, str(call.arguments.get("prompt", "")), str(call.arguments.get("path", "")),
-                    self.image_model, self.user_keys,
-                )
+                with request_scope(self.cancel, self._notify_retry):  # (and the image download)
+                    rel = generate_image(
+                        self.ws, str(call.arguments.get("prompt", "")), str(call.arguments.get("path", "")),
+                        self.image_model, self.user_keys,
+                    )
                 self.emit({"type": "image", "path": rel, "caption": str(call.arguments.get("prompt", ""))[:300]})
                 out = f"Image saved to `{rel}` and shown to the user."
             elif call.name == "show_image":
@@ -982,8 +1016,20 @@ class Agent:
         res = sub.run(task)
         usage.add(res.usage)
         self.events.extend(sub.events)
+        # Only a finished sub-agent answered: a stopped one's text is just what it said at its last step (never its
+        # findings), and a refusal is not "nothing found". The result says what happened (persisted, so the next turn's
+        # trail and digest say it too).
         if res.status == "error":
             raise ToolError(f"subagent failed: {res.error}")
+        if res.status == "cancelled":
+            said = ctxm.clip(" ".join((res.final_text or "").split()), 400, "text")
+            raise ToolError(f"subagent stopped by the user after {res.steps} step(s); it did not finish"
+                            + (f" (what it said last, not an answer: «{said}»)" if said else ""))
+        if res.status == "refusal":
+            raise ToolError("the subagent's model refused the task (refusal / content filter): it did not do it")
+        if res.status == "max_steps":  # (its step budget, or its context, ran out: both end a run as max_steps)
+            return (f"[partial: the subagent stopped before finishing — its step budget or its context ran out after "
+                    f"{res.steps} step(s); its answer may be incomplete]\n" + (res.final_text or "(it returned nothing)"))
         return res.final_text or "(subagent returned nothing)"
 
     # ------------------------------------------------------------------ the loop
@@ -1188,6 +1234,18 @@ class Agent:
                 reason = "masked"
                 self.emit({"type": "masked", "freed": freed // 4, "used": used, "limit": lim})
             self._masked_at = used
+        # Small windows, past MASK_AT: only the newest reply keeps its replayed reasoning, whatever tool results are kept
+        # (each reply's reasoning piled up next to them: a 16k-32k reasoning model compacted every 3-4 calls). After the
+        # first time each step only changes the reply before the newest, near the end: the prompt cache stays valid.
+        if used > ctxm.MASK_AT * lim and lim <= ctxm.SMALL_WINDOW and _replays(conv):
+            freed = _strip_reasoning(conv, 1)
+            if freed:
+                self._conv_chars -= freed
+                if not self._strip_noted:  # (once per conversation: the system prompt already warns about it)
+                    self._add_note(conv, MASK_NOTE_REASONING)
+                    self._strip_noted = True
+                used = self._est()
+                reason = reason or "masked"
         # Layer 2: structured summary — only with real growth since the last one (no thrash).
         if used > ctxm.SUMMARY_AT * lim and used >= self._last_compact_after + ctxm.COMPACT_GROWTH * lim \
                 and self._can_compact():
@@ -1231,6 +1289,14 @@ def _dropped(conv) -> int:
     take = getattr(conv, "take_dropped", None)
     try:
         return int(take()) if callable(take) else 0
+    except Exception:
+        return 0
+
+
+def _strip_reasoning(conv, keep: int) -> int:
+    strip = getattr(conv, "strip_reasoning", None)
+    try:
+        return int(strip(keep)) if callable(strip) else 0
     except Exception:
         return 0
 

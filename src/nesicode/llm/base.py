@@ -7,7 +7,9 @@ The agent loop only ever talks to `Conversation`.
 
 from __future__ import annotations
 
+import contextvars
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -16,6 +18,26 @@ EventSink = Callable[[str, str], None]  # (kind, text_delta) where kind in {"tex
 
 class LLMError(RuntimeError):
     """A model call failed after the provider's own retries."""
+
+
+_SCOPE: contextvars.ContextVar = contextvars.ContextVar("nesicode_llm_scope", default=(None, None))
+
+
+@contextmanager
+def request_scope(cancel=None, notify=None):
+    """Model requests made in this block by code that does not pass them itself (a tool asking the vision or image
+    model) get this Stop event (`cancel`: the request is aborted at once and never sent again) and retry listener."""
+    token = _SCOPE.set((cancel, notify))
+    try:
+        yield
+    finally:
+        _SCOPE.reset(token)
+
+
+def scoped(cancel=None, notify=None) -> tuple:
+    """(cancel, notify): the ones given, else the enclosing request_scope's."""
+    c, n = _SCOPE.get()
+    return (cancel if cancel is not None else c), (notify if notify is not None else n)
 
 
 @dataclass
@@ -137,6 +159,11 @@ class Conversation(ABC):
         the prompt cache, so callers dry-run first). Default: not supported (0)."""
         return 0
 
+    def strip_reasoning(self, keep: int, apply: bool = True) -> int:
+        """Drop the replayed reasoning of every reply but the newest `keep` ones, whatever tool results are kept, and
+        return the characters freed (apply=False only counts them). Default: nothing is replayed (0)."""
+        return 0
+
     @staticmethod
     def maskable(sizes: list[int], pending: int, keep_last: int, keep_chars: int) -> list[int]:
         """Indexes (oldest first) of the tool results that may be masked, given their sizes; the last `pending`
@@ -163,16 +190,17 @@ class Provider(ABC):
         self, model: str, system: str, tools: list[ToolSpec], options: ModelOptions
     ) -> Conversation: ...
 
-    def vision(self, model: str, prompt: str, image: bytes, mime: str) -> tuple[str, Usage]:
-        """Answer `prompt` about one image. Providers without vision raise LLMError."""
+    def vision(self, model: str, prompt: str, image: bytes, mime: str, *, cancel=None, notify=None) -> tuple[str, Usage]:
+        """Answer `prompt` about one image. Providers without vision raise LLMError. `cancel` (default: the enclosing
+        request_scope's) aborts the request at once; `notify` hears about retries."""
         raise LLMError(f"provider {self.name!r} does not support images")
 
     def transcribe(self, model: str, audio: bytes, filename: str, language: str = "") -> str:
         """Speech to text. Providers without it raise LLMError."""
         raise LLMError(f"provider {self.name!r} cannot transcribe audio")
 
-    def generate_image(self, model: str, prompt: str) -> tuple[bytes, str]:
-        """Create one image from a text prompt. Returns (bytes, mime type)."""
+    def generate_image(self, model: str, prompt: str, *, cancel=None, notify=None) -> tuple[bytes, str]:
+        """Create one image from a text prompt. Returns (bytes, mime type). `cancel` / `notify` as in vision()."""
         raise LLMError(f"provider {self.name!r} cannot generate images")
 
     def complete(self, model: str, system: str, prompt: str, options: ModelOptions) -> tuple[str, Usage]:
