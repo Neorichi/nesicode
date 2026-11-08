@@ -322,7 +322,8 @@ class Agent:
         chars = self._fixed_chars + self._conv_chars
         sent = ctxm.prompt_tokens(error)
         cpt = chars / sent * 0.95 if sent and chars else self._cpt * 0.85
-        self._cpt = self._cpt_min = max(1.5, min(self._cpt, cpt))
+        self._cpt = max(1.5, min(self._cpt, cpt))
+        self._cpt_min = min(self._cpt_min, self._cpt)  # only ever lowered: later real counts may still go below it
 
     def _room(self) -> int:
         lim = self.context_limit

@@ -941,3 +941,12 @@ def test_cut_reply_still_continues_when_a_compaction_comes_right_after_it(tmp_pa
     res = _agent(Workspace(tmp_path / "ws"), events, context_limit=65_536).run("escribe los datos y luego el informe")
     assert [e["reason"] for e in events if e["type"] == "compacted"] == ["threshold"]
     assert res.status == "done" and res.final_text.count("# INFORME") == 1 and res.final_text.endswith("PARTE-2 fin.")
+
+
+def test_a_window_error_never_raises_the_density_floor(tmp_path):
+    a = Agent(model="mock/demo", harness=base_harness(), workspace=Workspace(tmp_path), context_limit=32_768)
+    a._fixed_chars, a._conv_chars = 4_000, 36_000  # prose: 4.0 chars/token as reported by the provider
+    a._denser("maximum context length is 8192 tokens. However, you requested 12000 tokens (10000 in the messages, 2000 ...)")
+    assert a._cpt_min <= 3.0
+    a._calibrate(12_000)  # later, code-heavy content measured at ~3.3 chars/token is still taken into account
+    assert a._cpt < 3.5
