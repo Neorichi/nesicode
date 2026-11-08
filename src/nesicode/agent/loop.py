@@ -1026,9 +1026,9 @@ class Agent:
                             + (f" (what it said last, not an answer: «{said}»)" if said else ""))
         if res.status == "refusal":
             raise ToolError("the subagent's model refused the task (refusal / content filter): it did not do it")
-        if res.status == "max_steps":
-            return (f"[partial: the subagent used its whole step budget ({res.steps} steps) before finishing — its "
-                    "answer may be incomplete]\n" + (res.final_text or "(it returned nothing)"))
+        if res.status == "max_steps":  # (its step budget, or its context, ran out: both end a run as max_steps)
+            return (f"[partial: the subagent stopped before finishing — its step budget or its context ran out after "
+                    f"{res.steps} step(s); its answer may be incomplete]\n" + (res.final_text or "(it returned nothing)"))
         return res.final_text or "(subagent returned nothing)"
 
     # ------------------------------------------------------------------ the loop

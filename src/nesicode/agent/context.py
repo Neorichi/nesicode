@@ -21,7 +21,7 @@ import os
 import re
 import time
 
-from .tools import SEARCH_WINDOW, _lines, _match, _nested_repeat, _search_regex
+from .tools import _lines, _match, _nested_repeat, _search_regex
 from .workspace import ToolError, Workspace, _walk
 
 MASK_AT = 0.49          # layer 1 trigger (share of the context window)
@@ -776,11 +776,14 @@ def _search(ws, files, rx, budget: _Budget | None = None) -> str:
     hits = []
     hidden = False
     deadline = budget.deadline if budget is not None else float("inf")
+    cancel = budget.cancel if budget is not None else None
     for rel, lines in _read_all(ws, files, budget):
         for i, line in enumerate(lines, 1):
-            if budget is not None and (i % 256 == 0 or len(line) > SEARCH_WINDOW) and budget.over():
+            # (every line that is not short: an allowed regex such as `(.*)token` costs ~50 ms on a 4,000-char line,
+            # and 256 of them kept Stop waiting ~12 s)
+            if budget is not None and (i % 256 == 0 or len(line) > 500) and budget.over():
                 break
-            m = _match(rx, line, deadline)  # long lines in windows: the backtracking of one call stays bounded
+            m = _match(rx, line, deadline, cancel)  # long lines in windows: the backtracking of one call stays bounded
             if m:
                 shown = _excerpt(line, m.start(), m.end())
                 hidden = hidden or "<redacted" in shown

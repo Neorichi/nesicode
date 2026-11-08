@@ -156,7 +156,11 @@ def attachments_note(ws: Workspace, attachments: list[dict], vision: str, keys: 
 HISTORY_TURN_CHARS = 400_000  # soft budget of one turn in history.md (a disk file: steps are shortened, never dropped)
 HISTORY_FULL_TURNS = 40  # the first turn and the newest ones get that budget; older ones a smaller one
 HISTORY_OLD_TURN_CHARS = 40_000
-HISTORY_MAX_CHARS = 30_000_000  # the whole file: well under what search_history reads of one file (ARCHIVE_READ_MAX)
+# The whole file, in UTF-8 BYTES: under what search_history reads of one file (ARCHIVE_READ_MAX, bytes) — the newest
+# turns are at its end, so a longer file would hide exactly them (CJK text is 3 bytes a char). Past it, older turns
+# keep only the user's message and the answer, each clipped to HISTORY_CLIPPED_CHARS.
+HISTORY_MAX_BYTES = 36_000_000
+HISTORY_CLIPPED_CHARS = 3_000
 TRAIL_MAX_CHARS = 240_000  # the previous turn's trail: ~20-25% of the window, but never more than this (1M windows)
 
 
@@ -166,9 +170,10 @@ def _write_thread_history(db: DB, ws: Workspace, run: dict, archive: str) -> Non
     turn conversation_history hands the agent is here: the turns its context leaves out ("search_history finds
     them") must be searchable. A long turn keeps every step: its observations, arguments and reasoning get shorter
     (head/tail lines), never its middle. Turns older than the newest HISTORY_FULL_TURNS get a smaller budget (a very
-    long one, its first and last steps); past HISTORY_MAX_CHARS the oldest keep only the user's words and the answer
-    (their outputs stay whole in the archive's outputs/)."""
+    long one, its first and last steps); past HISTORY_MAX_BYTES the oldest keep only the user's words and the answer,
+    clipped (their outputs stay whole in the archive's outputs/)."""
     from ..agent import trajectory_text
+    from ..agent.context import clip, write_context_file
 
     rows = _earlier_turns(db, run)  # the same turns conversation_history hands over
     if not rows:
@@ -178,20 +183,20 @@ def _write_thread_history(db: DB, ws: Workspace, run: dict, archive: str) -> Non
     for k in range(len(rows) - 1, -1, -1):  # newest first: they matter most if the file must stay small
         r = rows[k]
         full = k == 0 or len(rows) - k < HISTORY_FULL_TURNS
-        if used > HISTORY_MAX_CHARS and k:
+        task, answer = r["task"] or "", r["final_text"] or ""
+        if used > HISTORY_MAX_BYTES and k:
             steps = "(steps not kept here: this conversation's history is very long; its saved outputs are in outputs/)"
+            task, answer = clip(task, HISTORY_CLIPPED_CHARS, "message"), clip(answer, HISTORY_CLIPPED_CHARS, "answer")
         else:
             events = _turn_events(db, r["id"], 5_000 if full else 1_000)
             steps = trajectory_text(events, HISTORY_TURN_CHARS if full else HISTORY_OLD_TURN_CHARS,
                                     obs_chars=6_000 if full else 2_000, args_chars=3_000 if full else 1_000,
                                     thinking_chars=3_000 if full else 1_000, fit="shrink")
-        blocks.append(f"## Turno #{r['id']} ({r['status']})\n### Usuario\n{r['task']}\n### Pasos\n"
-                      f"{steps}\n### Respuesta final\n{r['final_text']}")
-        used += len(blocks[-1])
+        blocks.append(f"## Turno #{r['id']} ({r['status']})\n### Usuario\n{task}\n### Pasos\n"
+                      f"{steps}\n### Respuesta final\n{answer}")
+        used += len(blocks[-1].encode("utf-8", "replace"))
     parts = ["# Historial de esta conversación (turnos anteriores)"] + blocks[::-1]
     try:
-        from ..agent.context import write_context_file
-
         write_context_file(ws, "history.md", "\n\n".join(parts), archive)
     except Exception:
         pass

@@ -38,16 +38,19 @@ TOOL_GUIDANCE = """\
 
 # rm with any flags (-rf, -fr, -r -f, --recursive...) and among its arguments the root, the home or everything in them:
 # /, /*, ~, ~/, ~/*, $HOME, ${HOME}/*, quoted or not. Not `rm -rf build/`. Its arguments end at the line (a newline, or
-# `\n` in the JSON form): `rm -rf dist` + `cd ~` is fine. The argument scan never crosses another standalone `rm` word
-# (the last `rm` before the target is the one that matches): without that, a command of many `rm` words (`echo rm rm
-# …`) took quadratic time, holding the GIL — one tool call froze the server for minutes.
-RM_MATCH = (r"""(?:^|[\s;&|({`"'])rm(?:[ \t]+(?!rm[ \t])[^\s;&|\\]+)*?[ \t]+["']?(?:/\*?|~/?\*?|\$\{?HOME\}?/?\*?)["']?"""
-            r"""(?=$|[\s;&|)`"'])""")
+# `\n` in the JSON form): `rm -rf dist` + `cd ~` is fine. The argument scan never crosses an argument where another
+# match could start — a standalone `rm`, or one right after a quote, `(`, `{` or a backtick (`"rm`, `x(rm`): the last
+# such `rm` before the target is the one that matches. Without that, a command of many such words (`echo rm rm …`,
+# `echo "rm "rm …`) took quadratic time, holding the GIL — one tool call froze the server for minutes.
+RM_MATCH = (r"""(?:^|[\s;&|({`"'])rm(?:[ \t]+(?!(?:[^\s;&|\\]*[({`"'])?rm[ \t])[^\s;&|\\]+)*?[ \t]+["']?"""
+            r"""(?:/\*?|~/?\*?|\$\{?HOME\}?/?\*?)["']?(?=$|[\s;&|)`"'])""")
 # Earlier spellings of that rule (stored in the harnesses of projects created with them): the agent runs RM_MATCH
 # instead (upgrade_hooks). Same verdicts; only the time differs.
 LEGACY_RM_MATCHES = (
     r"""(?:^|[\s;&|({`"'])rm(?:\s+[^\s;&|]+)*?\s+["']?(?:/\*?|~/?\*?|\$\{?HOME\}?/?\*?)["']?(?=$|[\s;&|)`"'])""",
     r"""(?:^|[\s;&|({`"'])rm(?:[ \t]+[^\s;&|\\]+)*?[ \t]+["']?(?:/\*?|~/?\*?|\$\{?HOME\}?/?\*?)["']?(?=$|[\s;&|)`"'])""",
+    r"""(?:^|[\s;&|({`"'])rm(?:[ \t]+(?!rm[ \t])[^\s;&|\\]+)*?[ \t]+["']?(?:/\*?|~/?\*?|\$\{?HOME\}?/?\*?)["']?"""
+    r"""(?=$|[\s;&|)`"'])""",
 )
 
 HOOKS = {
