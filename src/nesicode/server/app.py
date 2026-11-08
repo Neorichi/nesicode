@@ -187,16 +187,22 @@ def cross_site_reason(method: str, headers) -> str:
         return ""
     hosts, trusted = _request_hosts(headers), _env_set("NESICODE_ALLOWED_ORIGINS")
     origin = headers.get("origin")
-    if origin is not None:
-        o = origin.strip().lower().rstrip("/")
-        return "" if o in trusted or (o != "null" and same_origin(o, hosts)) else (o or "null")
+    o = origin.strip().lower().rstrip("/") if origin is not None else None
+    if o is not None and o in trusted:
+        return ""
+    site = (headers.get("sec-fetch-site") or "").strip().lower()
+    if site and o != "null":
+        # Fetch metadata is computed by the browser itself (no page can set or fake it) against the URL it
+        # really requested, so it stays right behind a proxy that rewrites Host (nginx's plain proxy_pass)
+        return "" if site in ("same-origin", "none") else (o or f"Sec-Fetch-Site: {site}")
+    if o is not None:  # older browsers: compare Origin with the host the request was sent to
+        return "" if o != "null" and same_origin(o, hosts) else (o or "null")
     referer = headers.get("referer")
     if referer:
-        o = _origin_parts(referer)
-        as_origin = f"{o[0]}://{o[1]}" + (f":{o[2]}" if o[2] else "") if o else ""
+        r = _origin_parts(referer)
+        as_origin = f"{r[0]}://{r[1]}" + (f":{r[2]}" if r[2] else "") if r else ""
         return "" if same_origin(referer, hosts) or as_origin in trusted else referer[:100]
-    site = (headers.get("sec-fetch-site") or "none").lower()
-    return "" if site in ("same-origin", "none") else f"Sec-Fetch-Site: {site}"
+    return ""
 
 
 @app.middleware("http")
@@ -323,7 +329,10 @@ def register(body: Credentials, response: Response):
     name, pw = body.name.strip() or email.split("@")[0], auth.hash_password(body.password)
     if claim:
         uid = claim["id"]
-        db.execute("UPDATE users SET email=?, name=?, password_hash=? WHERE id=?", (email, name, pw, uid))
+        # atomic: of two sign-ups racing for the same unclaimed account, only the first one takes it
+        if db.execute("UPDATE users SET email=?, name=?, password_hash=? WHERE id=? AND password_hash=?",
+                      (email, name, pw, uid, claim["password_hash"])).rowcount != 1:
+            raise HTTPException(403, "El registro está desactivado")
     else:
         uid = db.insert("INSERT INTO users (email, name, password_hash, created_at) VALUES (?, ?, ?, ?)",
                         (email, name, pw, time.time()))
@@ -372,7 +381,6 @@ def check_base_url(url: str) -> str:
     """Endpoints must be http(s). With NESICODE_ALLOW_PRIVATE_PROVIDERS=0 (multi-user servers),
     non-public addresses are refused so users cannot probe the server's network. Every URL built from
     user input goes through here: providers, custom and catalog connectors, git clones, imports."""
-    import socket
     from urllib.parse import urlparse
 
     url = url.strip().rstrip("/")
@@ -384,14 +392,38 @@ def check_base_url(url: str) -> str:
         raise HTTPException(422, "El endpoint debe ser una URL http(s)://") from exc
     if u.scheme not in ("http", "https") or not host:
         raise HTTPException(422, "El endpoint debe ser una URL http(s)://")
-    if os.environ.get("NESICODE_ALLOW_PRIVATE_PROVIDERS", "1") == "0":
-        try:
-            addrs = {ai[4][0] for ai in socket.getaddrinfo(host, None)}
-        except OSError as exc:
-            raise HTTPException(422, f"No se puede resolver {host}") from exc
-        if not addrs or any(_non_public_ip(a) for a in addrs):
-            raise HTTPException(422, "Este servidor no permite endpoints en redes privadas")
+    if private_networks_forbidden():
+        public_addresses(host)
     return url
+
+
+def private_networks_forbidden() -> bool:
+    return os.environ.get("NESICODE_ALLOW_PRIVATE_PROVIDERS", "1") == "0"
+
+
+def public_addresses(host: str) -> list[str]:
+    """The addresses `host` resolves to, all public (else HTTP 422)."""
+    import socket
+
+    try:
+        addrs = sorted({ai[4][0].split("%", 1)[0] for ai in socket.getaddrinfo(host, None)})
+    except OSError as exc:
+        raise HTTPException(422, f"No se puede resolver {host}") from exc
+    if not addrs or any(_non_public_ip(a) for a in addrs):
+        raise HTTPException(422, "Este servidor no permite endpoints en redes privadas")
+    return addrs
+
+
+def git_pin(url: str) -> list[str]:
+    """git -c options that make it connect only to addresses checked here. git resolves the name again by
+    itself, and a DNS-rebinding name could answer a public address to us and a private one to git."""
+    from urllib.parse import urlparse
+
+    if not private_networks_forbidden():
+        return []
+    u = urlparse(url)
+    addrs = public_addresses(u.hostname or "")
+    return ["-c", f"http.curloptResolve={u.hostname}:{u.port or 443}:" + ",".join(f"[{a}]" if ":" in a else a for a in addrs)]
 
 
 def provider_rows(user_id: int) -> list[dict]:
@@ -786,11 +818,15 @@ def _unseal_or_422(data: bytes, password: str) -> dict:
 
 
 def _preview_config(user: dict, data: bytes, password: str) -> dict:
-    from .config_io import redirected_keys, summary, validate_import
+    from .config_io import redirected_keys, stricter_usages, summary, validate_import
 
     doc, report = validate_import(_unseal_or_422(data, password), auth_enabled=settings.auth_enabled, check_url=check_base_url,
                                   settings_model=UserSettings, current_settings=user_settings(user["id"]))
     report["notes"] += redirected_keys(db, user["id"], doc)[1]
+    kept, notes = stricter_usages(db, user["id"], doc)
+    report["notes"] += notes
+    for c in doc.get("connectors", []):
+        c["usage"] = kept.get(c["name"], c["usage"])
     return {**summary(doc), **report}
 
 
@@ -1501,7 +1537,10 @@ def add_connector(body: ConnectorAdd, user: dict = Depends(current_user)):
                 raise HTTPException(422, f"{f['label']}: escribe solo el nombre del servidor")
             url = url.replace("{" + f["key"] + "}", v)
     if url and not entry.get("local_only"):
-        url = check_base_url(url)  # the host comes from the user: same private-network rule as custom endpoints
+        # the host comes from the user: same private-network rule as custom endpoints. Only checked, never
+        # rewritten: the catalog's exact URL is the endpoint (GitHub's ends in '/', and MCP clients do not
+        # follow the 301 a server may answer for the other spelling)
+        check_base_url(url)
     fields = [{k: v for k, v in f.items() if k in ("key", "label", "secret", "header", "prefix", "env")}
               for f in entry["fields"] if not f.get("url_param")]
     for f in entry["fields"]:
@@ -1781,13 +1820,14 @@ def create_project(body: ProjectCreate, user: dict = Depends(current_user)):
             if not re.match(r"^https://[\w.-]+/[\w./~-]+$", url):
                 raise HTTPException(422, "Solo se admiten URLs git https://")
             check_base_url(url)  # no clones from the server's own network on multi-user servers
+            pin = git_pin(url)  # …not even if the name resolves differently when git looks it up again
         except HTTPException:
             db.execute("DELETE FROM projects WHERE id=?", (pid,))
             shutil.rmtree(project_root(p), ignore_errors=True)
             raise
         # No redirects (they could lead to a private address) and no stored credentials of the server's account.
         # Multi-user: links in a cloned repo could point at other users' files; check them out as plain files.
-        cmd = ["git", "-c", "http.followRedirects=false", "-c", "credential.helper=",
+        cmd = ["git", "-c", "http.followRedirects=false", "-c", "credential.helper=", *pin,
                *(["-c", "core.symlinks=false"] if settings.auth_enabled else []), "clone", "--depth", "1", url, str(ws)]
         ok, err = run_git(cmd)
         if not ok:
@@ -2435,17 +2475,23 @@ def thread_tree(thread_id: int, user: dict = Depends(current_user)):
     return list_tree(root) if root.is_dir() else []
 
 
+INLINE_IMAGES_BUDGET = 32 * 1024 * 1024  # data: URIs one page may get in all (a page can repeat one image endlessly)
+
+
 def _inline_local_images(body: bytes, page: Path, root: Path) -> bytes:
-    """<img src="chart.png"> next to the page → data: URI, so a sandboxed page still shows its local images."""
+    """<img src="chart.png"> next to the page → data: URI, so a sandboxed page still shows its local images.
+    Each image is read once (at most 5 MB) and the page gets INLINE_IMAGES_BUDGET of them in all: a 1 KB page
+    repeating `<img src="big.png">` must not make a response of gigabytes."""
     import base64 as _b64
 
     html = body.decode("utf-8", "replace")
     root = root.resolve()
-    limit = 5 * 1024 * 1024
+    limit, left = 5 * 1024 * 1024, [INLINE_IMAGES_BUDGET]
+    uris: dict[str, str | None] = {}  # rel -> data: URI (only ones that fit the budget are kept)
 
     def repl(m):
         quote, ref = m.group(2), m.group(3)
-        if re.match(r"^(https?:|data:|blob:|#|/)", ref):
+        if left[0] <= 0 or re.match(r"^(https?:|data:|blob:|#|/)", ref):
             return m.group(0)
         try:
             target = (page.parent / ref.split("?")[0]).resolve()
@@ -2453,13 +2499,20 @@ def _inline_local_images(body: bytes, page: Path, root: Path) -> bytes:
         except (ValueError, OSError):
             return m.group(0)
         mime = image_mime(target.name)
-        try:
-            data = read_in(root, rel, limit + 1) if mime else b""
-        except (UnsafePath, OSError):
+        if not mime:
             return m.group(0)
-        if not data or len(data) > limit:
+        if rel not in uris:
+            try:
+                data = read_in(root, rel, limit + 1)
+            except (UnsafePath, OSError):
+                data = b""
+            uri = f"data:{mime};base64,{_b64.b64encode(data).decode()}" if data and len(data) <= limit else None
+            uris[rel] = uri if uri and len(uri) <= left[0] else None
+        uri = uris[rel]
+        if uri is None or len(uri) > left[0]:
             return m.group(0)
-        return f"{m.group(1)}{quote}data:{mime};base64,{_b64.b64encode(data).decode()}{quote}"
+        left[0] -= len(uri)
+        return f"{m.group(1)}{quote}{uri}{quote}"
 
     return re.sub(r"""(<img\b[^>]*?\bsrc=)(["'])([^"']+)\2""", repl, html, flags=re.I).encode()
 

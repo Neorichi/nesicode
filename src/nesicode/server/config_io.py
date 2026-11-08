@@ -138,7 +138,8 @@ def summary(doc: dict) -> dict:
         "details": {
             "providers": [{"name": p["name"], "kind": p.get("kind"), "base_url": p.get("base_url")} for p in doc.get("providers", [])],
             "connectors": [{"name": c["name"], "kind": c.get("kind"), "enabled": bool(c.get("enabled", 1)),
-                            "command": " ".join([c.get("command") or "", *c.get("args", [])]).strip(), "url": c.get("url") or ""}
+                            "command": " ".join([c.get("command") or "", *c.get("args", [])]).strip(), "url": c.get("url") or "",
+                            "usage": c.get("usage") or "mention"}
                            for c in doc.get("connectors", [])],
             "settings": {k: v for k, v in (doc.get("settings") or {}).items() if k not in ("project_template", "pending_bots")},
             "check_command": (t or {}).get("check_command") or "",
@@ -179,12 +180,14 @@ def validate_import(doc: dict, *, auth_enabled: bool, check_url: Callable[[str],
     notes: list[str] = []
     out: dict = {}
 
-    def url_or_none(url, what: str) -> str | None:
+    def url_or_none(url, what: str, exact: bool = False) -> str | None:
         try:
-            return check_url(str(url or ""))
+            checked = check_url(str(url or ""))
         except Exception as exc:
             skipped.append(f"{what}: {getattr(exc, 'detail', None) or exc}")
             return None
+        # a connector keeps its URL exactly as written (GitHub's MCP endpoint ends in '/'); providers are normalised
+        return str(url).strip() if exact else checked
 
     providers = []
     for p in _items(doc.get("providers")):
@@ -229,11 +232,12 @@ def validate_import(doc: dict, *, auth_enabled: bool, check_url: Callable[[str],
         if kind == "http" or (kind == "builtin" and c.get("url")):
             if (entry or {}).get("local_only"):  # (local mode only) the user's own Burp & co. live on this machine
                 try:
-                    url = _basic_url(c.get("url"))
+                    _basic_url(c.get("url"))
                 except ConfigError as exc:
                     skipped.append(f"{tag}: {exc}")
                     continue
-            elif (url := url_or_none(c.get("url"), tag)) is None:
+                url = str(c.get("url")).strip()
+            elif (url := url_or_none(c.get("url"), tag, exact=True)) is None:
                 continue
         fields = []
         for f in _items(c.get("fields")):
@@ -320,6 +324,12 @@ def validate_import(doc: dict, *, auth_enabled: bool, check_url: Callable[[str],
         if b.get("policy") == "auto":  # unattended runs without approvals: only the user can switch that on
             b["policy"] = "ask"
             notes.append(f"bot «{b['name']}»: importado con «pedir aprobación»; el archivo pedía «auto» (cámbialo tú si quieres)")
+        # Like a command from a file, instructions from a file never run by themselves: on a schedule a bot reads the
+        # projects and fetches URLs unattended (those tools never ask), so it arrives switched off until reviewed.
+        if b["triggers"] and b.get("enabled") is not False:
+            b["enabled"] = False
+            notes.append(f"bot «{b['name']}»: importado DESACTIVADO (se ejecutaría solo con las instrucciones del archivo); "
+                         "revísalo y actívalo en Bots si te fías de él")
         bots.append(b)
     if bots:
         out["bots"] = bots
@@ -340,6 +350,20 @@ def redirected_keys(db: DB, user_id: int, doc: dict) -> tuple[list[str], list[st
             notes.append(f"proveedor «{p['name']}»: cambia de dirección ({p['base_url']}); su clave guardada se borra, "
                          "vuelve a ponerla si te fías de esa dirección")
     return names, notes
+
+
+def stricter_usages(db: DB, user_id: int, doc: dict) -> tuple[dict[str, str], list[str]]:
+    """Connectors of a (validated) document whose usage would be looser than the one they have now — e.g.
+    'ask' (each tool call needs the user's approval) → 'auto': {name: usage to keep}, and a note per name.
+    Same order as browser_usage: an import never switches approvals off."""
+    order, keep, notes = STRICTER["browser_usage"], {}, []
+    for c in doc.get("connectors", []):
+        old = db.one("SELECT usage FROM user_connectors WHERE user_id=? AND name=?", (user_id, c["name"]))
+        if old and old["usage"] in order and c.get("usage") in order and order.index(c["usage"]) > order.index(old["usage"]):
+            keep[c["name"]] = old["usage"]
+            notes.append(f"conector «{c['label']}»: se mantiene «{old['usage']}» (el archivo pedía «{c['usage']}», que relaja "
+                         "las aprobaciones; cámbialo tú en Conectores si lo quieres)")
+    return keep, notes
 
 
 def _basic_url(url: str) -> str:
@@ -366,6 +390,10 @@ def apply(db: DB, user_id: int, doc: dict, *, auth_enabled: bool | None = None, 
     report["notes"] += notes
     for name in dropped:
         v.delete(user_id, f"provider:{name}")  # never send a stored key to the endpoint a file chose
+    kept, notes = stricter_usages(db, user_id, doc)
+    report["notes"] += notes
+    for c in doc.get("connectors", []):
+        c["usage"] = kept.get(c["name"], c["usage"])
     for p in doc.get("providers", []):
         db.execute(
             "INSERT INTO user_providers (user_id, name, label, kind, base_url, models, created_at, updated_at) "
