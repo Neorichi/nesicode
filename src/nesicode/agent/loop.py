@@ -583,7 +583,8 @@ class Agent:
         window = lim * 4
         shares = {"history": 0.15, "task": 0.08, "pending": 0.12, "tail": 0.06, "files": 0.08, "skills": 0.03,
                   "anchors": 0.02, "summary": 0.10, "git": 0.01}
-        order = ["tail", "files", "skills", "anchors", "history", "pending", "summary", "task"]
+        caps = {"tail": 40_000, "files": 80_000, "skills": 12_000, "anchors": 8_000, "summary": 60_000, "git": 4_000}  # chars
+        order =["tail", "files", "skills", "anchors", "history", "pending", "summary", "task"]
         scale = {k: 1.0 for k in shares}
         cache: dict = {}
         pend_ids = {c.id for c, _ in self._pending}
@@ -591,7 +592,7 @@ class Agent:
         git = ctxm.git_state(self.ws, int(window * shares["git"]))
         saved = {cid: info[1] for cid, info in self._saved.items()}
         for _ in range(30):
-            b = {k: int(window * shares[k] * scale[k]) for k in shares}
+            b = {k: min(int(window * shares[k] * scale[k]), caps.get(k, 10**9)) for k in shares}
             hist = self._fit_history(self._history, system, b["history"] // 4)
             msg = self._checkpoint(task, summary, anchors, tail_events, b, cache, git, saved, tr_rel)
             chars = sum(len(u) + len(a) + 32 for u, a in hist) + len(msg) + 16
