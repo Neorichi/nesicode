@@ -329,8 +329,9 @@ def test_pipeline_report_never_lands_in_the_agents_files(tmp_path):
     assert out.startswith("exit code: 0") and (ws.root / "t.md").read_text() == "| a | b |\n|---|---|\n"
     plain = ws.run("echo a | cat \\")  # what bash itself does with a trailing backslash...
     assert bash(ws, {"command": "echo a | cat \\"}).startswith(f"exit code: {plain[0]}\n{plain[1]}")  # ...unchanged
-    out = bash(ws, {"command": "echo a | cat\nif then"})
-    assert "line 2: syntax error" in out  # bash's line numbers are still the agent's
+    errors = [ln for ln in ws.run("echo a | cat\nif then")[1].splitlines() if "syntax error" in ln]
+    assert errors and errors == [ln for ln in bash(ws, {"command": "echo a | cat\nif then"}).splitlines()
+                                 if "syntax error" in ln]  # bash's line numbers are still the agent's
     assert bash(ws, {"command": "trap 'echo mine' EXIT; false | cat"}) == "exit code: 0\nmine\n"  # the agent's own trap wins
 
 
