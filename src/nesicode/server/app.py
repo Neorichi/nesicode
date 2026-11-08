@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import io
+import itertools
 import json
 import os
 import re
 import secrets
 import shutil
 import sqlite3
+import stat
 import sys
 import subprocess
 import threading
 import time
+import unicodedata
 import zipfile
+import zlib
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
@@ -34,9 +40,20 @@ from .db import DB, loads
 from ..agent.vision import image_mime
 from ..agent.workspace import ATTACHMENTS_DIR, apply_cage, manifest
 from .jobs import (
-    FINAL, Jobs, create_cage, current_harness, project_root, project_ws, run_dir, save_harness_version,
+    FINAL, Jobs, create_cage, current_harness, merge_harness, project_root, project_ws, run_dir, save_harness_version,
     thread_dir, thread_ws, user_root,
 )
+from .config_io import KEY_RX
+from .limits import endpoint_problem, vetted
+
+try:  # raised when the project lock stays taken (apply/«Aplicar» while a shared conversation works)
+    from .jobs import ProjectBusy
+except ImportError:  # a jobs module that never raises it
+    class ProjectBusy(RuntimeError):  # type: ignore[no-redef]
+        pass
+
+BUSY_MSG = "El proyecto está ocupado por otra conversación; inténtalo cuando termine."
+LOCK_WAIT = 2.0  # seconds an HTTP request may wait for a project's lock (a shared conversation holds it for its run)
 
 db = DB(settings.db_path)
 vault = Vault(db)
@@ -73,8 +90,38 @@ def _add_credentials_rule() -> None:
 
 
 _add_credentials_rule()
+
+PROFILE_REFRESH_NOTE = "Perfil actualizado: el informe sigue el formato que pidas"
+
+
+def _refresh_profiles() -> None:
+    """Projects whose harness still holds an earlier shipped wording of their profile's own texts (e.g. the security
+    report step that hard-coded report.md) get today's, as a new version. Only those verbatim texts change, never
+    what the project learned (profiles.refresh_profile); later startups find nothing to do."""
+    from ..harness.profiles import refresh_profile
+
+    for p in db.all("SELECT * FROM projects"):
+        try:
+            files = refresh_profile(current_harness(db, p))
+            if files is not None:
+                save_harness_version(db, p["id"], files, "base", PROFILE_REFRESH_NOTE)
+        except Exception as exc:  # one odd project must never keep the app from starting
+            print(f"nesicode: could not refresh the profile texts of project {p['id']}:", exc)
+
+
+_refresh_profiles()
 jobs = Jobs(db)
-app = FastAPI(title="nesicode", version="0.1.0")
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    _chain_exit_signals()
+    yield
+    # The server is stopping this app (`nesicode serve` stopped, desktop window closed): runs and MCP servers stop too.
+    await asyncio.to_thread(stop_runtime)
+
+
+app = FastAPI(title="nesicode", version="0.1.0", lifespan=_lifespan)
 
 def _web_dist() -> Path:
     if os.environ.get("NESICODE_WEB_DIST"):
@@ -368,13 +415,10 @@ _server_models: dict[str, tuple[float, list[str]]] = {}
 
 def _non_public_ip(addr: str) -> bool:
     """Loopback, private, link-local (cloud metadata), CGNAT 100.64/10, multicast, reserved…: anything
-    that is not a public unicast address (IPv4-mapped IPv6 addresses are judged as the IPv4 inside)."""
-    import ipaddress
-
-    ip = ipaddress.ip_address(addr.split("%", 1)[0])
-    if ip.version == 6 and ip.ipv4_mapped:
-        ip = ip.ipv4_mapped
-    return not ip.is_global or ip.is_multicast or ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+    that is not a public unicast address (IPv4-mapped IPv6 addresses are judged as the IPv4 inside). The
+    same rule as the connect-time check of user endpoints (limits.endpoint_problem, built on the LLM layer's
+    address_problem), so what was accepted when saved is what is allowed when connecting."""
+    return bool(endpoint_problem(addr))
 
 
 def check_base_url(url: str) -> str:
@@ -454,16 +498,28 @@ def provider_rows(user_id: int) -> list[dict]:
     return out
 
 
-def fetch_models(kind: str, base_url: str, api_key: str) -> list[str]:
+def fetch_models(kind: str, base_url: str, api_key: str, *, mine: bool = True) -> list[str]:
     """list_models, with any malformed answer (an HTML page, `{"data": 5}`…) reported as LLMError
-    instead of escaping as a 500: the usual cause is the website's URL instead of the API's."""
+    instead of escaping as a 500: the usual cause is the website's URL instead of the API's. A user's
+    own endpoint (`mine`) is vetted where it really connects (its name may resolve elsewhere since it was
+    saved); the operator's built-in providers are not."""
     try:
-        return list_models(kind, base_url, api_key)
+        with vetted(base_url) if mine else nullcontext():
+            return list_models(kind, base_url, api_key)
     except LLMError:
         raise
     except Exception as exc:
         raise LLMError(f"la dirección no responde como una API de modelos ({type(exc).__name__}). "
                        "¿Es la URL de la API (p. ej. https://…/v1) y no la de la web?") from exc
+
+
+def clean_key(value: str | None) -> str:
+    """An API key as pasted, without surrounding spaces. Inside it only visible ASCII: a key with a line break, a
+    space or an accent would be stored and then break every request with an obscure error (no HTTP header carries it)."""
+    key = (value or "").strip()
+    if key and not KEY_RX.fullmatch(key):
+        raise HTTPException(422, "La API key no es válida: no puede tener espacios, saltos de línea ni acentos (cópiala tal cual)")
+    return key
 
 
 def _discover_server(name: str) -> list[str]:
@@ -472,7 +528,7 @@ def _discover_server(name: str) -> list[str]:
     cfg = server_provider_config(name)
     if not cfg:
         raise LLMError("proveedor desconocido")
-    models = fetch_models(cfg["kind"], cfg["base_url"], cfg["api_key"])  # the server key never leaves
+    models = fetch_models(cfg["kind"], cfg["base_url"], cfg["api_key"], mine=False)  # the server key never leaves
     _server_models[name] = (time.time(), models)
     return models
 
@@ -507,6 +563,16 @@ def get_model_limits(spec: str, refresh: bool = False, user: dict = Depends(curr
     from .limits import model_limits
 
     return {"spec": spec, **model_limits(db, user["id"], spec, refresh=refresh)}
+
+
+@app.delete("/api/models/limits")
+def forget_model_limits(spec: str, user: dict = Depends(current_user)):
+    """«Olvidar» a limit learned from a provider error (kept for good otherwise), e.g. after the local server was
+    restarted with a bigger window. Answers the fresh limits, as GET does."""
+    from .limits import forget_learned, model_limits
+
+    forget_learned(db, user["id"], spec)
+    return {"spec": spec, **model_limits(db, user["id"], spec, refresh=True)}
 
 
 @app.get("/api/providers")
@@ -608,11 +674,12 @@ def create_provider(body: ProviderBody, user: dict = Depends(current_user)):
         raise HTTPException(422, "Nombre: minúsculas, dígitos, - o _ (sin espacios)")
     if db.one("SELECT id FROM user_providers WHERE user_id=? AND name=?", (user["id"], name)):
         raise HTTPException(409, f"Ya tienes un proveedor llamado {name}")
-    base = check_base_url(body.base_url)
+    # everything is checked before anything is stored
+    base, key = check_base_url(body.base_url), clean_key(body.api_key)
     models, warning = _clean_models(body.models), ""
     if not models:  # ask the endpoint first: nothing is stored until we know what it answered
         try:
-            models = fetch_models(body.kind, base, (body.api_key or "").strip())
+            models = fetch_models(body.kind, base, key)
         except LLMError as exc:
             models, warning = [], f"No se pudieron obtener los modelos: {exc}"
     now = time.time()
@@ -625,8 +692,8 @@ def create_provider(body: ProviderBody, user: dict = Depends(current_user)):
     except sqlite3.IntegrityError as exc:  # the same form sent twice while the models were being listed
         raise HTTPException(409, f"Ya tienes un proveedor llamado {name}") from exc
     try:
-        if body.api_key and body.api_key.strip():
-            vault.put(user["id"], f"provider:{name}", body.api_key.strip())
+        if key:
+            vault.put(user["id"], f"provider:{name}", key)
         assigned = auto_assign(user, name, models)
         view = next(p for p in provider_rows(user["id"]) if p["name"] == name)
     except Exception:  # never leave a half-created provider behind ("Ya tienes un proveedor llamado …")
@@ -647,6 +714,7 @@ def _own_provider(user: dict, name: str) -> dict:
 @app.patch("/api/providers/{name}")
 def patch_provider(name: str, body: ProviderPatch, user: dict = Depends(current_user)):
     _own_provider(user, name)
+    key = clean_key(body.api_key) if body.api_key is not None else None  # (checked before anything changes)
     fields: dict = {}
     if body.label is not None:
         fields["label"] = body.label.strip() or name
@@ -662,9 +730,9 @@ def patch_provider(name: str, body: ProviderPatch, user: dict = Depends(current_
             f"UPDATE user_providers SET {', '.join(f'{k}=?' for k in fields)} WHERE user_id=? AND name=?",
             (*fields.values(), user["id"], name),
         )
-    if body.api_key is not None:
-        if body.api_key.strip():
-            vault.put(user["id"], f"provider:{name}", body.api_key.strip())
+    if key is not None:
+        if key:
+            vault.put(user["id"], f"provider:{name}", key)
         else:
             vault.delete(user["id"], f"provider:{name}")
     return next(p for p in provider_rows(user["id"]) if p["name"] == name)
@@ -733,7 +801,7 @@ class ProviderTest(BaseModel):
 
 @app.post("/api/providers/test")
 def test_provider(body: ProviderTest, user: dict = Depends(current_user)):
-    key = (body.api_key or "").strip()
+    key = clean_key(body.api_key)
     if not key and body.name:
         key = vault.get(user["id"], f"provider:{body.name}") or ""
     try:
@@ -1033,6 +1101,16 @@ def delete_bot_memory(bot_id: int, key: str, user: dict = Depends(current_user))
     return {"ok": True}
 
 
+@app.delete("/api/bots/{bot_id}/triggers/{trigger_id}")
+def delete_bot_trigger(bot_id: int, trigger_id: int, user: dict = Depends(current_user)):
+    """Remove one of the bot's triggers — e.g. a pending one-off follow-up («seguimiento», kind 'once') that the agent
+    scheduled and the bot editor cannot edit. A webhook goes through its own endpoint (its secret goes with it)."""
+    b = _bot(user, bot_id)
+    if db.execute("DELETE FROM bot_triggers WHERE id=? AND bot_id=? AND kind<>'webhook'", (trigger_id, b["id"])).rowcount != 1:
+        raise HTTPException(404, "Disparador no encontrado")
+    return {"ok": True}
+
+
 class CronPreview(BaseModel):
     kind: str = Field(pattern="^(cron|interval)$")
     spec: str = Field(max_length=200)
@@ -1271,10 +1349,11 @@ def _pairing_hash(token: str) -> str:
 @app.get("/api/browser")
 def browser_status(request: Request, user: dict = Depends(current_user)):
     from ..browser import hub
+    from ..connectors import trigger_words
 
     paired = db.one("SELECT created_at FROM browser_pairings WHERE user_id=?", (user["id"],))
     return {**hub.status(user["id"]), "paired": bool(paired), "extension_dir": str(EXTENSION_SRC),
-            "local_mode": not settings.auth_enabled}
+            "local_mode": not settings.auth_enabled, "trigger_words": trigger_words(template="browser")}
 
 
 @app.post("/api/browser/pairing")
@@ -1397,7 +1476,7 @@ async def browser_ws(ws: WebSocket):
 
 # ------------------------------------------------------------ MCP connectors
 def _connector_view(user_id: int) -> list[dict]:
-    from ..connectors import manager
+    from ..connectors import manager, trigger_words
     from .connectors_store import connector_configs
 
     out = []
@@ -1411,20 +1490,23 @@ def _connector_view(user_id: int) -> list[dict]:
             "command": " ".join([row["command"], *loads(row["args"], [])]).strip(), "url": row["url"],
             "enabled": bool(row["enabled"]), "usage": row.get("usage") or "mention", "tools": loads(row["tools"], []), "fields": fields,
             "status": manager().status(user_id, cfg) if row["enabled"] else "off",
+            # the words that switch it on in 'only when I ask' (usage 'mention') mode
+            "trigger_words": trigger_words(row["name"], row["label"], row["template"] or ""),
         })
     return out
 
 
 @app.get("/api/connectors")
 def list_connectors(user: dict = Depends(current_user)):
-    from ..connectors import CATALOG, missing_requirements
+    from ..connectors import CATALOG, missing_requirements, trigger_words
 
     mine = _connector_view(user["id"])
     added = {c["template"] for c in mine}
     local_ok = not settings.auth_enabled
     catalog = [
         {**{k: v for k, v in c.items() if k not in ("command", "args")},
-         "missing": missing_requirements(c), "allowed": local_ok or (c["kind"] in ("http", "builtin") and not c.get("local_only")), "added": c["id"] in added}
+         "missing": missing_requirements(c), "allowed": local_ok or (c["kind"] in ("http", "builtin") and not c.get("local_only")), "added": c["id"] in added,
+         "trigger_words": trigger_words(c["id"], c["label"], c["id"])}
         for c in CATALOG
     ]
     return {"catalog": catalog, "connectors": mine, "local_allowed": local_ok}
@@ -1487,13 +1569,25 @@ class ConnectorCustom(BaseModel):
     token: str = Field(default="", max_length=2000)
 
 
-def _unique_connector_name(user_id: int, base: str) -> str:
-    base = re.sub(r"[^a-z0-9_-]+", "-", base.lower()).strip("-")[:24] or "mcp"
-    name, n = base, 1
-    while db.one("SELECT id FROM user_connectors WHERE user_id=? AND name=?", (user_id, name)):
-        n += 1
-        name = f"{base}-{n}"
-    return name
+# Latin letters that Unicode does not decompose into an ASCII letter plus accents
+_LATIN_FOLD = str.maketrans({"ß": "ss", "æ": "ae", "Æ": "ae", "œ": "oe", "Œ": "oe", "ø": "o", "Ø": "o", "đ": "d",
+                             "Đ": "d", "ð": "d", "Ð": "d", "þ": "th", "Þ": "th", "ł": "l", "Ł": "l", "ı": "i"})
+
+
+def connector_slug(label: str) -> str:
+    """A connector name from its label: lower-case ASCII, accents transliterated ('Navegación' → 'navegacion'), at most
+    24 characters, starting with a letter or digit. '' when nothing of it is in Latin script (数据库)."""
+    text = unicodedata.normalize("NFKD", label.translate(_LATIN_FOLD)).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9_-]+", "-", text.lower()).strip("-_")[:24].strip("-_")
+
+
+def _unique_connector_name(user_id: int, label: str) -> str:
+    """A free connector name for this label. With no usable slug it is 'mcp-1', 'mcp-2'…: never a bare 'mcp', which
+    every MCP tool name (mcp__<connector>__<tool>) would seem to mention."""
+    slug = connector_slug(label)
+    names = (slug if n == 1 else f"{slug}-{n}" for n in itertools.count(1)) if slug and slug != "mcp" \
+        else (f"mcp-{n}" for n in itertools.count(1))
+    return next(n for n in names if not db.one("SELECT id FROM user_connectors WHERE user_id=? AND name=?", (user_id, n)))
 
 
 def _insert_connector(user: dict, name: str, label: str, template: str, kind: str, command: str,
@@ -1871,6 +1965,22 @@ class ProfileChange(BaseModel):
     profile: str = Field(pattern="^[a-z0-9_-]{1,30}$")
 
 
+def _profile_now(files: dict[str, str], stored: str | None) -> str | None:
+    """The profile a switch starts from. The stored one decides leaving Blank, even after an improvement rewrote Blank's
+    opening line — unless the harness plainly carries another profile (its markers, or a non-Blank opening line): a
+    version restored from the history after switching to Blank (the restore leaves projects.profile alone). Taking that
+    one for Blank would graft its text onto the base harness ('senior ethical hacker' kept in a web project)."""
+    from ..harness.profiles import BASE_INTRO, MARK_RX, OVERLAY_FILES, PROFILES, is_blank
+
+    if stored != "blank" or is_blank(files):
+        return stored
+    sp = files.get("system_prompt.md", "").lstrip()
+    intros = [BASE_INTRO] + [q["intro"] for q in PROFILES.values() if q.get("intro")]
+    if any(sp.startswith(i) for i in intros) or any(MARK_RX.search(files.get(n) or "") for n in OVERLAY_FILES):
+        return None  # judged by its own text (apply_profile)
+    return stored
+
+
 @app.post("/api/projects/{project_id}/profile")
 def change_profile(project_id: int, body: ProfileChange, user: dict = Depends(current_user)):
     """Switch the project's profile: a new harness version with the new profile's blocks and skills
@@ -1880,7 +1990,9 @@ def change_profile(project_id: int, body: ProfileChange, user: dict = Depends(cu
     p = get_project(user, project_id)
     if body.profile not in PROFILES:
         raise HTTPException(422, "Perfil desconocido")
-    files = apply_profile(current_harness(db, p), body.profile)
+    # leaving Blank is decided by the stored profile, even after an improvement rewrote Blank's opening line
+    files = current_harness(db, p)
+    files = apply_profile(files, body.profile, current=_profile_now(files, p.get("profile")))
     errors = validate(files)
     if errors:
         raise HTTPException(422, "; ".join(errors))
@@ -2184,6 +2296,15 @@ async def upload(project_id: int, file: UploadFile = File(...), user: dict = Dep
     return await asyncio.to_thread(_store_upload, root, name, data)
 
 
+ZIP_MAX_ENTRIES = 20_000  # files and folders one uploaded ZIP may hold
+ZIP_MAX_BYTES = 1024 ** 3  # what it may unpack to in all: a zip bomb packs gigabytes into a few kilobytes
+
+
+def _zip_link(info: zipfile.ZipInfo) -> bool:
+    """A symbolic link stored in the ZIP (Unix mode bits in the external attributes)."""
+    return info.create_system == 3 and stat.S_ISLNK(info.external_attr >> 16)
+
+
 def _store_upload(root: Path, name: str, data: bytes) -> dict:
     if not name.endswith(".zip"):
         try:
@@ -2195,13 +2316,24 @@ def _store_upload(root: Path, name: str, data: bytes) -> dict:
         zf = zipfile.ZipFile(io.BytesIO(data))
     except zipfile.BadZipFile as exc:
         raise HTTPException(422, "ZIP no válido") from exc
-    for info in zf.infolist():
+    infos = zf.infolist()
+    # Checked before anything is written: how many entries, how big unpacked (each entry's data stops at its
+    # declared size, and that is also enforced while copying), and that every path stays inside the project.
+    if len(infos) > ZIP_MAX_ENTRIES:
+        raise HTTPException(413, f"El ZIP tiene demasiadas entradas ({len(infos)}; máximo {ZIP_MAX_ENTRIES}). "
+                                 "Quita node_modules, .venv y similares, o sube el proyecto por partes.")
+    if sum(i.file_size for i in infos) > ZIP_MAX_BYTES:
+        raise HTTPException(413, f"El ZIP ocupa demasiado descomprimido (máximo {ZIP_MAX_BYTES // 1024 ** 2} MB)")
+    for info in infos:
         try:
             rel_parts(info.filename)
         except UnsafePath as exc:
             raise HTTPException(422, f"Ruta peligrosa en el ZIP: {info.filename}") from exc
-    count = 0
-    for info in zf.infolist():
+    count, written, skipped = 0, 0, []
+    for info in infos:
+        if _zip_link(info):  # never extracted (not even as a file holding the link's target)
+            skipped.append(f"{info.filename}: enlace simbólico, no se extrae")
+            continue
         try:
             if info.is_dir():
                 mkdirs_in(root, info.filename)
@@ -2212,12 +2344,20 @@ def _store_upload(root: Path, name: str, data: bytes) -> dict:
                 if not unlink_in(root, info.filename, only_link=True):
                     raise
                 fd = open_in(root, info.filename, WRITE_FLAGS | os.O_EXCL, mkdirs=True)
-            with zf.open(info) as src, os.fdopen(fd, "wb") as dst:  # links inside the ZIP become plain files
-                shutil.copyfileobj(src, dst)
+            with os.fdopen(fd, "wb") as dst, zf.open(info) as src:  # (the fd is closed even if the entry can't be opened)
+                left = info.file_size
+                while block := src.read(min(1 << 20, max(left, 0) + 1)):
+                    left -= len(block)
+                    written += len(block)
+                    if left < 0 or written > ZIP_MAX_BYTES:
+                        raise HTTPException(413, f"El ZIP ocupa demasiado descomprimido (máximo {ZIP_MAX_BYTES // 1024 ** 2} MB)")
+                    dst.write(block)
         except (UnsafePath, OSError) as exc:
             raise HTTPException(422, f"Ruta peligrosa en el ZIP: {info.filename}") from exc
+        except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError, RuntimeError) as exc:  # damaged, odd compression, encrypted
+            raise HTTPException(422, f"No se puede extraer {info.filename} del ZIP: {exc}") from exc
         count += 1
-    return {"ok": True, "files": count}
+    return {"ok": True, "files": count, **({"skipped": skipped} if skipped else {})}
 
 
 # ---------------------------------------------------------------------- harness
@@ -2378,7 +2518,19 @@ def create_thread(project_id: int, body: ThreadCreate, user: dict = Depends(curr
         (project_id, body.title.strip() or "Nueva conversación", isolated, now, now),
     )
     if isolated:
-        db.execute("UPDATE threads SET manifest=? WHERE id=?", (json.dumps(create_cage(p, tid)), tid))
+        try:
+            base = create_cage(p, tid)
+        except Exception as exc:
+            # no conversation without its cage: a half-made one would start from an empty manifest, so every file would
+            # count as its own change and «Aplicar» would copy the stale copy back over the project
+            db.execute("DELETE FROM threads WHERE id=?", (tid,))
+            shutil.rmtree(thread_dir(p, tid), ignore_errors=True)
+            msg = str(exc)
+            for path, label in ((str(project_root(p)), "<proyecto>"), (str(project_ws(p)), "<proyecto>"),
+                                (str(settings.data_dir), "<datos>")):
+                msg = msg.replace(path, label)  # the server's own folders are nobody's business
+            raise HTTPException(422, f"No se pudo copiar el proyecto para la conversación: {msg[:500]}") from exc
+        db.execute("UPDATE threads SET manifest=? WHERE id=?", (json.dumps(base), tid))
     return db.one(f"SELECT {THREAD_COLS} FROM threads t WHERE t.id=?", (tid,))
 
 
@@ -2446,8 +2598,9 @@ def approve_call(run_id: int, body: Decision, user: dict = Depends(current_user)
 def delete_thread(thread_id: int, user: dict = Depends(current_user)):
     t, p = get_thread(user, thread_id)
     busy = halt_runs("thread_id=?", (thread_id,), grace=THREAD_DELETE_GRACE)
-    # a bot IS its conversation: deleting the conversation deletes the bot (triggers, memory, webhook secret)
-    for b in db.all("SELECT id FROM bots WHERE id=? AND user_id=?", (t.get("bot_id") or -1, user["id"])):
+    # a bot IS its conversation: deleting the conversation deletes the bot (triggers, memory, webhook secret) — only
+    # the bot whose conversation this really is (ids are reused: a stale threads.bot_id must not take another bot along)
+    for b in db.all("SELECT id FROM bots WHERE id=? AND user_id=? AND thread_id=?", (t.get("bot_id") or -1, user["id"], thread_id)):
         vault.delete(user["id"], f"bot:{b['id']}:webhook")
         db.execute("UPDATE runs SET bot_id=NULL WHERE bot_id=?", (b["id"],))
         db.execute("DELETE FROM bots WHERE id=?", (b["id"],))
@@ -2456,7 +2609,33 @@ def delete_thread(thread_id: int, user: dict = Depends(current_user)):
     db.execute("DELETE FROM threads WHERE id=?", (thread_id,))
     _forget_telegram_targets(user["id"], thread_ids=[thread_id])
     shutil.rmtree(thread_dir(p, thread_id), ignore_errors=True)
+    if not t["isolated"]:  # a conversation that shared the project folder kept its archive there
+        _drop_shared_archive(project_ws(p), thread_id)
     return {"ok": True}
+
+
+def _drop_shared_archive(ws: Path, thread_id: int) -> None:
+    """Remove ws/.nesicode/chats/<id> (the archive of a deleted conversation that worked in the shared project folder),
+    never through a link: the agents working there may have planted one anywhere on that path."""
+    name = str(int(thread_id))
+    if _OPENAT and getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+        try:
+            dfd = _open_dirs(ws, [".nesicode", "chats"], False)  # each folder entered without following a link
+        except (OSError, UnsafePath):
+            return
+        try:
+            if _is_link_at(name, dfd):
+                os.unlink(name, dir_fd=dfd)  # the link itself, never what it points to
+            else:
+                shutil.rmtree(name, dir_fd=dfd, ignore_errors=True)
+        except OSError:
+            pass
+        finally:
+            os.close(dfd)
+        return
+    chain = [ws / ".nesicode", ws / ".nesicode" / "chats", ws / ".nesicode" / "chats" / name]  # (no dir fds: Windows)
+    if not any(c.is_symlink() for c in chain) and chain[-1].is_dir():
+        shutil.rmtree(chain[-1], ignore_errors=True)
 
 
 # ---- the conversation's cage: its files, its own changes, applying them to the project
@@ -2673,7 +2852,7 @@ def thread_file(thread_id: int, path: str, download: int = 0, view: int = 0, use
             body = _inline_local_images(body, root / rel, root)
         return Response(body, media_type="image/svg+xml" if suffix == ".svg" else "text/html; charset=utf-8",
                         headers={"Content-Security-Policy": HTML_SANDBOX_CSP, "X-Content-Type-Options": "nosniff",
-                                 "Cache-Control": "no-store"})
+                                 "Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
     if image_mime(name):
         return stream_fd(fd, image_mime(name))
     with os.fdopen(fd, "rb") as fh:
@@ -2691,6 +2870,24 @@ def thread_changes(thread_id: int, user: dict = Depends(current_user)):
     return {"isolated": True, **cage_changes(loads(t["manifest"], {}), thread_ws(p, t), project_ws(p))}
 
 
+@contextmanager
+def project_lock(project_id: int):
+    """The project's folder lock for a request: a shared conversation holds it for its whole run (approval waits
+    included), so a request waits at most LOCK_WAIT seconds and then answers 409 — it never hangs."""
+    lock = jobs._project_lock(project_id)
+    if not lock.acquire(timeout=LOCK_WAIT):
+        raise HTTPException(409, BUSY_MSG)
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@app.exception_handler(ProjectBusy)
+async def project_busy(_request: Request, exc: ProjectBusy):
+    return JSONResponse({"detail": str(exc) or BUSY_MSG}, status_code=409)
+
+
 @app.post("/api/threads/{thread_id}/apply")
 def thread_apply(thread_id: int, user: dict = Depends(current_user)):
     t, p = get_thread(user, thread_id)
@@ -2699,12 +2896,21 @@ def thread_apply(thread_id: int, user: dict = Depends(current_user)):
     if db.one("SELECT id FROM runs WHERE thread_id=? AND status IN ('queued', 'running')", (thread_id,)):
         raise HTTPException(409, "Espera a que termine la respuesta en curso")
     cage, target, base = thread_ws(p, t), project_ws(p), loads(t["manifest"], {})
-    with jobs._project_lock(p["id"]):
+    with project_lock(p["id"]):
         added, modified, removed = cage_change_sets(base, cage)
         prepare_targets(target, added + modified, removed)
         applied = apply_cage(base, cage, target)
-    # Re-baseline: later applies only carry changes made after this one.
-    db.execute("UPDATE threads SET manifest=? WHERE id=?", (json.dumps(manifest(cage)), thread_id))
+    # Re-baseline: later applies only carry changes made after this one — except the ones that could not be applied
+    # ('skipped': a link or a folder in the way…): they keep their starting entry, so the Changes panel goes on listing
+    # them until they apply (or are undone in the conversation).
+    done = {*applied.get("added", []), *applied.get("modified", []), *applied.get("removed", [])}
+    now = manifest(cage)
+    for rel in {*added, *modified, *removed} - done:
+        if rel in base:
+            now[rel] = base[rel]
+        else:
+            now.pop(rel, None)
+    db.execute("UPDATE threads SET manifest=? WHERE id=?", (json.dumps(now), thread_id))
     return applied
 
 
@@ -2815,8 +3021,12 @@ async def transcribe_audio(project_id: int, request: Request, audio: UploadFile 
 
     def run() -> dict:
         if spec:
-            provider, model = get_provider(spec, auth.user_keys(db, user["id"]))
-            return {"text": provider.transcribe(model, data, audio.filename or "audio.wav", lang.split("-")[0]), "engine": spec}
+            keys = auth.user_keys(db, user["id"])
+            provider, model = get_provider(spec, keys)
+            entry = keys.get(spec.split("/", 1)[0])  # the user's own endpoint: vetted where it really connects
+            with vetted(entry["base_url"]) if isinstance(entry, dict) else nullcontext():
+                text = provider.transcribe(model, data, audio.filename or "audio.wav", lang.split("-")[0])
+            return {"text": text, "engine": spec}
         if native_available():
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 f.write(data)
@@ -2859,6 +3069,9 @@ def improve_run(run_id: int, user: dict = Depends(current_user)):
     run, p = get_run(user, run_id)
     if run["kind"] != "chat" or run["status"] in ("queued", "running"):
         raise HTTPException(422, "Solo se puede mejorar a partir de una respuesta de chat terminada")
+    # its rollouts would run every command without asking: refused here, not as a run that ends in 'error'
+    if why := jobs._gated(p, {"thread_id": run["thread_id"]}):
+        raise HTTPException(409, why)
     if db.one("SELECT id FROM runs WHERE project_id=? AND kind='harness' AND status IN ('queued', 'running')", (p["id"],)):
         raise HTTPException(409, "Ya hay un harnessing en curso en este proyecto")
     rid = jobs.improve_from_chat(run, p, auto=False)
@@ -2919,17 +3132,42 @@ def send_run_now(run_id: int, user: dict = Depends(current_user)):
     return {"ok": jobs.send_now(run_id)}
 
 
+def _harness_files(project_id: int, version: int) -> dict:
+    row = db.one("SELECT files FROM harness_versions WHERE project_id=? AND version=?", (project_id, version))
+    return loads(row["files"], {}) if row else {}
+
+
 @app.post("/api/runs/{run_id}/adopt")
 def adopt_run(run_id: int, user: dict = Depends(current_user)):
+    """«Adoptar» a harnessing run's harness by hand. Like the automatic adoption it never undoes what changed in the
+    harness while the run worked (a manual edit, a profile switch, another run): the run's own edits are merged onto
+    the current version; when both changed the same file nothing is adopted and the answer says how to choose."""
     run, p = get_run(user, run_id)
     result = loads(run["result"], {}) or {}
     files = result.get("adopted_harness")
     if run["kind"] != "harness" or not files:
         raise HTTPException(422, "Esta ejecución no tiene un harness adoptable")
-    v = save_harness_version(db, p["id"], files, "harnessing", f"Adoptado de la ejecución #{run_id}", run_id)
+    if normalize(files) == normalize(current_harness(db, p)):
+        return {"version": p["harness_version"], "unchanged": True}  # (already adopted: no duplicate version)
+    base = int(run.get("harness_version") or p["harness_version"])  # the version the run started from
+    v, why, merged = jobs._adopt(p["id"], base, files, run_id, str(result.get("selected") or ""))
+    if v is None:
+        cur = db.one("SELECT harness_version FROM projects WHERE id=?", (p["id"],))
+        if not cur:
+            raise HTTPException(404, "Proyecto no encontrado")
+        ours = _harness_files(p["id"], cur["harness_version"])
+        combined, conflicts = merge_harness(_harness_files(p["id"], base), ours, files)
+        if conflicts:
+            raise HTTPException(409, f"El harness cambió desde que empezó esta ejecución (ahora es la v{cur['harness_version']}) "
+                                     f"y los dos cambiaron {', '.join(conflicts[:5])}: adoptarlo desharía esos cambios tuyos. "
+                                     f"Si prefieres los de la ejecución, restaura la v{base} en el historial del harness y "
+                                     "vuelve a pulsar «Adoptar».")
+        if combined == normalize(ours):
+            return {"version": cur["harness_version"], "unchanged": True}  # its changes are already there
+        raise HTTPException(409, f"No se ha adoptado: {why}")
     result["adopted_version"] = v
     db.execute("UPDATE runs SET result=? WHERE id=?", (json.dumps(result, ensure_ascii=False), run_id))
-    return {"version": v}
+    return {"version": v, **({"merged": True} if merged else {})}
 
 
 @app.post("/api/runs/{run_id}/apply")
@@ -2943,18 +3181,15 @@ def apply_run(run_id: int, user: dict = Depends(current_user)):
     rd = run_dir(p, run_id)
     after = rd / "rollouts" / str(selected) / "ws"
     if selected and after.is_dir():  # the same links/odd-files check as a conversation's apply
-        lock = jobs._project_lock(p["id"])
-        if not lock.acquire(blocking=False):
-            raise HTTPException(409, "Hay una respuesta en curso trabajando en este proyecto: espera a que termine")
-        try:
+        with project_lock(p["id"]):
             d = diff_workspaces(rd / "source", after, max_chars=0)
             prepare_targets(project_ws(p), d["added"] + d["modified"], d["removed"])
-        finally:
-            lock.release()
     try:
-        return {"changes": jobs.apply_later(run_id, p)}
-    except FileNotFoundError as exc:
-        raise HTTPException(410, str(exc)) from exc
+        return {"changes": jobs.apply_later(run_id, p)}  # (a lock still taken by then: ProjectBusy -> 409)
+    except FileNotFoundError as exc:  # (copies dropped once applied, or pruned: never "run it again" for applied ones)
+        raise HTTPException(410, "Ya no se puede aplicar: las copias del proyecto de esta ejecución ya no existen (sus "
+                                 "cambios ya se aplicaron, o se borraron para liberar espacio: solo se guardan las de las "
+                                 "últimas ejecuciones sin aplicar).") from exc
 
 
 @app.get("/api/runs/{run_id}/stream")
@@ -2982,6 +3217,8 @@ async def stream_run(run_id: int, request: Request, after: int = 0, user: dict =
         idle = 0
         while True:
             if await request.is_disconnected():
+                return
+            if _closing.is_set() and idle:  # the server is shutting down: end the stream once what was there is sent
                 return
             got = await asyncio.to_thread(poll, last, gen_seen, idx)
             if got is None:  # deleted (its conversation or project): nothing more will ever come from this run
@@ -3028,7 +3265,109 @@ def health():
     return {"ok": True, "sandbox": settings.sandbox, "auth": settings.auth_enabled}
 
 
+# --------------------------------------------------------------------- shutdown
+_stop_lock = threading.Lock()
+_stopped = False
+_closing = threading.Event()  # the server got its stop signal: open response streams end (see _chain_exit_signals)
+
+
+def _chain_exit_signals() -> None:
+    """Served from the main thread (`nesicode serve`, uvicorn): the server's first Ctrl+C / SIGTERM also stops the runs
+    at once and ends the open response streams. The server only shuts this app down once every connection is closed,
+    and a browser tab following a reply (its event stream — a reply waiting for an approval keeps it open for up to
+    30 minutes) would otherwise keep it waiting. Other threads (the desktop window, tests) handle shutdown themselves."""
+    import signal
+
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        prev = signal.getsignal(sig)
+        if getattr(prev, "_nesi_chained", False):
+            continue
+
+        def handler(signum, frame, prev=prev):
+            _closing.set()
+            threading.Thread(target=_halt, daemon=True, name="nesi-halt").start()  # (locks: never in a signal handler)
+            if callable(prev):
+                prev(signum, frame)
+            elif prev != signal.SIG_IGN:  # the default action: as if this handler had never been there
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+
+        handler._nesi_chained = True  # type: ignore[attr-defined]
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):  # not allowed here: the old behaviour stays
+            pass
+
+
+def _quietly(fn, *args) -> None:
+    try:
+        fn(*args)
+    except Exception as exc:  # stopping must go on whatever fails
+        print("nesicode: shutdown step failed:", getattr(fn, "__name__", fn), exc)
+
+
+def _halt() -> None:
+    """Nothing new starts (bot schedules, Telegram) and every run is told to stop now (messages not started stay
+    queued for the next start). Idempotent."""
+    _quietly(bots.stop)
+    for uid in list(telegram.bridges):
+        _quietly(telegram.stop, uid)
+    _quietly(jobs.shutdown, 0)
+
+
+def stop_runtime(wait: float = 5.0) -> None:
+    """The app is going away (the server stops it, the desktop window closed, the interpreter exits): nothing new
+    starts, every run is told to stop and gets `wait` seconds to record how it ended, and every MCP server process
+    is stopped — none may outlive the app. Idempotent; a second caller waits until the first one is done."""
+    global _stopped
+    with _stop_lock:
+        if _stopped:
+            return
+        _stopped = True
+        _halt()  # first: a run must not start an MCP server again once they are being stopped
+        # (no connectors module loaded: no MCP server was ever started)
+        connectors = sys.modules.get(__name__.rsplit(".", 2)[0] + ".connectors")
+        stop_all = getattr(connectors, "shutdown_all", None)
+        mcp = threading.Thread(target=_quietly, args=(stop_all,), daemon=True, name="nesi-mcp-stop") if stop_all else None
+        if mcp:
+            mcp.start()
+        _quietly(jobs.shutdown, wait)
+        if mcp:
+            mcp.join(timeout=15)
+
+
+try:  # at exit too, before Python joins its threads: also when the server never ran its shutdown (a forced exit)
+    threading._register_atexit(stop_runtime)  # type: ignore[attr-defined]
+except Exception:  # noqa: BLE001
+    atexit.register(stop_runtime)
+
+
 # ---------------------------------------------------------------------- SPA
+def spa_csp(desktop: bool = False) -> str:
+    """Content-Security-Policy of the app's own page: defense in depth, since it renders untrusted model output.
+    What the built UI loads comes from this server; images may also be inline (data:, blob:) and, once the user clicks
+    «cargar la imagen» on one in an answer, from an https site (the answer itself never loads one: Markdown.tsx).
+    Generated HTML is framed from /api with its own sandbox policy. No inline scripts anywhere; the desktop window's
+    bridge (pywebview) builds its JS API with `new Function`, so only that page allows eval."""
+    return "; ".join([
+        "default-src 'self'",
+        "script-src 'self'" + (" 'unsafe-eval'" if desktop else ""),
+        "style-src 'self'",
+        "img-src 'self' data: blob: https:",
+        "connect-src 'self'",
+        "frame-src 'self'",
+        "object-src 'none'",
+        "base-uri 'none'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+    ])
+
+
+SPA_HEADERS = {"Content-Security-Policy": spa_csp(desktop=bool(DESKTOP_TOKEN)), "Referrer-Policy": "no-referrer",
+               "X-Content-Type-Options": "nosniff"}
+
 if WEB_DIST.is_dir():
     app.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="assets")
 
@@ -3038,5 +3377,5 @@ if WEB_DIST.is_dir():
             raise HTTPException(404)
         f = (WEB_DIST / path).resolve()
         if path and WEB_DIST in f.parents and f.is_file():
-            return FileResponse(f)
-        return FileResponse(WEB_DIST / "index.html")
+            return FileResponse(f, headers=SPA_HEADERS)
+        return FileResponse(WEB_DIST / "index.html", headers=SPA_HEADERS)

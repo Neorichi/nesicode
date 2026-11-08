@@ -234,6 +234,15 @@ def _allow_microphone(port: int) -> None:
         print("nesicode: could not pre-authorize the microphone:", exc)
 
 
+def _close(server, thread: threading.Thread, stop_runtime) -> None:
+    """The window (or the browser fallback) is gone: stop every run and MCP server first, then the server. Done here
+    rather than left to the server's own shutdown, which a slow connection delays and a quitting interpreter can cut
+    short (the server thread is a daemon)."""
+    stop_runtime()
+    server.should_exit = True
+    thread.join(timeout=5)
+
+
 def main() -> None:
     # Desktop defaults, before anything imports nesicode.config / the server.
     _adopt_login_path()
@@ -252,10 +261,12 @@ def main() -> None:
 
     import uvicorn
 
-    from .server.app import app
+    from .server.app import app, stop_runtime
 
     port = _free_port()
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", access_log=False))
+    # (an open response stream must not keep a closing app waiting for long)
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", access_log=False,
+                                           timeout_graceful_shutdown=3))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     base = f"http://127.0.0.1:{port}"
@@ -273,6 +284,7 @@ def main() -> None:
                 time.sleep(1)
         except KeyboardInterrupt:
             pass
+        _close(server, thread, stop_runtime)
         return
 
     class Api:
@@ -331,8 +343,7 @@ def main() -> None:
     webview.create_window("Nesicode", url, width=1360, height=880, min_size=(900, 600), text_select=True,
                           js_api=Api() if safe else None)
     webview.start(private_mode=False, storage_path=str(app_data_dir() / "webview"))
-    server.should_exit = True
-    thread.join(timeout=5)
+    _close(server, thread, stop_runtime)
 
 
 if __name__ == "__main__":
