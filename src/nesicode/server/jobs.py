@@ -312,7 +312,10 @@ def continuity_note(thread_id: int, interrupted: dict | None) -> str:
 # alike): filePath, output_path, outputDir, paths, file_name… — but never fileId, folderId, direction, profile,
 # output_format, redirect… (those are not paths: rewriting them broke real servers).
 _PATH_WORDS = {"path", "paths", "file", "files", "filename", "filenames", "dir", "dirs", "directory", "directories",
-               "folder", "folders"}
+               "folder", "folders",
+               # the same written as one lowercase word (excel-mcp-server's `filepath`…) — never xpath, jsonpath, profile
+               "filepath", "filepaths", "pathname", "dirpath", "dirname", "folderpath", "outfile", "infile", "logfile",
+               "outdir", "indir", "workdir", "basedir", "rootdir", "outpath", "savepath"}
 # Words that hold a path only when the value is a file name ("Informe Q3.docx", "out.png"), not an id, a format
 # ("json") or a text.
 _DOC_WORDS = {"document", "workbook", "presentation", "spreadsheet", "docx", "xlsx", "pptx", "output"}

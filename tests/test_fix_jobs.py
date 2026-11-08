@@ -598,6 +598,9 @@ def test_absolutize_touches_only_real_path_arguments(tmp_path):
     assert out == {"presentation": str(root / "Informe trimestral.pptx"), "output": str(root / "resultado.png")}
     assert absolutize_paths({"output": "json", "document": "texto con un punto. Y más"}, ws) == \
         {"output": "json", "document": "texto con un punto. Y más"}
+    # names written as one lowercase word (excel-mcp-server: `filepath`) are still paths; xpath/jsonpath never are
+    out = absolutize_paths({"filepath": "ventas.xlsx", "outdir": "out", "xpath": "div/span", "jsonpath": "a.b"}, ws)
+    assert out == {"filepath": str(root / "ventas.xlsx"), "outdir": str(root / "out"), "xpath": "div/span", "jsonpath": "a.b"}
 
 
 class _FakeManager:
