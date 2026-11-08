@@ -381,7 +381,8 @@ def test_daily_cap_notice_once_a_day_and_off_the_lock(alice, project, monkeypatc
         settle(b["id"])
     hook = alice.post(f"/api/bots/{b['id']}/webhook").json()
     assert TestClient(app).post(f"/hooks/{b['id']}", headers={"X-Nesicode-Token": hook["token"]}, content=b"x").status_code == 409
-    time.sleep(0.3)  # notices go out in the background
+    wait_for(lambda: any("límite" in s[0] for s in fake.sent), 5, "the cap notice")  # notices go out in the background
+    time.sleep(0.3)  # time for a second one, if there were one
     caps = [s for s in fake.sent if "límite" in s[0]]
     assert db.one("SELECT COUNT(*) AS n FROM runs WHERE bot_id=?", (b["id"],))["n"] == 2
     assert len(caps) == 1 and caps[0][1] is False and caps[0][2] == "nesi-bots-notice"
