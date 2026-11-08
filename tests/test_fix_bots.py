@@ -1005,7 +1005,7 @@ def test_compressed_pages_are_unpacked_within_the_limit(monkeypatch):
 def test_fence_scan_is_linear_on_hostile_payloads():
     """#5: the fence defusing regex ran in fire() — under the bots lock, on the webhook's event loop — and '<' + 20,000
     spaces took 1-1.5 s holding the GIL."""
-    for filler in (" ", " ", "/", "-"):
+    for filler in (" ", "\u2003", "/", "-"):  # \u2003: an em space, which page text keeps
         for payload in ("<" + filler * 19_999, "<untrusted" + filler * 19_990):
             t0 = time.perf_counter()
             botmod.fence_payload(payload, "webhook")
