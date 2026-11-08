@@ -936,3 +936,16 @@ def test_anthropic_cut_right_after_the_tool_name_gets_parse_error(srv):
     assert turn.stop_reason == "max_tokens" and [(c.arguments, c.parse_error) for c in turn.tool_calls] == [({}, CUT)]
     turn = a_conv(s).step()  # a tool without parameters that ended normally still runs
     assert [(c.name, c.parse_error) for c in turn.tool_calls] == [("list_dir", "")]
+
+
+def test_user_anthropic_endpoint_is_checked_at_connect_time(srv, monkeypatch):
+    """NESICODE_ALLOW_PRIVATE_PROVIDERS=0 also covers user-defined Anthropic endpoints (key and prompt never sent)."""
+    s = srv(default=stream(a_start(), a_text("leak"), a_end("end_turn")))
+    monkeypatch.setenv("NESICODE_ALLOW_PRIVATE_PROVIDERS", "0")
+    prov, model = get_provider("mine/claude-sonnet-5-5",
+                               {"mine": {"kind": "anthropic", "base_url": s.url, "api_key": "sk-ant-user"}})
+    conv = prov.conversation(model, "sys", [], ModelOptions(max_tokens=100))
+    conv.add_user("hi")
+    with pytest.raises(LLMError, match="private or local"):
+        conv.step()
+    assert not s.requests
