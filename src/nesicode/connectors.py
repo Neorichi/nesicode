@@ -9,12 +9,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
+import concurrent.futures
+import functools
 import hashlib
 import json
 import os
 import re
 import shutil
+import sys
 import threading
+import time
+import unicodedata
 from dataclasses import dataclass, field
 
 # ------------------------------------------------------------------ catalog
@@ -92,34 +98,104 @@ CATALOG: list[dict] = [
 ]
 
 
-# Words that count as "the user asked for this connector" (besides its name and label).
+# Words that count as "the user asked for this connector" (besides its name), for catalog connectors. Only
+# specific words: generic ones ('issue', 'tab', 'word', 'roadmap') switched connectors on in ordinary coding
+# talk ("convert tabs to spaces", "there's an issue with the login", "count the words").
 ALIASES = {
     "chrome": ["chrome devtools", "devtools", "chrome aparte"],
     "playwright": ["playwright"],
-    "github": ["github", "pull request", "issue"],
-    "office": ["office", "word", "excel", "powerpoint", "docx", "xlsx", "pptx", "hoja de calculo", "presentacion"],
+    "github": ["github", "pull request"],
+    "office": ["office", "excel", "powerpoint", "docx", "xlsx", "xlsm", "pptx", "hoja de calculo", "presentacion"],
     "burp": ["burp"], "burp-rest": ["burp"], "burp-dast": ["burp", "dast"],
-    "ms-roadmap": ["roadmap", "microsoft 365", "azure update"],
+    "ms-roadmap": ["microsoft 365", "m365", "azure update"],
     "virustotal": ["virustotal", "virus total"],
-    "browser": ["chrome", "mi navegador", "my browser", "navegador del usuario", "pestana", "tab"],
+    "browser": ["chrome", "mi navegador", "my browser", "navegador del usuario"],
 }
+# Generic words that count only in a phrase that clearly names the product ('hazme un Word', 'in Word',
+# 'Word document', 'roadmap de Microsoft'). Regexes over the normalised text (see _norm).
+PHRASES = {
+    # singular only: the plural after these words is the English noun ('in words', 'mark my words', 'in your words')
+    "office": [r"(?:un|una|el|al|del|de|en|con|usa|usar|use|using|in|into|with|mi|my|tu|your|este|ese) word",
+               r"words? (?:docs?|documents?|files?|templates?|documentos?|archivos?|ficheros?|plantillas?)"],
+    "ms-roadmap": [r"(?:microsoft|m365|365|azure) roadmaps?",
+                   r"roadmaps? (?:de |del |of |for )?(?:microsoft|m365|office 365|azure)"],
+}
+# Words that don't identify a custom connector on their own ('Linear de mi equipo', 'Servidor Jira', 'MCP local').
+# The second group: the words of Nesicode's own tool names, which the mention check sees in almost every conversation
+# (connector_context lists the tools used: 'search', 'read_file', 'view_image'…), and everyday words of coding and
+# office talk. 'Brave Search' must not switch on whenever the agent searched the code, nor 'Jira Cloud' at "the cloud".
+_GENERIC = frozenset("""
+    a al an and at con de del e el en for in la las lo los mi mis my o of on or our para por su sus the their to tu tus
+    u un una unas unos with y your api base cliente client company conector connector cuenta account data datos dev
+    empresa equipo home interno internal local mcp new nueva nuevo oficina personal prod produccion production prueba
+    pruebas remote remoto server servicio service servidor team test trabajo work casa
+    back bash bot chart click close create delegate delete dir edit fetch file files get history http image images list
+    load memory notify once open read replace report scan schedule screenshot scroll search set share skill tab tabs
+    type url view write
+    archivo archivos buscador busqueda cloud code codigo doc docs document documento documentos documents error errores
+    errors fichero ficheros google herramienta herramientas microsoft tool tools web
+    as be by do if is it me no se si so te up us vs we ya yo
+""".split())
 
 
 def _fold(text: str) -> str:
-    import unicodedata
-
     return "".join(c for c in unicodedata.normalize("NFD", text.lower()) if unicodedata.category(c) != "Mn")
 
 
+def _norm(text: str) -> str:
+    """Lower case, no accents, any run of non-letters → one space; letters of every script are kept (数据库)."""
+    return " " + " ".join(re.findall(r"[^\W_]+", _fold(text or ""))) + " "
+
+
+def _wide(word: str) -> bool:
+    """CJK/kana/hangul: written without spaces, so it is matched inside longer runs of text."""
+    return any(unicodedata.east_asian_width(c) in "WF" for c in word)
+
+
+def _phrase_re(words: list[str]) -> re.Pattern:
+    if any(_wide(w) for w in words):
+        return re.compile(re.escape(" ".join(words)))
+    # whole words, each with an optional plural ('hojas de calculo', 'presentaciones', 'Excels')
+    return re.compile(" " + " ".join(re.escape(w) + ("(?:e?s)?" if len(w) >= 3 and w[-1].isalpha() else "")
+                                     for w in words) + " ")
+
+
+def trigger_words(name: str = "", label: str = "", template: str = "") -> list[str]:
+    """The words that switch an 'only when I ask' connector on (for the UI / the agent's suggestion)."""
+    custom = template not in ALIASES
+    whole = label.split("(")[0]
+    phrases = [whole, name] if custom else list(ALIASES[template]) + [name]
+    if custom:  # plus each distinctive word of its label and name ('Confluence empresa' → 'confluence')
+        for src in (label, name):
+            words = [w for w in _norm(src).split() if w not in _GENERIC]
+            short_only = not any(len(w) >= 3 or _wide(w) for w in words)
+            # 2-letter words count when they are all there is ('DB', 'Mi DB') or carry a digit ('AWS S3')
+            phrases += [w for w in words if len(w) >= 3 or _wide(w) or (len(w) == 2 and (short_only or any(c.isdigit() for c in w)))]
+    out: list[str] = []
+    for i, ph in enumerate(phrases):
+        words = _norm(ph).split()
+        # a lone generic word only counts when it is the whole label the user gave it ('Datos', 'API'), never the
+        # fallback name 'mcp', which would match every MCP tool name in the context
+        if not words or (len(words) == 1 and words[0] in _GENERIC and not (custom and i == 0 and words[0] != "mcp")):
+            continue
+        size = len("".join(words))
+        if size < 2 or (size == 2 and (len(words) > 1 or not (custom or _wide(words[0])))):
+            continue
+        if (p := " ".join(words)) not in out:
+            out.append(p)
+    return out
+
+
+@functools.lru_cache(maxsize=512)
+def _patterns(name: str, label: str, template: str) -> tuple[re.Pattern, ...]:
+    pats = [_phrase_re(p.split()) for p in trigger_words(name, label, template)]
+    return tuple(pats + [re.compile(" " + r + " ") for r in PHRASES.get(template, [])])
+
+
 def mentioned(text: str, *, name: str = "", label: str = "", template: str = "") -> bool:
-    """Did the user name this connector? ('usa burp', 'en un Excel', 'con VirusTotal'…)"""
-    t = " " + re.sub(r"[^a-z0-9]+", " ", _fold(text)) + " "
-    words = list(ALIASES.get(template, [])) + [name, label.split("(")[0]]
-    for w in words:
-        w = re.sub(r"[^a-z0-9]+", " ", _fold(w)).strip()
-        if len(w) >= 3 and f" {w} " in t or (len(w) >= 3 and f" {w}s " in t):
-            return True
-    return False
+    """Did the user name this connector? ('usa burp', 'en un Excel', 'con VirusTotal', 'busca en Confluence'…)"""
+    t = _norm(text)
+    return any(p.search(t) for p in _patterns(name or "", label or "", template or ""))
 
 
 def catalog_entry(template_id: str) -> dict | None:
@@ -168,116 +244,286 @@ def _describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+# The server no longer knows our session (it restarted): the request was rejected without running. The whole
+# message must be one of the transports' own answers ('Session not found', 'Bad Request: No valid session ID
+# provided', 'Not Found: Invalid or expired session ID', 'Bad Request: Server not initialized'…): a tool's error
+# that mentions a session ('invalid session token for Jira') ran, and must not be repeated.
+_SESSION_GONE = re.compile(r"(?:(?:bad request|not found|error)\s*:\s*)?(?:session not found|no valid session(?: id)?"
+                           r"(?: provided)?|(?:unknown|invalid|invalid or expired|expired) session(?: id)?|session (?:id )?"
+                           r"(?:has )?expired|session terminated|server not initialized)(?:[\s:=(]+[\w.-]{6,}\)?)?\W*", re.I)
+
+
+def _lost(exc: BaseException) -> str:
+    """'gone' when the server dropped our session, 'closed' when the connection died, 'suspect' when an HTTP server
+    answered an error status without a JSON-RPC error (python-sdk 1.x servers answer an unknown session with a plain
+    '400 Bad Request', but a crash after running the tool looks the same: never repeat it, reconnect next time), ''
+    for any other error."""
+    while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
+        exc = exc.exceptions[0]
+    msg = str(getattr(exc, "message", "") or exc).strip()
+    if _SESSION_GONE.fullmatch(msg):
+        return "gone"
+    if msg.lower() == "connection closed" or type(exc).__name__ in ("ClosedResourceError", "BrokenResourceError"):
+        return "closed"
+    if msg.lower() == "server returned an error response":
+        return "suspect"
+    return ""
+
+
+class _StderrTail:
+    """A stdio server's stderr: still copied to ours (terminal / nesicode.log), and its last lines kept so a
+    failed start says why ('Error: falta la variable NOTION_TOKEN') instead of 'Connection closed'."""
+
+    # stack frames and code lines (indented) and the traceback header: noise next to the error line itself
+    _NOISE = re.compile(r"^\s|^Traceback \(most recent call last\)")
+
+    def __init__(self, name: str):
+        rfd, wfd = os.pipe()
+        self.file = os.fdopen(wfd, "wb", buffering=0)  # handed to the server process as its stderr
+        self.lines: collections.deque[str] = collections.deque(maxlen=40)
+        self.thread = threading.Thread(target=self._pump, args=(rfd,), daemon=True, name=f"mcp-stderr-{name}")
+        self.thread.start()
+
+    def _pump(self, rfd: int) -> None:
+        part = b""
+        with os.fdopen(rfd, "rb", buffering=0) as f:
+            while chunk := f.read(65536):
+                try:
+                    if sys.stderr is not None:
+                        sys.stderr.write(chunk.decode("utf-8", "replace"))
+                except Exception:  # noqa: BLE001 - logging must never block the server's pipe
+                    pass
+                lines = (part + chunk).split(b"\n")
+                part = lines.pop()[:4096]  # bounded, even for a line that never ends
+                self.lines.extend(ln.decode("utf-8", "replace").rstrip()[:400] for ln in lines if ln.strip())
+        if part.strip():
+            self.lines.append(part.decode("utf-8", "replace").rstrip()[:400])
+
+    def close_writer(self) -> None:
+        try:
+            self.file.close()  # the server has its own copy; ours must close so the reader sees the end
+        except OSError:
+            pass
+
+    async def tail(self) -> str:
+        for _ in range(20):  # the server is gone: give the reader a moment to drain the pipe
+            if not self.thread.is_alive():
+                break
+            await asyncio.sleep(0.025)
+        raw = list(self.lines)
+        lines = [ln for ln in raw if not self._NOISE.search(ln)] or raw
+        return "\n".join(lines[-10:])[-1200:]
+
+
 class _Connection:
-    def __init__(self, cfg: ConnectorConfig):
+    def __init__(self, cfg: ConnectorConfig, user_id: int = 0):
         self.cfg = cfg
+        self.user_id = user_id
         self.session = None
         self.ready = asyncio.Event()
-        self.stop = asyncio.Event()
+        self.stop = asyncio.Event()  # set by stop()/_drop(): shuts the server down, even while it is starting
         self.error: str = ""
         self.tools: list[McpTool] = []
         self.task: asyncio.Task | None = None
+        self.stderr: _StderrTail | None = None
 
     async def run(self) -> None:
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
+        import anyio
+        from mcp.client.stdio import StdioServerParameters, stdio_client
 
         try:
-            if self.cfg.kind == "stdio":
-                env = {**os.environ, **self.cfg.env}
-                params = StdioServerParameters(command=self.cfg.command, args=self.cfg.args, env=env)
-                async with stdio_client(params) as (read, write):
-                    await self._serve(ClientSession(read, write))
-            else:
-                from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
+            async with anyio.create_task_group() as tg:
+                # stop() cancels this scope: an anyio cancel, so stdio_client's shielded shutdown still kills the
+                # process tree, also while the server is starting and has not answered initialize
+                tg.start_soon(self._stop_when_asked, tg.cancel_scope)
+                if self.cfg.kind == "stdio":
+                    self.stderr = _StderrTail(self.cfg.name)
+                    env = {**os.environ, **self.cfg.env}
+                    params = StdioServerParameters(command=self.cfg.command, args=self.cfg.args, env=env)
+                    async with stdio_client(params, errlog=self.stderr.file) as (read, write):
+                        self.stderr.close_writer()
+                        await self._serve(read, write, watch=True)
+                else:
+                    from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
 
-                async with create_mcp_http_client(headers=self.cfg.headers) as http:
-                    async with streamable_http_client(self.cfg.url, http_client=http) as streams:
-                        read, write = streams[0], streams[1]
-                        await self._serve(ClientSession(read, write))
+                    async with create_mcp_http_client(headers=self.cfg.headers) as http:
+                        async with streamable_http_client(self.cfg.url, http_client=http) as streams:
+                            await self._serve(streams[0], streams[1])
+                tg.cancel_scope.cancel()  # the server went away by itself
         except BaseException as exc:  # noqa: BLE001 - surface any startup failure to the user
-            if not self.error:
+            if not self.error and not self.stop.is_set():
                 self.error = _describe(exc)[:800]
         finally:
             self.session = None
+            if self.stderr is not None:
+                self.stderr.close_writer()
+                if self.error and not self.stop.is_set() and (tail := await self.stderr.tail()):
+                    self.error = f"{self.error}\n{tail}"[:2000]
             self.ready.set()
 
-    async def _serve(self, session) -> None:
-        async with session:
-            await session.initialize()
-            listed = await session.list_tools()
-            self.tools = [
-                McpTool(t.name, (t.description or "")[:1500],
-                        getattr(t, "input_schema", None) or getattr(t, "inputSchema", None) or {"type": "object", "properties": {}})
-                for t in listed.tools
-            ]
-            self.session = session
-            self.ready.set()
-            await self.stop.wait()
+    async def _stop_when_asked(self, scope) -> None:
+        await self.stop.wait()
+        scope.cancel()
+
+    async def _serve(self, read, write, watch: bool = False) -> None:
+        import anyio
+        from mcp import ClientSession
+
+        closed = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            if watch:  # stdio_client doesn't end when the server process dies: notice it ourselves
+                read = _relay_until_eof(tg, read, closed)
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                listed = await session.list_tools()
+                self.tools = [
+                    McpTool(t.name, (t.description or "")[:1500],
+                            getattr(t, "input_schema", None) or getattr(t, "inputSchema", None) or {"type": "object", "properties": {}})
+                    for t in listed.tools
+                ]
+                self.session = session
+                self.ready.set()
+                await (closed.wait() if watch else anyio.sleep_forever())
+                self.session = None
+                self.error = "el servidor MCP se cerró (terminó o falló)"
+            tg.cancel_scope.cancel()
+
+
+def _relay_until_eof(tg, src, closed):
+    """Pass the server's messages on to the session and set `closed` when its stream ends (the process exited)."""
+    import anyio
+
+    send, recv = anyio.create_memory_object_stream(0)
+
+    async def relay():
+        try:
+            async with send:
+                async for item in src:
+                    await send.send(item)
+        except (anyio.ClosedResourceError, anyio.BrokenResourceError, anyio.EndOfStream):
+            pass
+        finally:
+            closed.set()
+
+    tg.start_soon(relay)
+    return recv
 
 
 class McpManager:
-    """Owns an asyncio loop in a background thread; sync callers (agent threads) use it safely."""
+    """Owns an asyncio loop in a background thread; sync callers (agent threads) use it safely.
+
+    A connection is keyed by (user, full config). tools() starts it and records it as started for that user's
+    connector; stop() (Probar, Desactivar, Eliminar) shuts down only that user's connections and revokes that, so
+    a conversation already running can't bring a disabled connector back. A crashed server, or one that restarted
+    and forgot our session, is reconnected on its next use."""
 
     def __init__(self):
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self.loop.run_forever, daemon=True, name="nesi-mcp")
         self.thread.start()
         self.conns: dict[str, _Connection] = {}
+        self.started: dict[tuple[int, str], str] = {}  # (user, connector name) -> key of the config tools() started
+        self.dying: set[_Connection] = set()  # dropped, their server still shutting down (stop() waits for them too)
         self.lock = threading.Lock()
 
-    def _run(self, coro, timeout: float):
-        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
+    def _run(self, coro, timeout: float, cancel: threading.Event | None = None):
+        cf = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        deadline = time.monotonic() + timeout
+        try:
+            while not concurrent.futures.wait([cf], timeout=min(0.25 if cancel is not None else timeout,
+                                                                max(0.0, deadline - time.monotonic()))).done:
+                if cancel is not None and cancel.is_set():
+                    raise RuntimeError("cancelado: el usuario pulsó Detener")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"sin respuesta en {timeout:.0f} s")
+            return cf.result()
+        except BaseException:
+            cf.cancel()  # a no-op if it finished; else the coroutine stops too (and its MCP request is cancelled)
+            raise
 
-    async def _ensure(self, key: str, cfg: ConnectorConfig, timeout: float) -> _Connection:
+    def _drop(self, key: str, conn: _Connection) -> None:
+        """Forget a connection and shut its server down (in the background)."""
+        if self.conns.get(key) is conn:
+            self.conns.pop(key, None)
+        conn.stop.set()
+        if conn.task is not None and not conn.task.done() and conn not in self.dying:
+            self.dying.add(conn)
+            conn.task.add_done_callback(lambda _task: self.dying.discard(conn))
+
+    async def _ensure(self, key: str, cfg: ConnectorConfig, user_id: int, timeout: float) -> _Connection:
         conn = self.conns.get(key)
-        if conn and (conn.session is None and conn.ready.is_set()):
-            self.conns.pop(key, None)  # died: start again
+        if conn is not None and conn.ready.is_set() and conn.session is None:
+            self._drop(key, conn)  # it died (crashed, closed, failed to start): start a new one
             conn = None
         if conn is None:
-            conn = _Connection(cfg)
+            conn = _Connection(cfg, user_id)
             self.conns[key] = conn
             conn.task = asyncio.ensure_future(conn.run())
-        await asyncio.wait_for(conn.ready.wait(), timeout)
-        if conn.session is None:
-            self.conns.pop(key, None)
-            raise RuntimeError(conn.error or "the MCP server stopped")
+        try:
+            await asyncio.wait_for(conn.ready.wait(), timeout)
+        except TimeoutError:
+            self._drop(key, conn)  # it never answered: don't leave its process running
+            tail = await conn.stderr.tail() if conn.stderr is not None else ""
+            raise RuntimeError(f"el servidor MCP no respondió en {timeout:.0f} s" + (f"\n{tail}" if tail else "")) from None
+        if conn.session is None or conn.stop.is_set():  # also a stop() that came in while it was starting
+            raise RuntimeError(conn.error or "el servidor MCP se detuvo")
         return conn
 
     def tools(self, user_id: int, cfg: ConnectorConfig, timeout: float = 120) -> list[McpTool]:
         if cfg.kind == "builtin":
             return builtin_tools(cfg.command, cfg)
-        return self._run(self._ensure(cfg.key(user_id), cfg, timeout), timeout + 5).tools
+        key = cfg.key(user_id)
 
-    def call(self, user_id: int, cfg: ConnectorConfig, tool: str, args: dict, timeout: float = 180) -> McpResult:
         async def go():
-            conn = await self._ensure(cfg.key(user_id), cfg, 120)
-            res = await conn.session.call_tool(tool, args or {}, read_timeout_seconds=timeout)
-            texts, images = [], []
-            for c in getattr(res, "content", None) or []:
-                t = getattr(c, "type", "")
-                if t == "text":
-                    texts.append(c.text)
-                elif t == "image":
-                    images.append((base64.b64decode(c.data), getattr(c, "mime_type", None) or getattr(c, "mimeType", None) or "image/png"))
-                elif t == "resource":
-                    r = c.resource
-                    texts.append(getattr(r, "text", None) or f"[resource {getattr(r, 'uri', '')}]")
-                else:
-                    texts.append(str(getattr(c, "uri", "") or c))
-            sc = getattr(res, "structured_content", None) or getattr(res, "structuredContent", None)
-            if sc and not texts:
-                texts.append(json.dumps(sc, ensure_ascii=False)[:20000])
-            return McpResult("\n".join(texts).strip(), images, bool(getattr(res, "is_error", None) or getattr(res, "isError", False)))
+            conn = await self._ensure(key, cfg, user_id, timeout)
+            self.started[(user_id, cfg.name)] = key
+            return conn.tools
 
-        return self._run(go(), timeout + 130)
+        return self._run(go(), timeout + 5)
+
+    def call(self, user_id: int, cfg: ConnectorConfig, tool: str, args: dict, timeout: float = 180,
+             cancel: threading.Event | None = None) -> McpResult:
+        """Call a tool. `cancel` (e.g. the run's Stop) abandons the call and cancels its MCP request."""
+        key = cfg.key(user_id)
+
+        async def go():
+            for attempt in (1, 2):
+                if self.started.get((user_id, cfg.name)) != key:
+                    raise RuntimeError("the user stopped, turned off or removed this connector in Nesicode: it is not "
+                                       "started again during this message")
+                conn = await self._ensure(key, cfg, user_id, 120)
+                try:
+                    res = await conn.session.call_tool(tool, args or {}, read_timeout_seconds=timeout)
+                except Exception as exc:
+                    if not (lost := _lost(exc)):
+                        raise
+                    if lost == "gone" and attempt == 1:
+                        self._drop(key, conn)
+                        continue  # the server restarted and rejected the call unrun: once more, on a new session
+                    # dead (or doubtful): it shows as 'error' and the next call starts a fresh one (_ensure replaces it)
+                    conn.session = None
+                    conn.stop.set()
+                    if lost == "closed":  # the call may have run: never repeat it on our own
+                        tail = await conn.stderr.tail() if conn.stderr is not None else ""
+                        raise RuntimeError("the connection to the MCP server closed during the call (the server exited, "
+                                           "crashed or restarted); the next call reconnects" + (f"\n{tail}" if tail else "")) from exc
+                    raise
+                return _result(res)
+
+        return self._run(go(), timeout + 130, cancel)
 
     def stop(self, user_id: int, name: str) -> None:
+        """Stop this user's connector (Probar, Desactivar, Eliminar), also a server that is still starting.
+        Until tools() starts it again, conversations already running can't restart it."""
         async def go():
+            self.started.pop((user_id, name), None)
             for key, conn in list(self.conns.items()):
-                if conn.cfg.name == name:
-                    conn.stop.set()
-                    self.conns.pop(key, None)
+                if conn.user_id == user_id and conn.cfg.name == name:
+                    self._drop(key, conn)
+            # also the ones dropped before (a start that timed out, a lost session): they may still be shutting down
+            tasks = [c.task for c in self.dying if c.user_id == user_id and c.cfg.name == name and not c.task.done()]
+            if tasks:  # wait (bounded) for the processes to exit: a restart must not overlap the old one
+                await asyncio.wait(tasks, timeout=8)
 
         self._run(go(), 10)
 
@@ -287,7 +533,28 @@ class McpManager:
         conn = self.conns.get(cfg.key(user_id))
         if not conn:
             return "stopped"
-        return "running" if conn.session is not None else ("error" if conn.error else "starting")
+        if conn.session is not None:
+            return "running"
+        return "error" if conn.ready.is_set() else "starting"  # ready without a session: it failed or died
+
+
+def _result(res) -> McpResult:
+    texts, images = [], []
+    for c in getattr(res, "content", None) or []:
+        t = getattr(c, "type", "")
+        if t == "text":
+            texts.append(c.text)
+        elif t == "image":
+            images.append((base64.b64decode(c.data), getattr(c, "mime_type", None) or getattr(c, "mimeType", None) or "image/png"))
+        elif t == "resource":
+            r = c.resource
+            texts.append(getattr(r, "text", None) or f"[resource {getattr(r, 'uri', '')}]")
+        else:
+            texts.append(str(getattr(c, "uri", "") or c))
+    sc = getattr(res, "structured_content", None) or getattr(res, "structuredContent", None)
+    if sc and not texts:
+        texts.append(json.dumps(sc, ensure_ascii=False)[:20000])
+    return McpResult("\n".join(texts).strip(), images, bool(getattr(res, "is_error", None) or getattr(res, "isError", False)))
 
 
 def builtin_module(which: str):

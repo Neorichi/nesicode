@@ -8,8 +8,11 @@ Each tool is `fn(args, ws, cfg) -> (text_for_the_model, written_relpath | None)`
 from __future__ import annotations
 
 import base64
+import collections
+import hashlib
 import json
 import re
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -24,6 +27,32 @@ EICAR = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f"
 MAX_UPLOAD = 32 * 1024 * 1024
 transport: httpx.BaseTransport | None = None  # tests plug a mock in here
 
+# The public (free) API allows 4 requests a minute and 500 a day. Analyses are polled every POLL_EVERY seconds
+# (VirusTotal's own client waits 20 s) and never faster than the per-minute quota, counting every request made
+# with that key (the lookup and the upload before the polls too).
+PER_MINUTE = 4
+POLL_EVERY = 20.0
+FIRST_POLL = 15.0  # an analysis is never ready right after the submission
+_recent: dict[str, collections.deque] = {}  # key fingerprint -> times of the last PER_MINUTE requests
+_recent_lock = threading.Lock()
+
+
+class RateLimited(ToolError):
+    """HTTP 429: the API key's quota is used up for now."""
+
+
+def _clock() -> float:
+    return time.monotonic()
+
+
+def _pause(ws, seconds: float) -> bool:
+    """Wait; True if the user pressed Stop meanwhile (the run's cancel event lives on its workspace)."""
+    cancel = getattr(ws, "cancel", None)
+    if cancel is not None:
+        return cancel.wait(max(0.0, seconds))
+    time.sleep(max(0.0, seconds))
+    return False
+
 
 def _key(cfg) -> str:
     key = (cfg.env or {}).get("VT_API_KEY", "").strip()
@@ -32,10 +61,26 @@ def _key(cfg) -> str:
     return key
 
 
+def _fingerprint(cfg) -> str:
+    return hashlib.sha256(_key(cfg).encode()).hexdigest()[:16]
+
+
+def _slot_in(cfg) -> float:
+    """Seconds until one more request fits in the per-minute quota of this key."""
+    with _recent_lock:
+        q = _recent.get(_fingerprint(cfg))
+        if not q or len(q) < PER_MINUTE:
+            return 0.0
+        return max(0.0, q[0] + 61.0 - _clock())
+
+
 def _req(cfg, method: str, path: str, **kw) -> dict | None:
+    key = _key(cfg)
+    with _recent_lock:
+        _recent.setdefault(_fingerprint(cfg), collections.deque(maxlen=PER_MINUTE)).append(_clock())
     try:
         with httpx.Client(timeout=60, transport=transport) as c:
-            r = c.request(method, API + path, headers={"x-apikey": _key(cfg), "accept": "application/json"}, **kw)
+            r = c.request(method, API + path, headers={"x-apikey": key, "accept": "application/json"}, **kw)
     except httpx.HTTPError as exc:
         raise ToolError(f"no se pudo conectar con VirusTotal: {exc}") from exc
     if r.status_code == 404:
@@ -43,7 +88,7 @@ def _req(cfg, method: str, path: str, **kw) -> dict | None:
     if r.status_code == 401:
         raise ToolError("VirusTotal rechazó la API key")
     if r.status_code == 429:
-        raise ToolError("VirusTotal: límite de consultas alcanzado (la API gratuita permite 4 por minuto y 500 al día). Espera un poco.")
+        raise RateLimited("VirusTotal: límite de consultas alcanzado (la API gratuita permite 4 por minuto y 500 al día). Espera un poco.")
     if r.status_code >= 400:
         raise ToolError(f"VirusTotal HTTP {r.status_code}: {r.text[:300]}")
     return r.json()
@@ -187,23 +232,56 @@ def vt_relations(args, ws, cfg):
 
 
 # ------------------------------------------------------------------ submissions (shared with VirusTotal: always asked)
-def _wait_analysis(cfg, analysis_id: str, timeout: float = 90) -> dict:
-    deadline = time.time() + timeout
+def _wait_analysis(cfg, ws, analysis_id: str, timeout: float = 90) -> tuple[dict, str]:
+    """Poll an analysis within the quota. Returns (attributes, "") once it is completed, or (the last attributes
+    seen, why it is not) when it is still running at the deadline, the user pressed Stop or polling failed. The
+    submission already happened, so a busy quota (429) means waiting longer, never an error that loses it."""
+    deadline = _clock() + timeout
+    a: dict = {}
+    wait = FIRST_POLL
     while True:
-        data = _req(cfg, "GET", f"/analyses/{analysis_id}") or {}
+        wait = max(wait, _slot_in(cfg))
+        if _clock() + wait > deadline:
+            return a, f"still running after {timeout:.0f} s"
+        if _pause(ws, wait):
+            return a, "the user pressed Stop before it finished"
+        try:
+            data = _req(cfg, "GET", f"/analyses/{analysis_id}") or {}
+        except RateLimited:
+            wait = 60.0  # quota used up (other requests with this key too): back off, then try again
+            continue
+        except ToolError as exc:
+            return a, f"could not check it ({exc})"
         a = (data.get("data") or {}).get("attributes") or {}
-        if a.get("status") == "completed" or time.time() > deadline:
-            return a
-        time.sleep(8)
+        if a.get("status") == "completed":
+            return a, ""
+        wait = POLL_EVERY
+
+
+def _not_finished(a: dict, why: str, analysis_id: str, how: str, report: str) -> list[str]:
+    """What to say about an analysis without a final result: never a verdict (0 engines is not 'clean')."""
+    return [f"Analysis not finished — status: {a.get('status') or 'queued'}, {why}. NO VERDICT YET: do not report "
+            "it as clean or malicious.", f"Analysis id: {analysis_id}",
+            f"Check the result later with {how} (a free lookup, no new submission), or open {report}"]
+
+
+def _submitted_id(data: dict | None) -> str:
+    aid = ((data or {}).get("data") or {}).get("id")
+    if not aid:
+        raise ToolError(f"VirusTotal no devolvió el id del análisis: {json.dumps(data)[:200]}")
+    return aid
 
 
 def vt_scan_url(args, ws, cfg):
     url = _clean(str(args.get("url", "")), "url")
-    data = _req(cfg, "POST", "/urls", data={"url": url}) or {}
-    a = _wait_analysis(cfg, data["data"]["id"])
-    lines = [f"Submitted {url} to VirusTotal (status: {a.get('status', 'queued')})"] + _verdict(a)
+    aid = _submitted_id(_req(cfg, "POST", "/urls", data={"url": url}))
+    a, why = _wait_analysis(cfg, ws, aid)
     uid = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
-    lines.append(f"Report: {GUI}/url/{uid}")
+    report = f"{GUI}/url/{uid}"
+    if why:
+        lines = [f"Submitted {url} to VirusTotal."] + _not_finished(a, why, aid, f"vt_url_report (url {url})", report)
+    else:
+        lines = [f"Submitted {url} to VirusTotal (status: completed)"] + _verdict(a) + [f"Report: {report}"]
     return "\n".join(lines), None
 
 
@@ -215,18 +293,21 @@ def vt_scan_file(args, ws, cfg):
     size = p.stat().st_size
     if size > MAX_UPLOAD:
         raise ToolError("archivo demasiado grande (máx. 32 MB con la API estándar)")
-    import hashlib
-
     sha = hashlib.sha256(p.read_bytes()).hexdigest()
     known = _req(cfg, "GET", f"/files/{sha}")
     if known:  # already known: no need to upload anything
         text, _ = vt_file_report({"hash": sha}, ws, cfg)
         return "Already known to VirusTotal (not uploaded again).\n" + text, None
     with p.open("rb") as fh:
-        data = _req(cfg, "POST", "/files", files={"file": (p.name, fh)}) or {}
-    a = _wait_analysis(cfg, data["data"]["id"], timeout=150)
-    lines = [f"Uploaded {rel} ({size} bytes) to VirusTotal — status: {a.get('status', 'queued')}", f"SHA-256 {sha}"] + _verdict(a)
-    lines.append(f"Report: {GUI}/file/{sha}")
+        aid = _submitted_id(_req(cfg, "POST", "/files", files={"file": (p.name, fh)}))
+    a, why = _wait_analysis(cfg, ws, aid, timeout=150)
+    report = f"{GUI}/file/{sha}"
+    lines = [f"Uploaded {rel} ({size} bytes) to VirusTotal", f"SHA-256 {sha}"]
+    if why:
+        lines += _not_finished(a, why, aid, f"vt_file_report (hash {sha})", report)
+    else:
+        lines[0] += " — status: completed"
+        lines += _verdict(a) + [f"Report: {report}"]
     return "\n".join(lines), None
 
 
@@ -247,9 +328,13 @@ TOOLS: dict[str, tuple[ToolSpec, object]] = {
                                  "relation": {"type": "string", "enum": ["subdomains", "siblings", "resolutions", "urls",
                                                                          "communicating_files", "referrer_files"]},
                                  "limit": {"type": "integer"}, "cursor": STR}, ["target", "relation"])), vt_relations),
-    "vt_scan_url": (ToolSpec("vt_scan_url", "Submit a URL to VirusTotal for a fresh scan. It is shared with VirusTotal: "
-                             "the user approves every submission.", S({"url": STR}, ["url"])), vt_scan_url),
-    "vt_scan_file": (ToolSpec("vt_scan_file", "Upload a workspace file (max 32 MB) to VirusTotal and wait for the verdict. "
-                              "The file is shared with VirusTotal and its community: the user approves every upload. "
-                              "Known files are only looked up by hash, never re-uploaded.", S({"path": STR}, ["path"])), vt_scan_file),
+    "vt_scan_url": (ToolSpec("vt_scan_url", "Submit a URL to VirusTotal for a fresh scan and wait (up to ~1.5 min) for "
+                             "the verdict; if the analysis is still running it says so: check it later with vt_url_report "
+                             "instead of submitting again. It is shared with VirusTotal: the user approves every submission.",
+                             S({"url": STR}, ["url"])), vt_scan_url),
+    "vt_scan_file": (ToolSpec("vt_scan_file", "Upload a workspace file (max 32 MB) to VirusTotal and wait (up to ~2.5 min) "
+                              "for the verdict; if the analysis is still running it says so: check it later with "
+                              "vt_file_report (its SHA-256) instead of uploading again. The file is shared with VirusTotal and "
+                              "its community: the user approves every upload. Known files are only looked up by hash, never "
+                              "re-uploaded.", S({"path": STR}, ["path"])), vt_scan_file),
 }
