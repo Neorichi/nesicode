@@ -9,12 +9,22 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import signal
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 from .config import settings
+
+CONFLICT_WHY = {
+    "changed": "cambió en el proyecto después de empezar la ejecución",
+    "exists": "ya existe en el proyecto con otro contenido",
+    "unsafe": "sale del proyecto por un enlace simbólico",
+    "error": "no se pudo escribir",
+}
 
 
 def _print_event(e: dict) -> None:
@@ -39,6 +49,59 @@ def _print_event(e: dict) -> None:
         print(f"  seleccionado: {e['label']}")
 
 
+def _safe_console() -> None:
+    """A character the console cannot show (Windows: cp1252 when output is redirected) prints as '?' instead of
+    raising inside the agent loop and ending the run."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+@contextlib.contextmanager
+def _ctrl_c_stops(cancel: threading.Event):
+    """First Ctrl+C stops the run cleanly (like the web's Stop: running commands are killed, rollouts wind
+    down, workspace copies are removed); a second one exits at once."""
+
+    def handler(signum, frame):
+        if cancel.is_set():
+            raise KeyboardInterrupt
+        cancel.set()
+        print("\nParando... (Ctrl+C otra vez para salir ya)", file=sys.stderr, flush=True)
+
+    try:
+        previous = signal.signal(signal.SIGINT, handler)
+    except ValueError:  # not the main thread: Ctrl+C keeps its default behaviour
+        yield
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous if previous is not None else signal.default_int_handler)
+
+
+def _limits(spec: str) -> tuple[int, int]:
+    """(context, output) tokens of `provider/model`: the known table, else the defaults (as the server does)."""
+    from .llm import DEFAULT_LIMITS, known_limits
+
+    return known_limits(spec.split("/", 1)[-1]) or DEFAULT_LIMITS
+
+
+def _load_harness(path: str | None) -> dict:
+    from .harness import base_harness
+
+    # utf-8 whatever the locale (Windows: cp1252); -sig also accepts files saved with a BOM
+    return json.loads(Path(path).read_text(encoding="utf-8-sig")) if path else base_harness()
+
+
+def _print_applied(ch: dict) -> None:
+    print(f"aplicado: +{len(ch.get('added', []))} ~{len(ch.get('modified', []))} -{len(ch.get('removed', []))}")
+    for c in ch.get("conflicts", []):
+        side = f"; la versión propuesta está en {c['side_file']}" if c.get("side_file") else ""
+        print(f"  conflicto, no se tocó {c['path']}: {CONFLICT_WHY.get(c['reason'], c['reason'])}{side}")
+
+
 def cmd_serve(a) -> None:
     import uvicorn
 
@@ -51,30 +114,51 @@ def cmd_serve(a) -> None:
 
 def cmd_run(a) -> None:
     from .agent import Agent, Workspace
-    from .harness import base_harness
 
-    h = json.loads(Path(a.harness).read_text()) if a.harness else base_harness()
-    res = Agent(model=a.model, harness=h, workspace=Workspace(a.workspace), emit=lambda e: e.get("_persist", True) and _print_event(e),
-                max_steps=a.max_steps).run(a.task)
+    cancel = threading.Event()
+    context, output = _limits(a.model)
+    agent = Agent(model=a.model, harness=_load_harness(a.harness), workspace=Workspace(a.workspace),
+                  emit=lambda e: e.get("_persist", True) and _print_event(e), max_steps=a.max_steps, cancel=cancel,
+                  context_limit=context, output_limit=output)
+    with _ctrl_c_stops(cancel):
+        res = agent.run(a.task)
     print(f"\n[{res.status}] pasos={res.steps} uso={res.usage.to_dict()}")
-    sys.exit(0 if res.status in ("done", "max_steps") else 1)
+    sys.exit(0 if res.status in ("done", "max_steps") else 130 if res.status == "cancelled" else 1)
 
 
 def cmd_harness(a) -> None:
-    from .harness import base_harness
     from .harnessing import HarnessingConfig, HarnessingRun
 
-    h = json.loads(Path(a.harness).read_text()) if a.harness else base_harness()
-    cfg = HarnessingConfig(task=a.task, executor_model=a.model, improver_model=a.improver or a.model, k=a.k,
-                           mode=a.mode, check_command=a.check or "", domain=a.domain)
-    out = Path(a.out or tempfile.mkdtemp(prefix="nesicode-run-"))
-    hr = HarnessingRun(cfg, base_harness=h, source_ws=Path(a.workspace), run_dir=out, emit=_print_event)
-    result = hr.run()
-    (out / "result.json").write_text(json.dumps(result, indent=1, ensure_ascii=False))
-    (out / "adopted_harness.json").write_text(json.dumps(result["adopted_harness"], indent=1, ensure_ascii=False))
+    ws = Path(a.workspace).resolve()
+    out = Path(a.out).resolve() if a.out else Path(tempfile.mkdtemp(prefix="nesicode-run-"))
+    if out == ws or ws in out.parents or out in ws.parents:
+        print(f"Error: --out ({out}) tiene que quedar fuera de --workspace ({ws}): guarda copias del proyecto "
+              "y dentro de él se copiaría a sí mismo.", file=sys.stderr)
+        sys.exit(2)
+    improver = a.improver or a.model
+    (context, output), (i_context, i_output) = _limits(a.model), _limits(improver)
+    cfg = HarnessingConfig(task=a.task, executor_model=a.model, improver_model=improver, k=a.k, mode=a.mode,
+                           check_command=a.check or "", domain=a.domain, context_limit=context, output_limit=output,
+                           improver_context=i_context, improver_output=i_output)
+    cancel = threading.Event()
+    hr = HarnessingRun(cfg, base_harness=_load_harness(a.harness), source_ws=ws, run_dir=out, emit=_print_event,
+                       cancel=cancel)
+    try:
+        with _ctrl_c_stops(cancel):
+            result = hr.run()
+    except RuntimeError as exc:
+        if str(exc) != "cancelled":
+            raise
+        print(f"\nCancelado: no se aplicó nada. Trayectorias y diffs en {out}", file=sys.stderr)
+        sys.exit(130)
+    (out / "result.json").write_text(json.dumps(result, indent=1, ensure_ascii=False), encoding="utf-8")
+    (out / "adopted_harness.json").write_text(json.dumps(result["adopted_harness"], indent=1, ensure_ascii=False),
+                                              encoding="utf-8")
     if a.apply:
-        print("aplicado:", hr.apply_selected(result["selected"], Path(a.workspace)))
-    print(f"\nResultado en {out}  (harness adoptado: adopted_harness.json, coste: {result['usage']})")
+        _print_applied(hr.apply_selected(result["selected"], ws))
+    hr.cleanup_workspaces(keep=result["selected"], snapshot=True)  # one copy: the chosen result
+    print(f"\nResultado en {out}  (elegido: rollouts/{result['selected']}/ws, harness adoptado: adopted_harness.json, "
+          f"coste: {result['usage']})")
     if result["harness_diff"]:
         print(result["harness_diff"])
 
@@ -82,7 +166,7 @@ def cmd_harness(a) -> None:
 def cmd_demo(a) -> None:
     tmp = Path(tempfile.mkdtemp(prefix="nesicode-demo-"))
     (tmp / "ws").mkdir()
-    (tmp / "ws" / "README.md").write_text("# Demo\n")
+    (tmp / "ws" / "README.md").write_text("# Demo\n", encoding="utf-8")
     a2 = argparse.Namespace(task="Write a short report about this repository", workspace=str(tmp / "ws"),
                             model="mock/demo", improver=None, k=a.k, mode=a.mode, check="test -f NESICODE_RESULT.md",
                             domain="demo", harness=None, out=str(tmp / "run"), apply=False)
@@ -96,6 +180,7 @@ def cmd_desktop(a) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    _safe_console()
     p = argparse.ArgumentParser(prog="nesicode")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -123,7 +208,7 @@ def main(argv: list[str] | None = None) -> None:
     h.add_argument("--check", help="comando de verificación (p. ej. 'uv run pytest -q')")
     h.add_argument("--domain", default="general")
     h.add_argument("--harness")
-    h.add_argument("--out")
+    h.add_argument("--out", help="carpeta del resultado (fuera del workspace)")
     h.add_argument("--apply", action="store_true", help="aplica los cambios del resultado elegido")
     h.set_defaults(fn=cmd_harness)
 

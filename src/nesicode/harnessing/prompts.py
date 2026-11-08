@@ -35,11 +35,17 @@ hand-rolled or got wrong; a SUBAGENT for a bounded investigation whose input is 
 answer is small; a HOOK for a recurring mechanical problem in the tool loop; always-on text last,
 and if you add some, cut something else.
 
+Lines between `<!-- profile:<id> -->` and `<!-- /profile -->` belong to the project's profile and
+are replaced when the user switches profile: keep both marker lines exactly as they are, and write
+what you add (rules, facts, skill triggers) OUTSIDE them.
+
 RULES THAT DISCARD THE WHOLE PROPOSAL (validation runs before any rollout):
 1. Every skill must be named VERBATIM in `system_prompt.md` or `guardrails.md` with a trigger
    line, e.g. "When <situation>, load the `<name>` skill." An unnamed skill is never opened.
 2. Every script named in always-on text or a skill must ship in the same proposal.
 3. `system_prompt.md` must never be empty.
+4. Profile marker lines must survive unchanged. A skill you delete must not stay named in a
+   trigger, and a trigger you add must name a skill that exists.
 
 A harness changes HOW the agent works, never WHAT it delivers: do not change the shape of the
 deliverable the user asked for.
@@ -124,7 +130,7 @@ your dimension; a later stage compares and merges."""
 
 def propose(dim: str, domain: str, *, k: int, index: int, round_t: int | None) -> str:
     where = ""
-    if k > 1:
+    if k > 1 and round_t is None:  # parallel mode only: sequential rounds have one proposer each, on growing evidence
         where = f"\n\nYou are candidate {index} of {k} on this dimension, drawn independently from the same evidence."
     if round_t:
         where += (

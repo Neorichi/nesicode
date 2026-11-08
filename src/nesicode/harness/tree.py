@@ -102,11 +102,18 @@ def always_on_text(h: Harness) -> str:
 
 
 def hooks(h: Harness) -> dict:
+    """The hook rules of a harness; anything malformed reads as "no rules" (validate() reports it)."""
+    empty = {"pre_tool": [], "post_tool": []}
     raw = h.get(HOOKS_FILE, "").strip()
     if not raw:
-        return {"pre_tool": [], "post_tool": []}
-    data = json.loads(raw)
-    return {"pre_tool": data.get("pre_tool", []), "post_tool": data.get("post_tool", [])}
+        return empty
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    return {k: v if isinstance(v := data.get(k, []), list) else [] for k in ("pre_tool", "post_tool")}
 
 
 def _validate_hooks(raw: str) -> list[str]:
@@ -128,17 +135,31 @@ def _validate_hooks(raw: str) -> list[str]:
             if not isinstance(rule, dict):
                 errs.append(f"{where} must be an object")
                 continue
-            if rule.get("action") not in actions:
-                errs.append(f"{where}: action must be one of {sorted(actions)}")
-            if "match" in rule:
+            # Type-check before use: LLM-written JSON often has null or lists where a string belongs.
+            action = rule.get("action")
+            if not isinstance(action, str) or action not in actions:
+                errs.append(f"{where}: action must be one of {sorted(actions)} (a string)")
+                action = None
+            tool = rule.get("tool", "*")
+            if not (isinstance(tool, str) and tool.strip()) and not (
+                isinstance(tool, list) and tool and all(isinstance(t, str) and t.strip() for t in tool)
+            ):
+                errs.append(f'{where}: `tool` must be a tool name, "*" or a list of tool names')
+            match = rule.get("match")  # null or "" means "no condition", as at runtime
+            if match is not None and not isinstance(match, str):
+                errs.append(f"{where}: `match` must be a regex string (or left out)")
+            elif match:
                 try:
-                    re.compile(rule["match"])
-                except re.error as exc:
+                    re.compile(match)
+                except (re.error, RecursionError, OverflowError) as exc:
                     errs.append(f"{where}: bad regex in `match`: {exc}")
-            if rule.get("action") in ("block", "warn", "append") and not str(rule.get("message", "")).strip():
-                errs.append(f"{where}: `message` is required for action {rule.get('action')!r}")
-            if rule.get("action") == "truncate" and not isinstance(rule.get("max_chars"), int):
-                errs.append(f"{where}: `max_chars` (int) is required for truncate")
+            msg = rule.get("message")
+            if action in ("block", "warn", "append") and not (isinstance(msg, str) and msg.strip()):
+                errs.append(f"{where}: `message` (a non-empty string) is required for action {action!r}")
+            if action == "truncate":
+                mc = rule.get("max_chars")
+                if isinstance(mc, bool) or not isinstance(mc, int) or mc <= 0:
+                    errs.append(f"{where}: `max_chars` (a positive integer) is required for truncate")
     return errs
 
 
