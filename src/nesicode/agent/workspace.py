@@ -501,13 +501,15 @@ def _walk(root: Path):
 
 
 def _lexists_exact(root: Path, rel: str, cache: dict | None = None) -> bool:
-    """root/rel exists spelled exactly so (on macOS/Windows a case-only rename leaves the old spelling resolvable)."""
+    """root/rel exists spelled exactly so (on macOS/Windows a case-only rename leaves the old spelling resolvable),
+    reached without a symlink: a folder the agent replaced by a link (maybe to a dir outside) is never listed."""
     cache = {} if cache is None else cache
-    cur = Path(root)
+    root = Path(root)
+    cur = root
     for name in Path(rel).parts:
         if cur not in cache:
             try:
-                cache[cur] = set(os.listdir(cur))
+                cache[cur] = set() if cur != root and os.path.islink(cur) else set(os.listdir(cur))
             except OSError:
                 cache[cur] = set()
         if name not in cache[cur]:
@@ -941,8 +943,7 @@ class Workspace:
             os.killpg(proc.pid, 0)  # members left in the command's process group?
         except OSError:
             return
-        self._bg.add(proc.pid)
-        if self._watcher is None or not self._watcher.is_alive():
+        if self._bg.add(proc.pid):  # decided under the lock, so a watcher that is just exiting can't miss this group
             self._watcher = threading.Thread(target=_watch_background, args=(weakref.ref(self), self._bg), daemon=True)
             self._watcher.start()
 
@@ -1040,22 +1041,28 @@ class _Background:
     def __init__(self):
         self.groups: set[int] = set()
         self.lock = threading.Lock()
+        self.watched = False  # a watcher thread is running (or about to) for these groups
 
-    def add(self, pgid: int) -> None:
+    def add(self, pgid: int) -> bool:
+        """Track a group; True when the caller must start a watcher (none is running)."""
         with self.lock:
             self.groups.add(pgid)
+            start, self.watched = not self.watched, True
+            return start
 
     def prune(self) -> bool:
-        """Forget groups that are gone (so their ids can never hit a reused one); True while any is alive."""
+        """Forget groups that are gone (so their ids can never hit a reused one); True while any is alive. When none
+        is, the watcher stops, and the next add() starts a new one (both under the lock: no group is left unwatched)."""
         with self.lock:
             for g in list(self.groups):
                 try:
                     os.killpg(g, 0)
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):  # gone, or the id now belongs to another user's process
                     self.groups.discard(g)
                 except OSError:
                     pass
-            return bool(self.groups)
+            self.watched = bool(self.groups)
+            return self.watched
 
     def kill(self) -> None:
         with self.lock:
@@ -1071,13 +1078,11 @@ def _watch_background(ws_ref, bg: _Background) -> None:
     """Kill the workspace's background processes as soon as the user presses Stop."""
     while True:
         ws = ws_ref()
-        if ws is None:
-            return  # released: its finalizer killed them
-        cancel = getattr(ws, "cancel", None)
+        cancel = getattr(ws, "cancel", None) if ws is not None else None
+        released = ws is None  # the run is over (its finalizer killed them already)
         del ws
-        if cancel is not None and cancel.is_set():
+        if released or (cancel is not None and cancel.is_set()):
             bg.kill()
-            return
         if not bg.prune():
             return
         time.sleep(0.5)

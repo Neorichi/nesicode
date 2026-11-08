@@ -290,6 +290,21 @@ def test_pipeline_failure_is_reported(tmp_path):
     assert bash(ws, {"command": "true | false"}).startswith("exit code: 1")
     assert bash(ws, {"command": "! false | false"}).startswith("exit code: 0")
     assert bash(ws, {"command": "exit 3"}).startswith("exit code: 3")
+    assert bash(ws, {"command": "false | true; exit 5"}).startswith("exit code: 5")
+
+
+@posix_only
+def test_pipeline_report_never_lands_in_the_agents_files(tmp_path):
+    # review: the report used to be shell code appended AFTER the command, so an unterminated heredoc swallowed it
+    # into the file being written (a markdown table full of `|`), and a trailing `\` joined it to the last line.
+    ws = Workspace(tmp_path / "ws")
+    out = bash(ws, {"command": "cat > t.md <<'EOF'\n| a | b |\n|---|---|"})
+    assert out.startswith("exit code: 0") and (ws.root / "t.md").read_text() == "| a | b |\n|---|---|\n"
+    plain = ws.run("echo a | cat \\")  # what bash itself does with a trailing backslash...
+    assert bash(ws, {"command": "echo a | cat \\"}).startswith(f"exit code: {plain[0]}\n{plain[1]}")  # ...unchanged
+    out = bash(ws, {"command": "echo a | cat\nif then"})
+    assert "line 2: syntax error" in out  # bash's line numbers are still the agent's
+    assert bash(ws, {"command": "trap 'echo mine' EXIT; false | cat"}) == "exit code: 0\nmine\n"  # the agent's own trap wins
 
 
 # ------------------------------------------------------------------ #4 / #7 / #21 command lifetime
@@ -356,6 +371,21 @@ def test_background_processes_are_cleaned_up(tmp_path, monkeypatch):
     del ws3  # the run is over and its workspace released
     gc.collect()
     assert _wait_dead(pid3)
+
+
+@posix_only
+def test_background_watcher_never_leaves_a_group_unwatched():
+    # review: a group added while the watcher was exiting (prune() had just found none) got no watcher: Stop did not
+    # kill it and its id was never pruned, so a later kill could hit a process group that reused the id.
+    bg = wsmod._Background()
+    assert bg.add(10**9) is True  # nothing watched yet: start a watcher
+    assert bg.add(10**9 + 1) is False  # one is running
+    assert bg.prune() is False  # both ids are gone: the watcher stops...
+    assert bg.add(10**9 + 2) is True  # ...so the next group starts a new one
+    if os.geteuid() != 0:
+        bg.groups.add(1)  # pid 1 (launchd/init): exists, but not ours to signal (an id reused by another user)
+        bg.prune()
+        assert 1 not in bg.groups
 
 
 # ------------------------------------------------------------------ #17 Docker
@@ -524,6 +554,44 @@ def test_search_is_linear_on_minified_lines(tmp_path):
     assert hit.startswith("dist/bundle.min.js:1: ") and len(hit) < 300
 
 
+def test_search_windows_have_no_fake_line_ends(tmp_path):
+    # review: a long line is matched in windows; at a window's end `$`, `\b` and lookaheads saw a fake end of line
+    import random
+    import re
+
+    from nesicode.agent.tools import SEARCH_WINDOW, _match
+
+    ws = Workspace(tmp_path / "ws")
+    line = "x" * (SEARCH_WINDOW - 3) + "foo" + "barbaz" * 2000
+    (ws.root / "min.js").write_text(line + "\n")
+    for pat in ("foo$", r"foo\b", "foo(?!bar)"):
+        assert search(ws, {"pattern": pat}) == "no matches", pat
+    for pat in ("foobar", "baz$", "foo.*", "x+foo"):
+        assert search(ws, {"pattern": pat}).startswith("min.js:1: "), pat
+    rnd = random.Random(7)
+    for _ in range(60):
+        text = "".join(rnd.choice("abc ") for _ in range(rnd.randint(SEARCH_WINDOW + 1, 3 * SEARCH_WINDOW)))
+        for pat in ("ab$", r"ab\b", "a(?!b)c", "c.*a", r"\bca", "b+$", "[ab]{3}$", "^ab"):
+            rx = re.compile(pat)
+            assert bool(_match(rx, text, time.monotonic() + 10)) == bool(rx.search(text)), pat
+
+
+def test_search_refuses_exponential_patterns_and_huge_brace_globs(tmp_path):
+    # review: `(a+)+$` on one 41-char line froze the whole server (re holds the GIL), windows or not
+    from nesicode.agent.tools import _globs, _nested_repeat
+
+    ws = Workspace(tmp_path / "ws")
+    (ws.root / "a.txt").write_text("a" * 14 + "b\n")  # short: even unguarded these finish (a regression fails, never hangs)
+    for pat in (r"(a+)+$", r"(\w+\s?)+$", r"(\s*\w+)*:", r"(.*)*x", r"((?:,\w+)*)+$", r"(a+){10}$"):
+        with pytest.raises(ToolError, match="exponential"):
+            search(ws, {"pattern": pat})
+    for pat in (r"(a+)+", r"(\w+\.)+Foo", r"(ab+)+$", r"(foo|bar)+", r"(\s*,\s*\w+)*$", r"(?:\r?\n)+", r"(a{3})+$",
+                r"(a++)+$", r"(?>a+)+$", r"import .* from", r".*TODO.*", r"def \w+\(self\):$"):
+        assert not _nested_repeat(pat), pat
+    t0 = time.monotonic()
+    assert len(_globs("{a,b}" * 30 + ".py")) == 64 and time.monotonic() - t0 < 1  # was 2^30 expansions
+
+
 def test_search_stops_on_cancel_and_globs_like_ripgrep(tmp_path):
     ws = Workspace(tmp_path / "ws")
     (ws.root / "src").mkdir()
@@ -615,6 +683,33 @@ def test_apply_cage_keeps_big_files_and_links(tmp_path, monkeypatch):
 
 
 @posix_only
+def test_a_folder_replaced_by_a_link_is_never_listed(tmp_path, monkeypatch):
+    # review: the "still exists?" check of removed paths listed THROUGH a folder the agent turned into a link
+    proj, cage = _cage(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "b.txt").write_text("someone else's\n")
+    (proj / "a").mkdir()
+    (proj / "a" / "b.txt").write_text("mine\n")
+    copy_workspace(proj, cage)
+    base = manifest(cage)
+    shutil.rmtree(cage / "a")
+    os.symlink(outside, cage / "a")
+    listed: list[str] = []
+    real = os.listdir
+    monkeypatch.setattr(os, "listdir", lambda p=".": (listed.append(os.fspath(p)), real(p))[1])
+    ch = changes_since(base, cage, proj)
+    assert ch["removed"] == [os.path.join("a", "b.txt")] and ch["added"] == ["a"]
+    assert not any(os.path.realpath(p).startswith(str(outside.resolve())) for p in listed), listed
+    d = diff_workspaces(proj, cage, max_chars=0)
+    assert d["removed"] == [os.path.join("a", "b.txt")]
+    monkeypatch.setattr(os, "listdir", real)
+    res = apply_cage(base, cage, proj)
+    assert (outside / "b.txt").read_text() == "someone else's\n" and not (proj / "a" / "b.txt").exists()
+    assert any(s.startswith("a:") for s in res["skipped"])  # the link points out of the project: not created
+
+
+@posix_only
 def test_apply_never_writes_or_links_outside_the_project(tmp_path):
     proj, cage = _cage(tmp_path)
     victim = tmp_path / "victim"
@@ -676,7 +771,10 @@ BLOCKED = ["rm -rf /", "rm -rf ~", "rm -rf $HOME", "rm -rf /*", "rm -fr /", "rm 
            "rm --recursive --force /", "rm -Rf ~/", "rm -rf ~/*", 'rm -rf "$HOME"', "rm -rf ${HOME}/", "cd /tmp && rm -rf ~",
            "sudo rm -rf / --no-preserve-root", "rm -rf ~ && echo done", "rm -rf build /"]
 ALLOWED = ["rm -rf build/", "rm -rf ./build", "rm -rf ~/project/build", "rm -rf /tmp/x", "git rm -r --cached .", "ls /",
-           "rm -rf $HOME_BACKUP", "echo ~"]
+           "rm -rf $HOME_BACKUP", "echo ~",
+           # review: rm's arguments end at the line; a later `cd ~` / `ls /` is not one of them
+           "rm -rf dist\ncd ~", "rm -f out.txt\nls /", "rm -rf node_modules\necho $HOME", "rm -rf /tmp/x\ncd /"]
+BLOCKED += ["cd x\nrm -rf ~", "echo hi\nrm -rf $HOME/*", "rm\t-rf\t/"]
 
 
 def test_base_rm_rule_blocks_root_and_home():

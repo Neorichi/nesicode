@@ -41,7 +41,8 @@ HOOKS = {
             "tool": "bash",
             # rm with any flags (-rf, -fr, -r -f, --recursive...) and among its arguments the root, the home
             # or everything in them: /, /*, ~, ~/, ~/*, $HOME, ${HOME}/*, quoted or not. Not `rm -rf build/`.
-            "match": r"""(?:^|[\s;&|({`"'])rm(?:\s+[^\s;&|]+)*?\s+["']?(?:/\*?|~/?\*?|\$\{?HOME\}?/?\*?)["']?(?=$|[\s;&|)`"'])""",
+            # Its arguments end at the line (a newline, or `\n` in the JSON form): `rm -rf dist` + `cd ~` is fine.
+            "match": r"""(?:^|[\s;&|({`"'])rm(?:[ \t]+[^\s;&|\\]+)*?[ \t]+["']?(?:/\*?|~/?\*?|\$\{?HOME\}?/?\*?)["']?(?=$|[\s;&|)`"'])""",
             "action": "block",
             "message": "Blocked: refusing to delete a root or home directory.",
         }

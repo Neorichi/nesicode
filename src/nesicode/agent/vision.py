@@ -107,7 +107,9 @@ def describe_image(ws: Workspace, path: str, vision_model: str, user_keys: dict 
     if size > MAX_IMAGE_BYTES:
         data, mime = _shrink(p, size)
     else:
-        data = ws.read_bytes(p)
+        data = ws.read_bytes(p, MAX_IMAGE_BYTES + 1)  # bounded: the file may grow (or be swapped) after the stat
+        if len(data) > MAX_IMAGE_BYTES:
+            raise ToolError("the image changed while it was being read; try again")
         mime = sniff_mime(data) or mime
     try:
         provider, model = get_provider(vision_model, user_keys)

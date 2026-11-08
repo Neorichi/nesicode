@@ -287,8 +287,10 @@ def _expand_braces(pattern: str, limit: int = 64) -> list[str]:
         cur += ch
     alts.append(cur)
     out: list[str] = []
-    for a in alts:
-        out.extend(_expand_braces(pattern[:i] + a + pattern[j + 1 :], limit))
+    for a in alts:  # stop at the limit: `{a,b}` x 30 would otherwise expand 2^30 patterns before cutting
+        if len(out) >= limit:
+            break
+        out.extend(_expand_braces(pattern[:i] + a + pattern[j + 1 :], limit - len(out)))
     return out[:limit]
 
 
@@ -322,6 +324,73 @@ def _glob_ok(rel: str, globs: list[str]) -> bool:
     return False
 
 
+try:  # CPython's own regex parser, to spot patterns that backtrack exponentially (best effort)
+    from re import _constants as _sre, _parser as _sre_parse
+except ImportError:  # pragma: no cover - other interpreters
+    _sre = _sre_parse = None
+
+
+def _nested_repeat(pattern: str) -> bool:
+    """True for a repetition of something made only of repetitions, followed by more pattern: `(a+)+$`,
+    `(\\w+\\s?)*:`, `(\\s*\\w+)+x`. One short line can then take exponential time, and Python's re holds the
+    GIL while it does, which freezes the whole server. `(\\w+\\.)+` (a mandatory `.` in each round) is fine."""
+    if _sre_parse is None:
+        return False
+    try:
+        tree = _sre_parse.parse(pattern)
+    except Exception:
+        return False
+    backtracking = (_sre.MAX_REPEAT, _sre.MIN_REPEAT)
+
+    def children(op, av):
+        if op in backtracking or op == getattr(_sre, "POSSESSIVE_REPEAT", None):
+            return [av[2]]
+        if op == _sre.SUBPATTERN:
+            return [av[-1]]
+        if op == _sre.BRANCH:
+            return list(av[1])
+        if op in (_sre.ASSERT, _sre.ASSERT_NOT):
+            return [av[1]]
+        if op == getattr(_sre, "ATOMIC_GROUP", None):
+            return [av]
+        if op == _sre.GROUPREF_EXISTS:
+            return [s for s in av[1:] if s is not None]
+        return []
+
+    def flexible(items) -> bool:  # every element can match different lengths (or nothing): no fixed anchor per round
+        for op, av in items:
+            if op in backtracking:
+                if av[0] == av[1]:
+                    return False
+            elif op == _sre.SUBPATTERN:
+                if not flexible(av[-1]):
+                    return False
+            elif op == _sre.BRANCH:
+                if not any(flexible(b) for b in av[1]):
+                    return False
+            elif op not in (_sre.AT, _sre.ASSERT, _sre.ASSERT_NOT):
+                return False
+        return True
+
+    def unbounded(items) -> bool:
+        return any((op in backtracking and av[1] == _sre.MAXREPEAT) or any(unbounded(c) for c in children(op, av))
+                   for op, av in items)
+
+    def walk(items, followed: bool) -> bool:
+        items = list(items)
+        for i, (op, av) in enumerate(items):
+            after = followed or i + 1 < len(items)
+            if (op in backtracking and (av[1] == _sre.MAXREPEAT or av[1] > 4) and after
+                    and flexible(av[2]) and unbounded(av[2])):
+                return True
+            inside = after or op in backtracking
+            if any(walk(c, inside) for c in children(op, av)):
+                return True
+        return False
+
+    return walk(tree, False)
+
+
 def _search_regex(pattern: str):
     """re.search already tries every start position, so a leading `.*` only adds quadratic backtracking
     (`.*TODO.*` on a minified bundle froze the server): drop it, the set of matching lines is the same."""
@@ -338,9 +407,20 @@ def _match(rx, line: str, deadline: float):
     if len(line) <= SEARCH_WINDOW:
         return rx.search(line)
     for start in range(0, len(line), SEARCH_WINDOW - SEARCH_OVERLAP):  # bounded work per call; the GIL is free between
-        m = rx.search(line, start, min(len(line), start + SEARCH_WINDOW))
-        if m or time.monotonic() > deadline:
+        stop = min(len(line), start + SEARCH_WINDOW)
+        m, tries = rx.search(line, start, stop), 0
+        # A match that reaches the window's end may be an artifact: there `$`, `\b` and lookaheads see a fake end of
+        # line (`foo$` "matched" in the middle of a minified line). Re-check it from its start with more of the line.
+        while m is not None and stop < len(line) and m.end() == stop and tries < 3:
+            v = rx.match(line, m.start(), min(len(line), m.start() + 2 * SEARCH_WINDOW))
+            if v is not None:
+                return v
+            tries += 1
+            m = rx.search(line, m.start() + 1, stop) if m.start() + 1 < stop else None
+        if m is not None and (m.end() < stop or stop == len(line)):
             return m
+        if time.monotonic() > deadline:
+            return None
     return None
 
 
@@ -351,6 +431,9 @@ def search(ws: Workspace, args: dict) -> str:
         rx = _search_regex(pattern)
     except re.error as exc:
         raise ToolError(f"invalid regex: {exc}") from None
+    if _nested_repeat(pattern):
+        raise ToolError("this pattern repeats a group made only of repetitions (like `(a+)+$` or `(\\w+\\s?)*x`), which "
+                        "can take exponential time on a single line; simplify it (e.g. `a+`, `[\\w\\s]+x`)")
     base = ws.resolve(_str(args, "path", False, "."))
     globs = _globs(args.get("glob"))
     hits: list[str] = []
@@ -400,20 +483,21 @@ def search(ws: Workspace, args: dict) -> str:
     return out + (f"\n{stopped}" if stopped else "")
 
 
-# When a pipeline hides a failure (`pytest | tail` reports tail's 0), say which stage failed. Appended only to
-# commands with a `|`; keeps the exit status bash would return (incl. `! cmd`); 141 is SIGPIPE from `| head`.
-PIPE_TRAILER = (
-    '\n__nesi_s=("${PIPESTATUS[@]}" "$?"); { set +x; } 2>/dev/null; __nesi_n=$((${#__nesi_s[@]} - 1)); '
-    '__nesi_i=0; while [ "$__nesi_i" -lt "$__nesi_n" ] && [ "$__nesi_n" -gt 1 ]; do '
-    'case "${__nesi_s[$__nesi_i]}" in 0|141) ;; *) echo "[pipeline exit codes: ${__nesi_s[*]:0:$__nesi_n}]"; break;; esac; '
-    '__nesi_i=$((__nesi_i + 1)); done; exit "${__nesi_s[$__nesi_n]}"'
+# When a pipeline hides a failure (`pytest | tail` reports tail's 0), say which stage failed: an EXIT trap set
+# BEFORE the command reads the last pipeline's PIPESTATUS when the shell ends and leaves its exit status alone.
+# (Text appended AFTER the command was swallowed by an unterminated heredoc — the trap's code ended up inside the
+# agent's file — and joined to a trailing `\`.) Only for commands with a `|`; 141 is SIGPIPE from `| head`.
+PIPE_TRAP = (
+    '__nesi_pipes() { local __s=("${PIPESTATUS[@]}") __i=0; { set +x; } 2>/dev/null; '
+    'if [ "${#__s[@]}" -gt 1 ]; then while [ "$__i" -lt "${#__s[@]}" ]; do case "${__s[$__i]}" in 0|141) ;; '
+    '*) echo "[pipeline exit codes: ${__s[*]}]"; break;; esac; __i=$((__i + 1)); done; fi; }; trap __nesi_pipes EXIT; '
 )
 
 
 def bash(ws: Workspace, args: dict) -> str:
     command = _str(args, "command")
     if "|" in command and shell_name() == "bash":
-        command += PIPE_TRAILER
+        command = PIPE_TRAP + command  # same line: bash's "line N" in error messages stays the agent's line N
     code, out = ws.run(command, _int(args, "timeout", 120))
     out = out if len(out) <= 30_000 else out[:15_000] + "\n... (output truncated) ...\n" + out[-15_000:]
     return f"exit code: {code}\n{out}"
