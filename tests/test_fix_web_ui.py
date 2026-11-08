@@ -331,3 +331,20 @@ def test_interrupted_text_never_shows_on_a_new_run_that_reuses_a_deleted_runs_id
       out.reused = L.runKey(stopped) === L.runKey(reused)
     """)
     assert out == {"same": True, "reused": False}
+
+
+def test_a_queue_with_nothing_running_is_looked_at_again(tmp_path):
+    """Review of web-ui#18: the idle chat now reloads only when its conversation's updated_at grows, but a reply that
+    crashes (Jobs._safe) ends without that bump. If the reload after its end caught the moment before the server
+    started the next queued message, the page kept showing it queued, with no live progress, until it finished.
+    'Waiting with nothing running' is never a lasting state, so the page looks again once."""
+    out = run_ts(tmp_path, """
+      out.r = [
+        L.queueStalled([{ status: 'error' }, { status: 'waiting' }]),
+        L.queueStalled([{ status: 'running' }, { status: 'waiting' }]),
+        L.queueStalled([{ status: 'queued' }, { status: 'waiting' }]),
+        L.queueStalled([{ status: 'done' }]),
+        L.queueStalled([]),
+      ]
+    """)
+    assert out["r"] == [True, False, False, False, False]

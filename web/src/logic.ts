@@ -66,6 +66,15 @@ export function withEvent(runs: Run[], runId: number, e: RunEvent): Run[] {
   )
 }
 
+/**
+ * Messages waiting in the queue with nothing running: a moment's state, since the server starts the next one as soon
+ * as a reply ends. Seeing it means the last reload caught that moment (and a reply that crashed doesn't bump the
+ * conversation's updated_at, which the idle page watches), so the page should look again shortly.
+ */
+export function queueStalled(runs: { status: string }[]): boolean {
+  return runs.some((r) => r.status === 'waiting') && !runs.some((r) => r.status === 'queued' || r.status === 'running')
+}
+
 /** How long to wait before following a run again when the server couldn't even be asked whether it still runs. */
 export const FOLLOW_RETRY_MS = 5000
 

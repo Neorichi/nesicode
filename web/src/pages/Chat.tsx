@@ -6,7 +6,7 @@ import Composer, { AttachmentChip } from '../components/Composer'
 import Diff from '../components/Diff'
 import Transcript from '../components/Transcript'
 import { t, useLang } from '../i18n'
-import { compactReason, followAgainIn, mergeLoaded, runKey, withEvent, withRun } from '../logic'
+import { compactReason, followAgainIn, mergeLoaded, queueStalled, runKey, withEvent, withRun } from '../logic'
 
 type Ctx = { used: number; limit: number; reason?: string }
 
@@ -99,6 +99,15 @@ export default function Chat() {
     if (activeId || seenUpdated.current === null) return // a live reply reloads by itself when it ends
     if (row.updated_at > seenUpdated.current) load().catch(() => {})
   }, [row?.updated_at, row?.title, activeId, load]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // A queued message with nothing running is about to start (see queueStalled): look again once, shortly, instead of
+  // showing it queued (with no live progress) until it has finished.
+  const stalled = queueStalled(runs)
+  useEffect(() => {
+    if (!stalled) return
+    const id = window.setTimeout(() => load().catch(() => {}), 1500)
+    return () => clearTimeout(id)
+  }, [stalled, load])
 
   useEffect(() => { setCtxLive(null) }, [activeId]) // a new message rebuilds the context: never show the previous run's value
   useEffect(() => {
