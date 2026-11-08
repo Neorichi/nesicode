@@ -2,18 +2,94 @@
 
 from __future__ import annotations
 
-import mimetypes
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
 from ..llm import LLMError, get_provider
-from .workspace import ToolError, Workspace
+from .workspace import ToolError, Workspace, _q, _sandbox_paths
 
 IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
-MAX_IMAGE_BYTES = 5 * 1024 * 1024
+# By extension, not via mimetypes: Python's own table has no .webp (it only worked where the OS supplied one).
+EXT_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".jpe": "image/jpeg",
+            ".gif": "image/gif", ".webp": "image/webp"}
+# Providers limit an image to 5 MB of base64 (Anthropic), i.e. about 3.7 MB of raw bytes.
+MAX_IMAGE_BYTES = 3_700_000
+MAX_SOURCE_BYTES = 60_000_000  # bigger files are refused before reading them
 
 
 def image_mime(path: str) -> str | None:
-    mime = mimetypes.guess_type(path)[0]
-    return mime if mime in IMAGE_TYPES else None
+    return EXT_MIME.get(os.path.splitext(str(path))[1].lower())
+
+
+def sniff_mime(data: bytes) -> str | None:
+    """The real type from the first bytes (a .png that is really a JPEG must be sent as image/jpeg)."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _sips_profile(src: Path, out_dir: Path) -> str:
+    """Seatbelt profile for one `sips` run on an image the agent controls: it may read that image and the OS,
+    write only its output dir (and the UUID-named temp file sips makes first), and has no network."""
+    first, _, after = _sandbox_paths()
+    deny = " ".join(f"(subpath {_q(p)})" for p in first + after)
+    return "\n".join([
+        "(version 1)",
+        "(allow default)",
+        "(deny network*)",
+        f"(deny file-read* file-write* {deny})",
+        '(deny file-write* (subpath "/"))',
+        "(allow file-read-metadata)",
+        f"(allow file-read* (literal {_q(src)}))",
+        f"(allow file-read* file-write* (subpath {_q(out_dir)}))",
+        # sips saves through T/<UUID> and T/.<UUID> in the per-user temp dir, whatever TMPDIR says
+        '(allow file-read* file-write* (regex #"^/private/var/folders/[^/]+/[^/]+/T/'
+        '\\.?[0-9A-Fa-f]+-[0-9A-Fa-f]+-[0-9A-Fa-f]+-[0-9A-Fa-f]+-[0-9A-Fa-f]+"))',
+        '(allow file-read* file-write* (literal "/dev/null"))',
+        "(deny lsopen)",
+        "(deny appleevent-send)",
+    ])
+
+
+def _shrink(src: Path, size: int) -> tuple[bytes, str]:
+    """A JPEG copy small enough for the vision model (a Retina screenshot is often 5-15 MB), made by macOS
+    `sips` in its own sandbox: the untrusted image is never parsed by the server process itself."""
+    if sys.platform != "darwin" or not shutil.which("sips") or not shutil.which("sandbox-exec"):
+        raise ToolError(
+            f"image is {size:,} bytes; the vision limit is {MAX_IMAGE_BYTES:,}. Make a smaller copy first "
+            "(e.g. `python3 -c \"from PIL import Image; im=Image.open('in.png'); im.thumbnail((1600,1600)); "
+            "im.convert('RGB').save('small.jpg', quality=85)\"`) and view that."
+        )
+    out_dir = Path(tempfile.mkdtemp(prefix="nesicode-view-")).resolve()  # the server's own temp: the agent can't touch it
+    try:
+        for edge, quality in ((2000, 80), (1400, 70), (1000, 60)):
+            out = out_dir / f"{edge}.jpg"
+            argv = ["sandbox-exec", "-p", _sips_profile(src, out_dir), "/usr/bin/sips", "-Z", str(edge),
+                    "-s", "format", "jpeg", "-s", "formatOptions", str(quality), str(src), "--out", str(out)]
+            try:
+                r = subprocess.run(argv, capture_output=True, timeout=60, stdin=subprocess.DEVNULL,
+                                   env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(out_dir), "TMPDIR": str(out_dir)})
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise ToolError(f"could not make a smaller copy of the image: {exc}") from None
+            if r.returncode != 0 or not out.is_file():
+                msg = (r.stdout + r.stderr).decode("utf-8", "replace").strip()[-300:]
+                raise ToolError(f"could not make a smaller copy of the image: {msg}")
+            data = out.read_bytes()
+            if len(data) <= MAX_IMAGE_BYTES:
+                return data, "image/jpeg"
+        raise ToolError(f"image is {size:,} bytes and still too large after shrinking it")
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
 
 
 def describe_image(ws: Workspace, path: str, vision_model: str, user_keys: dict | None, question: str) -> str:
@@ -25,9 +101,16 @@ def describe_image(ws: Workspace, path: str, vision_model: str, user_keys: dict 
     mime = image_mime(p.name)
     if not mime:
         raise ToolError("unsupported image type; use png, jpeg, gif or webp")
-    data = p.read_bytes()
-    if len(data) > MAX_IMAGE_BYTES:
-        raise ToolError(f"image is {len(data):,} bytes; the limit is {MAX_IMAGE_BYTES:,}")
+    size = p.stat().st_size  # before reading: a huge file is refused without loading it
+    if size > MAX_SOURCE_BYTES:
+        raise ToolError(f"image is {size:,} bytes; too large to view")
+    if size > MAX_IMAGE_BYTES:
+        data, mime = _shrink(p, size)
+    else:
+        data = ws.read_bytes(p, MAX_IMAGE_BYTES + 1)  # bounded: the file may grow (or be swapped) after the stat
+        if len(data) > MAX_IMAGE_BYTES:
+            raise ToolError("the image changed while it was being read; try again")
+        mime = sniff_mime(data) or mime
     try:
         provider, model = get_provider(vision_model, user_keys)
         text, _ = provider.vision(model, question or "Describe this image in detail.", data, mime)
@@ -63,6 +146,5 @@ def generate_image(ws: Workspace, prompt: str, path: str, image_model: str, user
     while target.exists() and not path.strip():
         n += 1
         target = ws.resolve(rel.rsplit(".", 1)[0] + f"-{n}.{ext}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(data)
+    ws.write_bytes(target, data)
     return ws.rel(target)
