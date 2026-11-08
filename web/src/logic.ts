@@ -66,6 +66,19 @@ export function withEvent(runs: Run[], runId: number, e: RunEvent): Run[] {
   )
 }
 
+/** How long to wait before following a run again when the server couldn't even be asked whether it still runs. */
+export const FOLLOW_RETRY_MS = 5000
+
+/**
+ * A run's stream gave up (STREAM_LOST: the server was unreachable for a while). When to follow the run again: now if
+ * the reload says it is still going, in a few seconds if the reload failed too (the server may come back, as an
+ * EventSource would wait for it), never if it is over. `runs` = the reloaded runs, or null when the reload failed.
+ */
+export function followAgainIn(runs: { id: number; status: string }[] | null, runId: number): number | null {
+  if (!runs) return FOLLOW_RETRY_MS
+  return runs.some((r) => r.id === runId && (r.status === 'queued' || r.status === 'running')) ? 0 : null
+}
+
 /** Was the text of a stopped/failed reply saved by the server after all (so the local copy can go)? */
 export function interruptedSaved(events: RunEvent[], text: string): boolean {
   const head = text.trim().slice(0, 200)

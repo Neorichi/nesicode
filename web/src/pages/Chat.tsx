@@ -6,7 +6,7 @@ import Composer, { AttachmentChip } from '../components/Composer'
 import Diff from '../components/Diff'
 import Transcript from '../components/Transcript'
 import { t, useLang } from '../i18n'
-import { compactReason, mergeLoaded, withEvent, withRun } from '../logic'
+import { compactReason, followAgainIn, mergeLoaded, withEvent, withRun } from '../logic'
 
 type Ctx = { used: number; limit: number; reason?: string }
 
@@ -104,6 +104,8 @@ export default function Chat() {
     if (!activeId) return
     const run = runs.find((r) => r.id === activeId)!
     const after = Math.max(0, ...(run.events ?? []).map((e) => e.seq ?? 0))
+    let alive = true
+    let again: number | undefined
     const freeze = () => {
       if (!liveRef.current.trim()) return
       interruptedText.set(activeId, liveRef.current)
@@ -129,11 +131,18 @@ export default function Chat() {
         resetLive()
         const data = await load().catch(() => null)
         refreshThreads()
-        // the connection gave up (server unreachable for a while) but the reply may go on: follow it again
-        if (status === STREAM_LOST && data?.runs.some((r) => r.id === activeId && ACTIVE.has(r.status))) setStreamKey((k) => k + 1)
+        // The connection gave up (server unreachable for a while) but the reply may go on: follow it again — now if
+        // the server says it still runs, or in a few seconds if it still can't be reached (else the page would show
+        // "running" forever once the server is back).
+        const wait = alive && status === STREAM_LOST ? followAgainIn(data?.runs ?? null, activeId) : null
+        if (wait !== null) again = window.setTimeout(() => setStreamKey((k) => k + 1), wait)
       },
     })
-    return close
+    return () => {
+      alive = false
+      clearTimeout(again)
+      close()
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId, streamKey])
 

@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { ACTIVE, api, isAbort, money, relTime, statusLabel, streamRun, type Run, type RunEvent } from '../api'
+import { ACTIVE, api, isAbort, money, relTime, statusLabel, STREAM_LOST, streamRun, type Run, type RunEvent } from '../api'
 import { useApp, useProject } from '../App'
 import Diff from '../components/Diff'
 import Transcript from '../components/Transcript'
 import { useVisibleInterval } from '../hooks'
 import { t, translateError, useLang } from '../i18n'
+import { followAgainIn } from '../logic'
 
 type Node = {
   label: string
@@ -182,19 +183,23 @@ function RunDetail({ runId }: { runId: number }) {
   const [msg, setMsg] = useState('')
   const loadSeq = useRef(0)
   const loadCtl = useRef<AbortController | null>(null)
+  const [streamKey, setStreamKey] = useState(0) // bumped to follow the run again after its stream gave up
   useLang()
 
   // only the newest request may paint, and only with this run's data (a big run's download stops when superseded)
-  const load = useCallback(async () => {
+  const load = useCallback(async (): Promise<Run | null> => {
     const n = ++loadSeq.current
     loadCtl.current?.abort()
     const ctl = new AbortController()
     loadCtl.current = ctl
     try {
       const r = await api.get<Run>(`/api/runs/${runId}`, { signal: ctl.signal })
-      if (n === loadSeq.current && r.id === runId) setRun(r)
+      if (n !== loadSeq.current || r.id !== runId) return null
+      setRun(r)
+      return r
     } catch (e) {
       if (!isAbort(e)) throw e
+      return null
     }
   }, [runId])
   useEffect(() => {
@@ -211,16 +216,26 @@ function RunDetail({ runId }: { runId: number }) {
   useEffect(() => {
     if (!run || !ACTIVE.has(run.status)) return
     const after = Math.max(0, ...(run.events ?? []).map((e) => e.seq ?? 0))
-    return streamRun(runId, after, {
+    let alive = true
+    let again: number | undefined
+    const close = streamRun(runId, after, {
       onEvent: (e) =>
         setRun((r) => (r && !(r.events ?? []).some((x) => x.seq === e.seq) ? { ...r, status: 'running', events: [...(r.events ?? []), e] } : r)),
-      onEnd: () => {
-        load().catch(() => {})
-        refreshProjects()
+      onEnd: async (status) => {
+        const r = await load().catch(() => null)
+        refreshProjects().catch(() => {})
+        // the stream gave up (server unreachable for a while) but the run may go on: follow it again (see Chat)
+        const wait = alive && status === STREAM_LOST ? followAgainIn(r ? [r] : null, runId) : null
+        if (wait !== null) again = window.setTimeout(() => setStreamKey((k) => k + 1), wait)
       },
     })
+    return () => {
+      alive = false
+      clearTimeout(again)
+      close()
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runId, !!active])
+  }, [runId, !!active, streamKey])
 
   if (!run) return msg ? <div className="error-box">{msg}</div> : <div className="muted">{t('Cargando…')}</div>
   const events = run.events ?? []

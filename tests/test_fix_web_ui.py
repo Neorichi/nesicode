@@ -20,10 +20,11 @@ ESBUILD = WEB / "node_modules" / "esbuild"
 pytestmark = pytest.mark.skipif(not NODE or not ESBUILD.is_dir(), reason="needs node and web/node_modules (esbuild)")
 
 
-def run_ts(tmp_path: Path, body: str):
-    """Bundle `body` (TypeScript, with `L` = web/src/logic.ts) for node, run it, return what it printed as JSON."""
+def run_ts(tmp_path: Path, body: str, head: str = ""):
+    """Bundle `body` (TypeScript, with `L` = web/src/logic.ts) for node, run it, return what it printed as JSON.
+    `head`: imports that must run first (e.g. browser fakes)."""
     entry = tmp_path / "entry.ts"
-    entry.write_text(f"import * as L from {json.dumps(str(WEB / 'src' / 'logic.ts'))}\n"
+    entry.write_text(f"{head}\nimport * as L from {json.dumps(str(WEB / 'src' / 'logic.ts'))}\n"
                      f"const out: Record<string, unknown> = {{}}\n{body}\nconsole.log(JSON.stringify(out))\n")
     bundle = tmp_path / "bundle.cjs"
     build = tmp_path / "build.cjs"
@@ -199,3 +200,121 @@ def test_provider_endpoint_without_scheme_is_completed(tmp_path):
     assert out["u"] == ["http://localhost:11434/v1", "http://127.0.0.1:1234/v1", "http://192.168.1.20:8000",
                         "https://api.example.com/v1", "https://api.example.com/v1", "http://x", "",
                         "http://[::1]:8080/v1", "http://mac.local:11434"]
+
+
+# Browser stand-ins for streamRun (web/src/api.ts): a manual clock behind window.setTimeout/clearTimeout, a document
+# whose visibility the test flips, and an EventSource the test opens, feeds and breaks.
+STREAM_FAKES = r"""
+const g = globalThis as any
+let now = 0
+let next = 1_000_000
+const timers: { at: number; id: number; fn: () => void }[] = []
+const realClear = g.clearTimeout
+g.clearTimeout = (id: unknown) => {
+  if (typeof id === 'number' && id >= 1_000_000) {
+    const i = timers.findIndex((t) => t.id === id)
+    if (i >= 0) timers.splice(i, 1)
+  } else if (id !== undefined) realClear(id)
+}
+g.window = { setTimeout: (fn: () => void, ms: number) => { const id = next++; timers.push({ at: now + ms, id, fn }); return id } }
+export function advance(ms: number) {
+  const end = now + ms
+  for (;;) {
+    timers.sort((a, b) => a.at - b.at || a.id - b.id)
+    const t = timers[0]
+    if (!t || t.at > end) break
+    timers.shift()
+    now = t.at
+    t.fn()
+  }
+  now = end
+}
+const vis = new Set<() => void>()
+g.document = {
+  visibilityState: 'visible',
+  documentElement: {},
+  addEventListener: (type: string, fn: () => void) => { if (type === 'visibilitychange') vis.add(fn) },
+  removeEventListener: (type: string, fn: () => void) => { if (type === 'visibilitychange') vis.delete(fn) },
+}
+export function setVisible(v: boolean) {
+  g.document.visibilityState = v ? 'visible' : 'hidden'
+  vis.forEach((fn) => fn())
+}
+export const listeners = () => vis.size
+export class FakeES {
+  static CLOSED = 2
+  static all: FakeES[] = []
+  url: string
+  readyState = 0
+  closed = false
+  onopen: (() => void) | null = null
+  onerror: (() => void) | null = null
+  on: Record<string, ((m: { data: string }) => void)[]> = {}
+  constructor(url: string) { this.url = url; FakeES.all.push(this) }
+  addEventListener(type: string, fn: (m: { data: string }) => void) { (this.on[type] ??= []).push(fn) }
+  close() { this.closed = true; this.readyState = 2 }
+  open() { this.readyState = 1; this.onopen?.() }
+  send(type: string, data: unknown) { (this.on[type] ?? []).forEach((fn) => fn({ data: JSON.stringify(data) })) }
+  fail() { this.readyState = 0; this.onerror?.() }
+}
+g.EventSource = FakeES
+"""
+
+
+def test_run_stream_resumes_after_drops_and_hidden_tabs_and_is_followed_again_after_giving_up(tmp_path):
+    """web-ui#12/#19 (+ review): a dropped stream reconnects after the last event it got and says so (the page drops
+    its partial live text); a hidden tab gives its connection back and resumes when visible; a server that stays
+    unreachable ends in one 'stream-lost', and the page then follows the run again unless a reload says it is over
+    (before the review fix a failed reload left the chat 'running' forever once the server came back)."""
+    fakes = tmp_path / "fakes.ts"
+    fakes.write_text(STREAM_FAKES)
+    head = (f"import * as F from {json.dumps(str(fakes))}\n"
+            f"import * as A from {json.dumps(str(WEB / 'src' / 'api.ts'))}")
+    out = run_ts(tmp_path, """
+      const got = { open: 0, seqs: [] as number[], ends: [] as string[] }
+      const close = A.streamRun(7, 10, { onOpen: () => got.open++, onEvent: (e) => got.seqs.push(e.seq!), onEnd: (s) => got.ends.push(s) })
+      const s1 = F.FakeES.all.at(-1)!
+      out.url1 = s1.url
+      s1.open(); s1.send('event', { seq: 11, type: 'x' }); s1.send('event', { seq: 12, type: 'x' })
+      s1.fail()
+      out.closedOnError = s1.closed
+      F.advance(999); out.beforeRetry = F.FakeES.all.length
+      F.advance(2)
+      const s2 = F.FakeES.all.at(-1)!
+      out.url2 = s2.url
+      s2.open(); out.opens = got.open
+      F.setVisible(false); F.advance(4999); out.openWhileBrieflyHidden = !s2.closed
+      F.advance(2); out.closedWhenHidden = s2.closed; out.connsWhileHidden = F.FakeES.all.length
+      F.setVisible(true)
+      const s3 = F.FakeES.all.at(-1)!
+      out.url3 = s3.url
+      s3.open(); s3.send('event', { seq: 13, type: 'done' }); s3.send('end', { status: 'done' })
+      out.closedAtEnd = s3.closed; out.ends = got.ends; out.seqs = got.seqs
+      F.advance(60000); F.setVisible(false); F.setVisible(true)
+      out.connsAfterEnd = F.FakeES.all.length; out.listenersAfterEnd = F.listeners()
+      close()
+      const lost: string[] = []
+      const before = F.FakeES.all.length
+      A.streamRun(8, 0, { onEvent: () => {}, onEnd: (s) => lost.push(s) })
+      for (let i = 0; i < 12; i++) { F.FakeES.all.at(-1)!.fail(); F.advance(16000) }
+      out.attempts = F.FakeES.all.length - before
+      out.lost = lost
+      const quiet = F.FakeES.all.length
+      const stop = A.streamRun(9, 0, { onEvent: () => {}, onEnd: () => lost.push('x') })
+      F.FakeES.all.at(-1)!.fail(); stop(); F.advance(60000)
+      out.afterClose = F.FakeES.all.length - quiet
+      out.lostAfterClose = lost.length
+      out.follow = [L.followAgainIn(null, 7), L.followAgainIn([{ id: 7, status: 'running' }], 7),
+        L.followAgainIn([{ id: 7, status: 'queued' }], 7), L.followAgainIn([{ id: 7, status: 'done' }], 7),
+        L.followAgainIn([{ id: 6, status: 'running' }], 7), L.followAgainIn([], 7)]
+    """, head=head)
+    assert out["url1"] == "/api/runs/7/stream?after=10"
+    assert out["closedOnError"] and out["beforeRetry"] == 1
+    assert out["url2"] == "/api/runs/7/stream?after=12" and out["opens"] == 2  # resumes after the last event received
+    assert out["openWhileBrieflyHidden"] and out["closedWhenHidden"] and out["connsWhileHidden"] == 2
+    assert out["url3"] == "/api/runs/7/stream?after=12"
+    assert out["closedAtEnd"] and out["ends"] == ["done"] and out["seqs"] == [11, 12, 13]
+    assert out["connsAfterEnd"] == 3 and out["listenersAfterEnd"] == 0
+    assert out["attempts"] == 7 and out["lost"] == ["stream-lost"]  # gives up once, with a status that isn't the run's
+    assert out["afterClose"] == 1 and out["lostAfterClose"] == 1  # the caller closing it stops every retry
+    assert out["follow"] == [5000, 0, 0, None, None, None]  # unreachable: try again soon; over: never
