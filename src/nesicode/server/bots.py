@@ -19,8 +19,10 @@ import secrets
 import socket
 import threading
 import time
+import zlib
 from datetime import datetime, timedelta
 
+import httpcore
 import httpx
 
 from ..agent.workspace import ToolError
@@ -289,6 +291,98 @@ def _alive(deadline: float, timeout: float, cancel: threading.Event | None) -> N
         raise ToolError(f"la página tarda demasiado (más de {timeout:g} s)")
 
 
+class _Clock(httpcore.NetworkBackend):
+    """The network under one fetch: connecting, the TLS handshake and every read and write end by the fetch's
+    deadline, and a read notices Stop within a second. httpx's timeouts count per operation, so a server sending its
+    headers (or a chunk's size line) one byte at a time would otherwise never trip them."""
+
+    def __init__(self, deadline: float, timeout: float, cancel: threading.Event | None):
+        self.deadline, self.timeout, self.cancel = deadline, timeout, cancel
+        self.net = httpcore.SyncBackend()
+
+    def left(self, timeout: float | None) -> float:
+        """Seconds the next operation may take: its own timeout, never past the deadline (raises once it passed)."""
+        _alive(self.deadline, self.timeout, self.cancel)
+        rest = self.deadline - time.monotonic()
+        return max(rest if timeout is None else min(timeout, rest), 0.001)
+
+    def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        return _ClockStream(self.net.connect_tcp(host, port, timeout=self.left(timeout), local_address=local_address,
+                                                 socket_options=socket_options), self)
+
+    def connect_unix_socket(self, path, timeout=None, socket_options=None):
+        raise httpcore.ConnectError("unix sockets are never fetched")
+
+    def sleep(self, seconds):
+        time.sleep(seconds)
+
+
+class _ClockStream(httpcore.NetworkStream):
+    def __init__(self, stream: httpcore.NetworkStream, clock: _Clock):
+        self.stream, self.clock = stream, clock
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        end = None if timeout is None else time.monotonic() + timeout
+        while True:
+            wait = self.clock.left(None if end is None else end - time.monotonic())
+            try:
+                return self.stream.read(max_bytes, min(wait, 1.0))  # short waits: Stop and the deadline are checked between
+            except httpcore.ReadTimeout:
+                if end is not None and time.monotonic() >= end:
+                    raise  # this read's own timeout
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        self.stream.write(buffer, self.clock.left(timeout))
+
+    def close(self) -> None:
+        self.stream.close()
+
+    def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+        return _ClockStream(self.stream.start_tls(ssl_context, server_hostname, self.clock.left(timeout)), self.clock)
+
+    def get_extra_info(self, info: str):
+        return self.stream.get_extra_info(info)
+
+
+_UNZIP = {"gzip": zlib.MAX_WBITS | 16, "x-gzip": zlib.MAX_WBITS | 16, "deflate": zlib.MAX_WBITS}
+
+
+def _read_body(r: httpx.Response, alive) -> tuple[bytes, bool]:
+    """(at most FETCH_LIMIT bytes of the body, cut short?). A compressed body is unpacked here a bounded amount at a
+    time — httpx unpacks each network chunk whole, and a few KB of gzip inside gzip unpack to GBs — and only the
+    encodings the request offered (gzip, deflate) are accepted, never several stacked."""
+    if r.is_stream_consumed:  # a response built in memory (a test's MockTransport): httpx already decoded it
+        return r.content[:FETCH_LIMIT], len(r.content) >= FETCH_LIMIT
+    codings = [c.strip().lower() for c in r.headers.get("content-encoding", "").split(",")]
+    codings = [c for c in codings if c not in ("", "identity")]
+    if len(codings) > 1 or (codings and codings[0] not in _UNZIP):
+        raise ToolError(f"la página llega comprimida con «{', '.join(codings)[:80]}», que no se admite")
+    z = zlib.decompressobj(_UNZIP[codings[0]]) if codings else None
+    data, first = bytearray(), True
+    try:
+        for chunk in r.iter_raw():
+            if z is not None and chunk:
+                try:
+                    out = z.decompress(chunk, FETCH_LIMIT - len(data))  # never more than what is still wanted
+                except zlib.error:
+                    if not (first and codings[0] == "deflate"):
+                        raise
+                    z = zlib.decompressobj(-zlib.MAX_WBITS)  # 'deflate' sent without its zlib header, as some servers do
+                    out = z.decompress(chunk, FETCH_LIMIT - len(data))
+                first = False
+                if z.unconsumed_tail:  # the limit was reached inside this chunk
+                    data += out
+                    return bytes(data), True
+                chunk = out
+            data += chunk
+            if len(data) >= FETCH_LIMIT:
+                return bytes(data[:FETCH_LIMIT]), True
+            alive()
+    except zlib.error as exc:
+        raise ToolError(f"la página llega comprimida pero no se puede descomprimir: {exc}") from exc
+    return bytes(data), False
+
+
 def safe_fetch(url: str, method: str = "GET", body=None, headers: dict | None = None,
                transport: httpx.BaseTransport | None = None, *, cancel: threading.Event | None = None,
                timeout: float = FETCH_TIMEOUT, info: dict | None = None) -> tuple[int, str, str]:
@@ -297,13 +391,19 @@ def safe_fetch(url: str, method: str = "GET", body=None, headers: dict | None = 
     Every hop (each redirect too) resolves the host once, refuses it if any of its addresses is loopback, LAN,
     link-local, CGNAT, metadata… and connects to the vetted address itself — the Host header and the TLS name stay the
     real ones — so a DNS answer that changes between the check and the connection (rebinding) can't reach the local
-    network. The body is streamed and never more than FETCH_LIMIT bytes are read (info['truncated'] says so); the
-    whole fetch ends within `timeout` seconds and stops as soon as `cancel` is set."""
+    network. The body is streamed and never more than FETCH_LIMIT bytes are read, counted unpacked (info['truncated']
+    says so); the whole fetch ends within `timeout` seconds and stops as soon as `cancel` is set."""
     deadline = time.monotonic() + timeout
-    hdrs = {"User-Agent": "Nesicode-Bot/1.0"} | {k: v for k, v in (headers or {}).items() if k.lower() != "host"}
-    # no keep-alive: a pooled connection (to a vetted IP) must never carry a request for another host; and no proxy
-    # from the environment: what we connect to must be the address we vetted (SSL_CERT_FILE/DIR still count)
-    transport = transport or httpx.HTTPTransport(limits=httpx.Limits(max_keepalive_connections=0))
+    ours = ("host", "accept-encoding")
+    hdrs = {"User-Agent": "Nesicode-Bot/1.0", **{k: v for k, v in (headers or {}).items() if k.lower() not in ours},
+            "Accept-Encoding": "gzip, deflate"}  # only what _read_body unpacks, whatever decoders httpx has installed
+    if transport is None:
+        # no keep-alive: a pooled connection (to a vetted IP) must never carry a request for another host; and no proxy
+        # from the environment: what we connect to must be the address we vetted (SSL_CERT_FILE/DIR still count)
+        transport = httpx.HTTPTransport(limits=httpx.Limits(max_keepalive_connections=0))
+        pool = getattr(transport, "_pool", None)
+        if hasattr(pool, "_network_backend"):  # httpx has no public option for it; tests check it is in place
+            pool._network_backend = _Clock(deadline, timeout, cancel)
     client = httpx.Client(timeout=httpx.Timeout(FETCH_READ_TIMEOUT), follow_redirects=False, trust_env=False,
                           transport=transport)
     try:
@@ -335,15 +435,9 @@ def safe_fetch(url: str, method: str = "GET", body=None, headers: dict | None = 
                         raise ToolError(f"redirección no válida: {r.headers['location'][:200]}") from exc
                     method = "GET" if r.status_code == 303 else method
                     continue
-                data = bytearray()
-                for chunk in r.iter_bytes():
-                    data += chunk
-                    if len(data) >= FETCH_LIMIT:
-                        break
-                    _alive(deadline, timeout, cancel)
+                data, cut = _read_body(r, lambda: _alive(deadline, timeout, cancel))
                 if info is not None:
-                    info.update(truncated=len(data) >= FETCH_LIMIT, url=str(u))
-                data = bytes(data[:FETCH_LIMIT])
+                    info.update(truncated=cut, url=str(u))
                 try:
                     text = data.decode(r.charset_encoding or "utf-8", "replace")
                 except LookupError:  # a charset Python doesn't know
@@ -397,7 +491,8 @@ def page_text(content_type: str, text: str) -> str:
 
 
 # ======================================================================= external data in a task
-_FENCE_TAG = re.compile(r"<\s*/?\s*untrusted[\s_-]*payload", re.I)
+# one quantifier per run of filler: '<\s*/?\s*' backtracks quadratically on '<' + 20,000 spaces (seconds holding the GIL)
+_FENCE_TAG = re.compile(r"<[\s/]*untrusted[\s_-]*payload", re.I)
 
 
 def fence_payload(payload: str, source: str) -> str:
@@ -530,8 +625,8 @@ class BotManager:
                 nxt = next_runs("cron", v["spec"], v["tz"], 1)[0]
             elif v["kind"] == "interval":
                 nxt = prev.get("next_at") or next_runs("interval", v["spec"], v["tz"], 1)[0]
-            else:  # url: a new page is looked at right away
-                nxt = prev.get("next_at") or now
+            else:  # url: a new page is looked at right away; a kept one keeps its turn, sooner if now checked more often
+                nxt = min(prev["next_at"], now + v["config"]["every"] * 60) if prev.get("next_at") else now
             self.db.execute(
                 "INSERT INTO bot_triggers (bot_id, kind, spec, tz, prompt, config, next_at, last_at, last_hash, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",

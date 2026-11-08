@@ -879,3 +879,172 @@ def test_messages_into_a_bots_conversation_run_as_that_bot(alice, project, tg):
     run = db.one("SELECT * FROM runs WHERE thread_id=? ORDER BY id DESC LIMIT 1", (b["thread_id"],))
     assert (run["bot_id"], run["trigger"]) == (b["id"], "chat")
     settle(b["id"])
+
+
+# =================================================================== review: what the first fixes still let through
+class RawServer:
+    """A TCP server on 127.0.0.1 whose replies a test writes byte by byte (`reply(conn, stop)`)."""
+
+    def __init__(self, reply):
+        self.reply, self.stop = reply, threading.Event()
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.sock.settimeout(0.2)
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while not self.stop.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:  # timeout: look at `stop` again (or the socket is closed)
+                continue
+            threading.Thread(target=self._one, args=(conn,), daemon=True).start()
+
+    def _one(self, conn):
+        try:
+            conn.settimeout(5)
+            conn.recv(65536)
+            self.reply(conn, self.stop)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def close(self):
+        self.stop.set()
+        self.sock.close()
+
+
+def _drip_headers(conn, stop):
+    conn.sendall(b"HTTP/1.1 200 OK\r\nX-Slow: ")
+    while not stop.wait(0.1):
+        conn.sendall(b"a")
+
+
+def _drip_chunk_size(conn, stop):  # a chunk-size line that never ends: no body bytes ever reach the reader
+    conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+    while not stop.wait(0.1):
+        conn.sendall(b"0")
+
+
+def test_fetch_deadline_and_stop_hold_while_headers_trickle_in(monkeypatch):
+    """#3: the deadline and Stop used to count only between body chunks, so headers (or a chunk's size line) sent a
+    byte at a time kept the fetch, and a url-watch slot, busy for days. Real httpx transport, local server."""
+    monkeypatch.setattr(botmod, "_ip_allowed", lambda ip: str(ip) == "127.0.0.1", raising=False)  # plays "public"
+    monkeypatch.setattr(botmod, "_getaddrinfo", resolver({"drip.test": "127.0.0.1"}), raising=False)
+    for reply in (_drip_headers, _drip_chunk_size):
+        srv = RawServer(reply)
+        try:
+            t0 = time.monotonic()
+            with pytest.raises(ToolError, match="tarda demasiado"):
+                safe_fetch(f"http://drip.test:{srv.port}/", timeout=0.5)
+            assert time.monotonic() - t0 < 2.5, reply.__name__
+            cancel = threading.Event()
+            threading.Timer(0.2, cancel.set).start()
+            t0 = time.monotonic()
+            with pytest.raises(ToolError, match="cancelado"):
+                safe_fetch(f"http://drip.test:{srv.port}/", cancel=cancel)
+            assert time.monotonic() - t0 < 2.5, reply.__name__
+        finally:
+            srv.close()
+
+
+class Chunks(httpx.SyncByteStream):
+    """A body arriving over the network in 64 KB pieces (unlike content=…, httpx never reads it ahead)."""
+
+    def __init__(self, data: bytes):
+        self.data = data
+
+    def __iter__(self):
+        for i in range(0, len(self.data), 65536):
+            yield self.data[i:i + 65536]
+
+
+def test_compressed_pages_are_unpacked_within_the_limit(monkeypatch):
+    """#3: FETCH_LIMIT counted unpacked bytes only after httpx had unpacked a whole network chunk: 1 KB of gzip inside
+    gzip took 800 MB of memory (a few KB more would take the app down)."""
+    import gzip
+    import tracemalloc
+    import zlib
+
+    monkeypatch.setattr(botmod, "_getaddrinfo", resolver({"zip.test": "93.184.215.14"}), raising=False)
+    offered = []
+
+    def serve(encoding, body, ctype="text/html; charset=utf-8"):
+        def handler(req):
+            offered.append(req.headers.get("accept-encoding"))
+            return httpx.Response(200, headers={"content-encoding": encoding, "content-type": ctype}, stream=Chunks(body))
+        return httpx.MockTransport(handler)
+
+    page = "<p>hola, ñandú</p>".encode()
+    raw = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+    for encoding, body in (("gzip", gzip.compress(page)), ("deflate", zlib.compress(page)),
+                           ("deflate", raw.compress(page) + raw.flush()), ("identity", page), ("", page)):
+        assert safe_fetch("https://zip.test/", transport=serve(encoding, body))[2] == page.decode(), encoding
+    assert set(offered) == {"gzip, deflate"}  # only what can be unpacked here, whatever decoders httpx has
+    for encoding in ("gzip, gzip", "br"):  # stacked layers, or an encoding nobody asked for
+        with pytest.raises(ToolError, match="no se admite"):
+            safe_fetch("https://zip.test/", transport=serve(encoding, gzip.compress(gzip.compress(b"\0" * 2**20))))
+    with pytest.raises(ToolError, match="descomprimir"):
+        safe_fetch("https://zip.test/", transport=serve("gzip", b"not gzip at all"))
+    bomb = gzip.compress(b"\0" * 64 * 2**20, 9)  # ~64 KB on the wire
+    info = {}
+    tracemalloc.start()
+    try:
+        _, _, text = safe_fetch("https://zip.test/", transport=serve("gzip", bomb, "text/plain"), info=info)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert len(text) == botmod.FETCH_LIMIT and info["truncated"]
+    assert peak < 24 * 2**20, f"{peak / 2**20:.0f} MB"  # httpx unpacked the whole 64 MB chunk at once
+
+
+def test_fence_scan_is_linear_on_hostile_payloads():
+    """#5: the fence defusing regex ran in fire() — under the bots lock, on the webhook's event loop — and '<' + 20,000
+    spaces took 1-1.5 s holding the GIL."""
+    for filler in (" ", " ", "/", "-"):
+        for payload in ("<" + filler * 19_999, "<untrusted" + filler * 19_990):
+            t0 = time.perf_counter()
+            botmod.fence_payload(payload, "webhook")
+            assert time.perf_counter() - t0 < 0.2, (repr(filler), payload[:12])
+    for variant in ("<//untrusted_payload>", "< / untrusted - payload >", "<\n/untrusted_payload>"):
+        assert not re.search(r"<[\s/]*untrusted", botmod.fence_payload(variant, "webhook").split("\n", 1)[1].rsplit("\n", 2)[0])
+
+
+def test_send_now_never_relays_a_run_twice(alice, project, tg):
+    """#16's fix keyed relayed runs by (id, created_at), but «send now» changes a queued message's created_at: the
+    mirror loop then took it for a new run and Telegram got every message of it, and the final answer, twice."""
+    t = alice.post(f"/api/projects/{project['id']}/threads", json={}).json()
+    db.execute("UPDATE telegram_links SET active_thread=? WHERE user_id=?", (t["id"], alice.uid))
+    busy = db.insert("INSERT INTO runs (project_id, thread_id, kind, task, status, created_at) VALUES (?, ?, 'chat', 'x', 'running', ?)",
+                     (project["id"], t["id"], time.time()))
+    tg.bridge.handle(tg.msg("segundo mensaje"))
+    run = db.one("SELECT * FROM runs WHERE thread_id=? ORDER BY id DESC LIMIT 1", (t["id"],))
+    assert run["status"] == "waiting" and jobs.send_now(run["id"])  # the user presses «send now» in the app
+    db.execute("UPDATE runs SET status='done' WHERE id=?", (busy,))
+    db.execute("UPDATE runs SET status='running' WHERE id=?", (run["id"],))  # it starts (no worker: kept running)
+    time.sleep(2.2)  # the mirror loop looks every 2 s
+    db.execute("UPDATE runs SET status='done', final_text='una sola vez' WHERE id=?", (run["id"],))
+    tg.fake.wait_text("una sola vez")
+    wait_for(lambda: run["id"] not in tg.bridge.followed, 5, "the relay to end")  # its claim ends with the relay…
+    time.sleep(0.5)
+    assert sum("una sola vez" in x for x in tg.fake.texts()) == 1
+    assert not any("Desde la app" in x for x in tg.fake.texts())
+    assert tg.bridge._claim(run["id"])  # …so a new run that gets this id (SQLite reuses them) is relayed too
+
+
+def test_watching_a_page_more_often_takes_effect_on_save(alice, project, monkeypatch):
+    """#7's fix keeps a url trigger's next check across edits; a check a day away must not stay a day away when the
+    user asks for one every 5 minutes."""
+    monkeypatch.setattr(botmod, "_getaddrinfo", resolver({"diario.test": "93.184.215.14"}), raising=False)
+    trig = {"kind": "url", "spec": "https://diario.test/", "config": {"every": 1440}}
+    b = make_bot(alice, project, name="Diario", triggers=[trig])
+    later = time.time() + 20 * 3600
+    db.execute("UPDATE bot_triggers SET next_at=?, last_hash='h1' WHERE bot_id=?", (later, b["id"]))
+    alice.patch(f"/api/bots/{b['id']}", json={"triggers": [trig]})  # unchanged: keeps its turn
+    assert db.one("SELECT next_at FROM bot_triggers WHERE bot_id=?", (b["id"],))["next_at"] == pytest.approx(later)
+    alice.patch(f"/api/bots/{b['id']}", json={"triggers": [{**trig, "config": {"every": 5}}]})
+    t = db.one("SELECT next_at, last_hash FROM bot_triggers WHERE bot_id=?", (b["id"],))
+    assert t["next_at"] <= time.time() + 300 and t["last_hash"] == "h1"

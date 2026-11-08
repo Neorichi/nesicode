@@ -151,7 +151,7 @@ class TelegramBridge:
         self.thread: threading.Thread | None = None
         self.me: dict = {}
         self.error = ""  # why Telegram isn't answering right now ('' = all good)
-        self.followed: set[tuple] = set()  # runs already mirrored to Telegram: (id, created_at), ids get reused
+        self.followed: set[int] = set()  # runs being relayed to Telegram right now (see _claim)
         self._followed_lock = threading.Lock()
         self._albums: dict[str, dict] = {}
         self._album_lock = threading.Lock()
@@ -217,14 +217,13 @@ class TelegramBridge:
                 backoff *= 2
 
     def _claim(self, run_id: int) -> bool:
-        """True the first time a run is seen here (then it gets relayed once). Keyed with the run's creation time:
-        SQLite reuses the ids of deleted runs, and a new run with an old id is a different run."""
-        row = self.db.one("SELECT created_at FROM runs WHERE id=?", (run_id,))
-        key = (run_id, row["created_at"] if row else None)
+        """True when nobody relays this run yet (then it gets relayed once). The claim ends with its relay (_follow):
+        SQLite reuses the ids of deleted runs, and a new run with an old id must be relayed too. Never keyed by the
+        run's created_at: «send now» moves a queued message by changing it, which would relay that run twice."""
         with self._followed_lock:
-            if key in self.followed:
+            if run_id in self.followed:
                 return False
-            self.followed.add(key)
+            self.followed.add(run_id)
             return True
 
     def _mirror(self) -> None:
@@ -571,6 +570,9 @@ class TelegramBridge:
             self._relay(chat_id, run_id, project, thread, status_id, bot_name)
         except Exception as exc:  # e.g. the conversation was deleted mid-run
             print(f"nesicode telegram: stopped relaying run {run_id}: {exc}")
+        finally:
+            with self._followed_lock:
+                self.followed.discard(run_id)
 
     def _relay(self, chat_id: int, run_id: int, project: dict, thread: dict, status_id: int | None, bot_name: str) -> None:
         from ..agent.workspace import Workspace
@@ -601,9 +603,9 @@ class TelegramBridge:
             if status_id and steps and time.time() - last_edit > 3:
                 self.edit(chat_id, status_id, f"⏳ Trabajando… (paso {steps}: {tool})")
                 last_edit = time.time()
-            run = self.db.one("SELECT status, final_text, error FROM runs WHERE id=?", (run_id,))
-            if not run:
-                return  # deleted with its conversation
+            run = self.db.one("SELECT status, final_text, error, thread_id FROM runs WHERE id=?", (run_id,))
+            if not run or run["thread_id"] != thread["id"]:
+                return  # deleted with its conversation (and maybe its id already given to another run)
             if run["status"] in FINAL and not self.db.events_after(run_id, seen):
                 break
             time.sleep(POLL)
