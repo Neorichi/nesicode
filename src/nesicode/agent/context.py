@@ -553,16 +553,17 @@ def files_block(ws: Workspace, touched: list[tuple[str, str]], budget: int, cach
             continue
         if rel not in cache:
             p = _safe_file(ws, rel)
-            try:
-                cache[rel] = p.read_bytes() if p is not None else None
+            try:  # size first: a huge file (a log read with offset/limit) is never loaded just to be listed
+                size = p.stat().st_size if p is not None else -1
+                cache[rel] = (size, p.read_bytes() if 0 <= size <= per_file else None)
             except OSError:
-                cache[rel] = None
-        data = cache[rel]
-        if data is None:
+                cache[rel] = (-1, None)
+        size, data = cache[rel]
+        if size < 0:
             continue
-        if b"\0" in data[:4096] or len(data) > per_file or used + len(data) > budget or len(shown) >= 5:
+        if data is None or b"\0" in data[:4096] or len(data) > per_file or used + len(data) > budget or len(shown) >= 5:
             if len(listed) < 15:
-                listed.append(f"- `{rel}` ({how}; {len(data):,} bytes — read_file it if you need it)")
+                listed.append(f"- `{rel}` ({how}; {size:,} bytes — read_file it if you need it)")
             continue
         used += len(data)
         shown.append(f"### {rel} ({how})\n```\n{data.decode('utf-8', 'replace')}\n```")

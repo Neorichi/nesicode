@@ -818,9 +818,10 @@ class Agent:
             try:
                 label = str(call.arguments.get("path") or call.arguments.get("command") or "")
                 rel = ctxm.save_output(self.ws, call.id, call.name, out, self.archive, label)
+                out = ctxm.inline_output(out, rel, self._inline_limit(call.name), call.name, call.arguments)
+                # the mask marker describes what the model SAW (a cut read covers fewer lines than the file)
                 desc, reread = ctxm.describe_call(call.name, call.arguments, out)
                 self._saved[call.id] = (call.name, rel, desc, reread)
-                out = ctxm.inline_output(out, rel, self._inline_limit(call.name), call.name, call.arguments)
             except Exception:
                 pass
         return ToolResult(call.id, self.hooks.after(call.name, out))

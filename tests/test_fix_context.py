@@ -896,3 +896,26 @@ def test_summary_that_quotes_reasoning_tags_is_kept_intact():
 def test_subagents_can_search_the_conversation_archive(tmp_path):
     sub = Agent(model="mock/demo", harness=base_harness(), workspace=Workspace(tmp_path), depth=1, archive=".nesicode/chats/7")
     assert "search_history" in [s.name for s in sub.tool_specs()]  # its checkpoints tell it to use it
+
+
+def test_files_block_lists_huge_touched_files_without_loading_them(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    ws = Workspace(tmp_path / "ws")
+    (ws.root / "big.log").write_text("x" * 2_000_000)
+    (ws.root / "small.py").write_text("PORT = 1\n")
+    real = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes", lambda p: (_ for _ in ()).throw(AssertionError("loaded")) if p.name == "big.log"
+                        else real(p))
+    block = ctxm.files_block(ws, [("big.log", "read"), ("small.py", "edited")], 10_000)
+    assert "`big.log` (read; 2,000,000 bytes" in block and "PORT = 1" in block
+
+
+def test_mask_marker_of_a_cut_read_names_only_the_lines_the_model_saw(tmp_path):
+    ws = Workspace(tmp_path / "ws")
+    (ws.root / "app.log").write_text("\n".join(f"2026-10-14 INFO event {i} " + "k" * 80 for i in range(316)))
+    a = Agent(model="mock/demo", harness=base_harness(), workspace=ws, context_limit=32_768)
+    r = a._call_tool(ToolCall("c1", "read_file", {"path": "app.log"}), Usage())
+    shown = int(re.search(r"showing lines 1–(\d+) of 316", r.content).group(1))
+    marker = a._marker("c1", r.content)
+    assert f"app.log lines 1–{shown} " in marker and f"offset=1, limit={shown})" in marker and "1–316" not in marker
