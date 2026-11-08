@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import shutil
+import sqlite3
 import sys
 import subprocess
 import threading
@@ -31,7 +32,7 @@ from .vault import Vault
 from . import auth
 from .db import DB, loads
 from ..agent.vision import image_mime
-from ..agent.workspace import ATTACHMENTS_DIR, apply_cage, changes_since, manifest
+from ..agent.workspace import ATTACHMENTS_DIR, apply_cage, manifest
 from .jobs import (
     FINAL, Jobs, create_cage, current_harness, project_root, project_ws, run_dir, save_harness_version,
     thread_dir, thread_ws, user_root,
@@ -103,6 +104,119 @@ async def desktop_guard(request: Request, call_next):
     return await call_next(request)
 
 
+# ------------------------------------------------- cross-site requests and DNS rebinding
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+EXTENSION_SCHEMES = {"chrome-extension", "moz-extension", "safari-web-extension"}
+
+
+def _split_host(value: str) -> tuple[str, int | None]:
+    """'Example.com:8420' -> ('example.com', 8420); '[::1]' -> ('::1', None); garbage -> ('', None)."""
+    value = (value or "").strip().lower()
+    if value.startswith("["):
+        host, _, rest = value[1:].partition("]")
+        port = rest[1:] if rest.startswith(":") else ""
+    elif value.count(":") == 1:
+        host, _, port = value.partition(":")
+    else:
+        host, port = value, ""
+    try:
+        return host.rstrip("."), (int(port) if port else None)
+    except ValueError:
+        return "", None
+
+
+def _env_set(name: str) -> set[str]:
+    return {x.strip().lower().rstrip("/") for x in os.environ.get(name, "").split(",") if x.strip()}
+
+
+def host_allowed(host_header: str) -> bool:
+    """Can a browser have sent this Host on purpose? A DNS-rebinding page always arrives with ITS own
+    domain (evil.example) as Host, so a domain name must be listed in NESICODE_ALLOWED_HOSTS. IP
+    literals, single-label names (localhost, a LAN machine name), *.localhost and *.local cannot be
+    pointed at this server by a remote attacker."""
+    import ipaddress
+
+    host, _ = _split_host(host_header)
+    if not host_header.strip() or host == "localhost" or "." not in host or host.endswith((".localhost", ".local")):
+        return True  # (no Host at all: not a browser)
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    allowed = {_split_host(h)[0] if not h.startswith(".") else h for h in _env_set("NESICODE_ALLOWED_HOSTS")}
+    return "*" in allowed or host in allowed or any(a.startswith(".") and host.endswith(a) for a in allowed)
+
+
+def _origin_parts(url: str) -> tuple[str, str, int | None] | None:
+    from urllib.parse import urlsplit
+
+    try:
+        u = urlsplit(url.strip())
+        if not u.scheme or not u.hostname:
+            return None
+        return u.scheme.lower(), u.hostname.lower().rstrip("."), u.port
+    except ValueError:
+        return None
+
+
+def same_origin(url: str, hosts: list[str]) -> bool:
+    """Does `url` (an Origin or Referer) point at the host this request was sent to?"""
+    o = _origin_parts(url)
+    if not o:
+        return False
+    scheme, host, port = o
+    default = {"http": 80, "https": 443}.get(scheme)
+    for h in hosts:
+        name, p = _split_host(h)
+        if name and name == host and (p or default) == (port or default):
+            return True
+    return False
+
+
+def _request_hosts(headers) -> list[str]:
+    # X-Forwarded-Host (reverse proxies) cannot be set by a cross-site page: custom headers need a CORS preflight
+    return [headers.get("host", ""), headers.get("x-forwarded-host", "").split(",")[0]]
+
+
+def cross_site_reason(method: str, headers) -> str:
+    """Why this state-changing request must be refused as cross-site ('' = it is fine). Browsers send
+    Origin (or at least Referer / Sec-Fetch-Site) with every POST/PUT/PATCH/DELETE; other programs
+    (curl, scripts, the desktop shell) send none of them."""
+    if method.upper() in SAFE_METHODS:
+        return ""
+    hosts, trusted = _request_hosts(headers), _env_set("NESICODE_ALLOWED_ORIGINS")
+    origin = headers.get("origin")
+    if origin is not None:
+        o = origin.strip().lower().rstrip("/")
+        return "" if o in trusted or (o != "null" and same_origin(o, hosts)) else (o or "null")
+    referer = headers.get("referer")
+    if referer:
+        o = _origin_parts(referer)
+        as_origin = f"{o[0]}://{o[1]}" + (f":{o[2]}" if o[2] else "") if o else ""
+        return "" if same_origin(referer, hosts) or as_origin in trusted else referer[:100]
+    site = (headers.get("sec-fetch-site") or "none").lower()
+    return "" if site in ("same-origin", "none") else f"Sec-Fetch-Site: {site}"
+
+
+@app.middleware("http")
+async def request_guard(request: Request, call_next):
+    """No login (`nesicode serve`, desktop) must not mean 'any website can drive the API': refuse
+    state-changing requests that come from another site (CSRF) and, without login, Host names that
+    only a DNS-rebinding page would send. Bot webhooks are exempt (external callers with their own
+    secret, often through a tunnel's domain)."""
+    if request.method == "POST" and request.url.path.startswith("/hooks/"):
+        return await call_next(request)
+    host = request.headers.get("host", "")
+    if (not settings.auth_enabled or os.environ.get("NESICODE_ALLOWED_HOSTS")) and not host_allowed(host):
+        return JSONResponse({"detail": f"Nombre de servidor no permitido: {host[:100]}. Abre Nesicode en http://127.0.0.1 "
+                                       "o http://localhost, o añade ese nombre a NESICODE_ALLOWED_HOSTS."}, status_code=403)
+    if reason := cross_site_reason(request.method, request.headers):
+        return JSONResponse({"detail": f"Petición rechazada: viene de otra web ({reason}). Si es tu propio dominio, "
+                                       "añádelo a NESICODE_ALLOWED_ORIGINS."}, status_code=403)
+    return await call_next(request)
+
+
 # --------------------------------------------------------------------- helpers
 def local_user() -> dict:
     """The account used when NESICODE_AUTH is off (single-user mode, no login screen)."""
@@ -113,16 +227,16 @@ def local_user() -> dict:
     row = db.one("SELECT id, email, name FROM users ORDER BY id LIMIT 1")
     if row and not settings.local_user:
         return row
-    email = (settings.local_user or "local@nesicode.local").strip().lower()
+    email = (settings.local_user or auth.LOCAL_EMAIL).strip().lower()
     try:
         import getpass
 
         name = getpass.getuser() if not settings.local_user else email.split("@")[0]
     except Exception:
         name = email.split("@")[0]
-    uid = db.insert(
+    uid = db.insert(  # no usable password: the first sign-up after switching to NESICODE_AUTH=true claims it
         "INSERT INTO users (email, name, password_hash, created_at) VALUES (?, ?, ?, ?)",
-        (email, name, auth.hash_password(secrets.token_urlsafe(32)), time.time()),
+        (email, name, auth.unclaimed_hash(), time.time()),
     )
     return db.one("SELECT id, email, name FROM users WHERE id=?", (uid,))
 
@@ -188,17 +302,31 @@ class Credentials(BaseModel):
 
 @app.post("/api/auth/register")
 def register(body: Credentials, response: Response):
-    if not settings.allow_signup and db.one("SELECT 1 AS x FROM users LIMIT 1"):
-        raise HTTPException(403, "El registro está desactivado")
+    users = db.all("SELECT id, email, password_hash FROM users ORDER BY id")
+    claim = None
+    if users and not settings.allow_signup:
+        if any(not auth.is_unclaimed(u) for u in users):
+            raise HTTPException(403, "El registro está desactivado")
+        # Only local-mode accounts exist (made while NESICODE_AUTH was off; nobody knows their password):
+        # this first sign-up is the owner and takes that account, with its projects, keys and settings.
+        claim = users[0]
     email = body.email.strip().lower()
     if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
         raise HTTPException(422, "Email no válido")
-    if db.one("SELECT id FROM users WHERE email=?", (email,)):
+    if email == auth.LOCAL_EMAIL:
+        raise HTTPException(422, "Ese email está reservado: usa el tuyo")
+    same = db.one("SELECT id, email, password_hash FROM users WHERE email=?", (email,))
+    if claim and same:
+        claim = same  # an unclaimed account with this very email (NESICODE_LOCAL_USER)
+    elif same:
         raise HTTPException(409, "Ya existe una cuenta con ese email")
-    uid = db.insert(
-        "INSERT INTO users (email, name, password_hash, created_at) VALUES (?, ?, ?, ?)",
-        (email, body.name.strip() or email.split("@")[0], auth.hash_password(body.password), time.time()),
-    )
+    name, pw = body.name.strip() or email.split("@")[0], auth.hash_password(body.password)
+    if claim:
+        uid = claim["id"]
+        db.execute("UPDATE users SET email=?, name=?, password_hash=? WHERE id=?", (email, name, pw, uid))
+    else:
+        uid = db.insert("INSERT INTO users (email, name, password_hash, created_at) VALUES (?, ?, ?, ?)",
+                        (email, name, pw, time.time()))
     _set_cookie(response, auth.create_session(db, uid))
     return db.one("SELECT id, email, name FROM users WHERE id=?", (uid,))
 
@@ -229,26 +357,40 @@ NAME_RX = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
 _server_models: dict[str, tuple[float, list[str]]] = {}
 
 
+def _non_public_ip(addr: str) -> bool:
+    """Loopback, private, link-local (cloud metadata), CGNAT 100.64/10, multicast, reserved…: anything
+    that is not a public unicast address (IPv4-mapped IPv6 addresses are judged as the IPv4 inside)."""
+    import ipaddress
+
+    ip = ipaddress.ip_address(addr.split("%", 1)[0])
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return not ip.is_global or ip.is_multicast or ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+
+
 def check_base_url(url: str) -> str:
     """Endpoints must be http(s). With NESICODE_ALLOW_PRIVATE_PROVIDERS=0 (multi-user servers),
-    private/loopback addresses are refused so users cannot probe the server's network."""
-    import ipaddress
+    non-public addresses are refused so users cannot probe the server's network. Every URL built from
+    user input goes through here: providers, custom and catalog connectors, git clones, imports."""
     import socket
     from urllib.parse import urlparse
 
     url = url.strip().rstrip("/")
-    u = urlparse(url)
-    if u.scheme not in ("http", "https") or not u.hostname:
+    try:
+        u = urlparse(url)
+        host = u.hostname
+        u.port  # noqa: B018 — raises ValueError for a bad port
+    except ValueError as exc:
+        raise HTTPException(422, "El endpoint debe ser una URL http(s)://") from exc
+    if u.scheme not in ("http", "https") or not host:
         raise HTTPException(422, "El endpoint debe ser una URL http(s)://")
     if os.environ.get("NESICODE_ALLOW_PRIVATE_PROVIDERS", "1") == "0":
         try:
-            addrs = {ai[4][0] for ai in socket.getaddrinfo(u.hostname, None)}
+            addrs = {ai[4][0] for ai in socket.getaddrinfo(host, None)}
         except OSError as exc:
-            raise HTTPException(422, f"No se puede resolver {u.hostname}") from exc
-        for a in addrs:
-            ip = ipaddress.ip_address(a)
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                raise HTTPException(422, "Este servidor no permite endpoints en redes privadas")
+            raise HTTPException(422, f"No se puede resolver {host}") from exc
+        if not addrs or any(_non_public_ip(a) for a in addrs):
+            raise HTTPException(422, "Este servidor no permite endpoints en redes privadas")
     return url
 
 
@@ -280,13 +422,25 @@ def provider_rows(user_id: int) -> list[dict]:
     return out
 
 
+def fetch_models(kind: str, base_url: str, api_key: str) -> list[str]:
+    """list_models, with any malformed answer (an HTML page, `{"data": 5}`…) reported as LLMError
+    instead of escaping as a 500: the usual cause is the website's URL instead of the API's."""
+    try:
+        return list_models(kind, base_url, api_key)
+    except LLMError:
+        raise
+    except Exception as exc:
+        raise LLMError(f"la dirección no responde como una API de modelos ({type(exc).__name__}). "
+                       "¿Es la URL de la API (p. ej. https://…/v1) y no la de la web?") from exc
+
+
 def _discover_server(name: str) -> list[str]:
     if name == "mock":
         return ["demo"]
     cfg = server_provider_config(name)
     if not cfg:
         raise LLMError("proveedor desconocido")
-    models = list_models(cfg["kind"], cfg["base_url"], cfg["api_key"])  # the server key never leaves
+    models = fetch_models(cfg["kind"], cfg["base_url"], cfg["api_key"])  # the server key never leaves
     _server_models[name] = (time.time(), models)
     return models
 
@@ -423,24 +577,32 @@ def create_provider(body: ProviderBody, user: dict = Depends(current_user)):
     if db.one("SELECT id FROM user_providers WHERE user_id=? AND name=?", (user["id"], name)):
         raise HTTPException(409, f"Ya tienes un proveedor llamado {name}")
     base = check_base_url(body.base_url)
-    now = time.time()
-    db.insert(
-        "INSERT INTO user_providers (user_id, name, label, kind, base_url, models, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (user["id"], name, body.label.strip() or name, body.kind, base, json.dumps(_clean_models(body.models)), now, now),
-    )
-    if body.api_key and body.api_key.strip():
-        vault.put(user["id"], f"provider:{name}", body.api_key.strip())
-    models = _clean_models(body.models)
-    if not models:
+    models, warning = _clean_models(body.models), ""
+    if not models:  # ask the endpoint first: nothing is stored until we know what it answered
         try:
-            models = list_models(body.kind, base, (body.api_key or "").strip())
-            db.execute("UPDATE user_providers SET models=? WHERE user_id=? AND name=?", (json.dumps(models), user["id"], name))
-        except LLMError:
-            models = []
-    assigned = auto_assign(user, name, models)
+            models = fetch_models(body.kind, base, (body.api_key or "").strip())
+        except LLMError as exc:
+            models, warning = [], f"No se pudieron obtener los modelos: {exc}"
+    now = time.time()
+    try:
+        db.insert(
+            "INSERT INTO user_providers (user_id, name, label, kind, base_url, models, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user["id"], name, body.label.strip() or name, body.kind, base, json.dumps(models), now, now),
+        )
+    except sqlite3.IntegrityError as exc:  # the same form sent twice while the models were being listed
+        raise HTTPException(409, f"Ya tienes un proveedor llamado {name}") from exc
+    try:
+        if body.api_key and body.api_key.strip():
+            vault.put(user["id"], f"provider:{name}", body.api_key.strip())
+        assigned = auto_assign(user, name, models)
+        view = next(p for p in provider_rows(user["id"]) if p["name"] == name)
+    except Exception:  # never leave a half-created provider behind ("Ya tienes un proveedor llamado …")
+        db.execute("DELETE FROM user_providers WHERE user_id=? AND name=?", (user["id"], name))
+        vault.delete(user["id"], f"provider:{name}")
+        raise
     _refresh_limits_bg(user["id"], name, models)
-    return {**next(p for p in provider_rows(user["id"]) if p["name"] == name), "assigned": assigned}
+    return {**view, "assigned": assigned, **({"warning": warning} if warning else {})}
 
 
 def _own_provider(user: dict, name: str) -> dict:
@@ -543,7 +705,7 @@ def test_provider(body: ProviderTest, user: dict = Depends(current_user)):
     if not key and body.name:
         key = vault.get(user["id"], f"provider:{body.name}") or ""
     try:
-        models = list_models(body.kind, check_base_url(body.base_url), key)
+        models = fetch_models(body.kind, check_base_url(body.base_url), key)
     except LLMError as exc:
         return {"ok": False, "error": str(exc)}
     return {"ok": True, "models": models}
@@ -554,7 +716,7 @@ def discover_models(name: str, user: dict = Depends(current_user)):
     row = db.one("SELECT * FROM user_providers WHERE user_id=? AND name=?", (user["id"], name))
     try:
         if row:
-            models = list_models(row["kind"], row["base_url"], vault.get(user["id"], f"provider:{name}") or "")
+            models = fetch_models(row["kind"], row["base_url"], vault.get(user["id"], f"provider:{name}") or "")
             db.execute("UPDATE user_providers SET models=?, updated_at=? WHERE id=?", (json.dumps(models), time.time(), row["id"]))
         else:
             if name not in PROVIDERS or not provider_available(name, {}):
@@ -603,27 +765,56 @@ def config_export_download(token: str, user: dict = Depends(current_user)):
 
 @app.post("/api/config/import")
 async def config_import(request: Request, file: UploadFile = File(...), user: dict = Depends(current_user)):
-    from .config_io import ConfigError, apply, unseal
-
     form = await request.form()
     password = str(form.get("password") or "")
-    data = await file.read()
+    data = await file.read(5 * 1024 * 1024 + 1)
     if len(data) > 5 * 1024 * 1024:
         raise HTTPException(413, "Archivo demasiado grande")
+    if str(form.get("preview") or "") in ("1", "true"):  # dry run: what WOULD be imported (commands, URLs, preferences)
+        return {"preview": await asyncio.to_thread(_preview_config, user, data, password)}
+    # scrypt (and the DB work) off the event loop: other users' requests and live streams keep flowing
+    return {"imported": await asyncio.to_thread(_import_config, user, data, password)}
+
+
+def _unseal_or_422(data: bytes, password: str) -> dict:
+    from .config_io import ConfigError, unseal
+
     try:
-        doc = unseal(data, password)
+        return unseal(data, password)
     except ConfigError as exc:
         raise HTTPException(422, str(exc)) from exc
-    result = apply(db, user["id"], doc)
-    result["projects_updated"] = _apply_role_models(user, doc.get("role_models") or {})
-    from .config_io import import_bots
 
+
+def _preview_config(user: dict, data: bytes, password: str) -> dict:
+    from .config_io import redirected_keys, summary, validate_import
+
+    doc, report = validate_import(_unseal_or_422(data, password), auth_enabled=settings.auth_enabled, check_url=check_base_url,
+                                  settings_model=UserSettings, current_settings=user_settings(user["id"]))
+    report["notes"] += redirected_keys(db, user["id"], doc)[1]
+    return {**summary(doc), **report}
+
+
+def _import_config(user: dict, data: bytes, password: str) -> dict:
+    from ..connectors import manager
+    from .config_io import apply, import_bots
+
+    doc = _unseal_or_422(data, password)
+    # the same rules as the API: multi-user stdio ban, URL checks, validated preferences, no looser approvals
+    result = apply(db, user["id"], doc, auth_enabled=settings.auth_enabled, check_url=check_base_url,
+                   settings_model=UserSettings, current_settings=user_settings(user["id"]))
+    for c in result["details"]["connectors"]:  # an overwritten connector must not keep running its old config
+        try:
+            manager().stop(user["id"], c["name"])
+        except Exception as exc:
+            print("nesicode: could not stop connector", c["name"], exc)
+    result["projects_updated"] = _apply_role_models(user, result["role_models"])  # the validated ones
     result["bots_created"] = import_bots(db, bots, user["id"])  # waits for a project if there is none yet
-    if doc.get("telegram"):
+    if result["telegram"]:
         telegram.restart(user["id"])
-    for p in doc.get("providers", []):
-        _refresh_limits_bg(user["id"], p["name"], p.get("models", []))
-    return {"imported": result}
+    for p in result["details"]["providers"]:
+        row = db.one("SELECT models FROM user_providers WHERE user_id=? AND name=?", (user["id"], p["name"]))
+        _refresh_limits_bg(user["id"], p["name"], loads(row["models"], []) if row else [])
+    return result
 
 
 def _model_works(spec: str, user: dict) -> bool:
@@ -669,6 +860,10 @@ bots = BotManager(db, jobs, telegram)
 jobs.bots = bots
 bots.repair_links()  # links from before threads.bot_id existed
 bots.start()  # scheduler thread (off with NESICODE_NO_SCHEDULER)
+# Runs of deleted conversations kept while their worker finished (see delete_thread): gone when it ends
+# (registered after the bots' hook, so that one still sees the row), and leftovers of a previous launch now.
+jobs.on_finish.append(lambda run_id: _drop_detached_run(run_id))
+db.execute("DELETE FROM runs WHERE kind='chat' AND thread_id IS NULL")
 
 
 # ------------------------------------------------------------------------ bots
@@ -740,6 +935,8 @@ def _save_bot(user: dict, body: BotIn, bot_id: int | None = None) -> dict:
         b = bots.save(user["id"], data, bot_id)
     except (ValueError, CronError, ToolError) as exc:
         raise HTTPException(422, str(exc)) from exc
+    if bot_id is None:  # a new bot may reuse a deleted bot's id: never its old webhook secret
+        vault.delete(user["id"], f"bot:{b['id']}:webhook")
     return _bot_view(b, full=True)
 
 
@@ -826,12 +1023,13 @@ def draft_bot(body: BotDraft, user: dict = Depends(current_user)):
     from .bots import validate_trigger
 
     p = get_project(user, body.project_id)
-    tz = local_tz() or "local"
+    tz = local_tz()  # '' on Windows: then the example has no tz at all (it means this computer's local time)
+    cron = '{"kind": "cron", "spec": "min hour dom mon dow"' + (f', "tz": "{tz}"' if tz else "") + "}"
     prompt = (
         "Turn the user's request into a JSON bot configuration for Nesicode. Reply with ONLY a JSON object:\n"
         '{"name": short name, "description": one line, "instructions": complete self-contained brief for an unattended '
         'agent (what to check, how to report, when to stay silent by answering NOTHING_NEW), written in the user\'s language, '
-        '"triggers": [{"kind": "cron", "spec": "min hour dom mon dow", "tz": "' + tz + '"} | {"kind": "interval", "spec": "30" (minutes) or "2h"} '
+        '"triggers": [' + cron + ' | {"kind": "interval", "spec": "30" (minutes) or "2h"} '
         '| {"kind": "url", "spec": "https://…", "config": {"every": 30}}] (empty list if it should only run on demand), '
         '"policy": "readonly" if it only needs to read/fetch/report, else "ask"}\n\nUser request:\n' + body.description
     )
@@ -850,7 +1048,11 @@ def draft_bot(body: BotDraft, user: dict = Depends(current_user)):
     except Exception:
         draft = {}
     triggers = []
-    for t in draft.get("triggers") or []:
+    for t in draft.get("triggers") if isinstance(draft.get("triggers"), list) else []:
+        if not isinstance(t, dict):
+            continue
+        if str(t.get("tz") or "").strip().lower() in ("local", "localtime", "system", "local time"):
+            t = {**t, "tz": tz}  # models copy placeholders: 'local' means this computer's zone ('' = its local time)
         try:
             triggers.append(validate_trigger(t))
         except Exception:
@@ -896,7 +1098,10 @@ async def _hook(bot_id: int, token: str, request: Request):
     host = (request.headers.get("host") or "").split(":")[0].strip("[]")
     if DESKTOP_TOKEN and host not in ("127.0.0.1", "localhost", "::1"):
         raise HTTPException(403, "host no permitido")  # DNS-rebinding guard for the desktop app
-    b = db.one("SELECT * FROM bots WHERE id=?", (bot_id,))
+    # the webhook trigger row lives and dies with the bot (cascade): a secret left behind by a deleted bot whose
+    # id was reused never opens the new one
+    b = db.one("SELECT b.* FROM bots b WHERE b.id=? AND EXISTS (SELECT 1 FROM bot_triggers t WHERE t.bot_id=b.id "
+               "AND t.kind='webhook')", (bot_id,))
     expected = vault.get(b["user_id"], f"bot:{bot_id}:webhook") if b else None
     if not b or not expected or not token or not secrets.compare_digest(token, expected):
         raise HTTPException(404, "not found")
@@ -1076,31 +1281,82 @@ def extension_zip(user: dict = Depends(current_user)):
                     headers={"Content-Disposition": 'attachment; filename="nesicode-chrome.zip"'})
 
 
+class ExtensionSocket:
+    """The extension's socket as the browser hub sees it. It remembers the ids of the commands sent
+    through it, and only replies to those are passed on: another user's extension (or anyone guessing
+    the ids) can never answer this user's commands with made-up page contents."""
+
+    MAX_PENDING = 1000
+
+    def __init__(self, ws: WebSocket):
+        self.ws = ws
+        self.sent: dict[str, None] = {}  # insertion-ordered set of command ids awaiting a reply
+
+    def _remember(self, data) -> None:
+        if isinstance(data, dict) and data.get("id") is not None:
+            self.sent[str(data["id"])] = None
+            while len(self.sent) > self.MAX_PENDING:  # commands that timed out never get a reply
+                self.sent.pop(next(iter(self.sent)))
+
+    async def send_json(self, data, *args, **kwargs):
+        self._remember(data)
+        return await self.ws.send_json(data, *args, **kwargs)
+
+    async def send_text(self, data: str):
+        try:
+            self._remember(json.loads(data))
+        except ValueError:
+            pass
+        return await self.ws.send_text(data)
+
+    def claim(self, msg) -> bool:
+        """Is this a reply to a command sent through THIS socket (each id answers once)?"""
+        rid = str(msg.get("id")) if isinstance(msg, dict) and msg.get("id") is not None else None
+        return rid is not None and self.sent.pop(rid, False) is None
+
+    def __getattr__(self, name):
+        return getattr(self.ws, name)
+
+
+def extension_origin_ok(origin: str | None, headers) -> bool:
+    """The extension connects from chrome-extension://…; other programs send no Origin. A web page
+    (another site) has no business here, even with a stolen pairing code."""
+    if not origin:
+        return True
+    o = origin.strip().lower().rstrip("/")
+    return (o.split("://", 1)[0] in EXTENSION_SCHEMES or o in _env_set("NESICODE_ALLOWED_ORIGINS")
+            or (o != "null" and same_origin(o, _request_hosts(headers))))
+
+
 @app.websocket("/api/browser/ws")
 async def browser_ws(ws: WebSocket):
     from ..browser import hub
 
     token = ws.query_params.get("token", "")
     row = db.one("SELECT user_id FROM browser_pairings WHERE token_hash=?", (_pairing_hash(token),)) if token else None
-    if not row:
+    if not row or not extension_origin_ok(ws.headers.get("origin"), ws.headers):
         await ws.close(code=4401)
         return
     await ws.accept()
     user_id = row["user_id"]
+    sock = ExtensionSocket(ws)
     try:
         hello = await asyncio.wait_for(ws.receive_json(), 10)
-        hub.attach(user_id, ws, {"browser": str(hello.get("browser", ""))[:120], "version": str(hello.get("version", ""))[:20]})
+        hello = hello if isinstance(hello, dict) else {}
+        hub.attach(user_id, sock, {"browser": str(hello.get("browser", ""))[:120], "version": str(hello.get("version", ""))[:20]})
         await ws.send_json({"type": "welcome", "user": user_id})
         while True:
             msg = await ws.receive_json()
+            if not isinstance(msg, dict):
+                continue
             if msg.get("type") == "ping":
                 await ws.send_json({"type": "pong"})
-            else:
+            elif sock.claim(msg):  # only answers to commands this very socket received
                 hub.on_message(msg)
-    except (WebSocketDisconnect, asyncio.TimeoutError, RuntimeError):
+    except (WebSocketDisconnect, asyncio.TimeoutError, RuntimeError, ValueError):
         pass
     finally:
-        hub.detach(user_id, ws)
+        hub.detach(user_id, sock)
 
 
 # ------------------------------------------------------------ MCP connectors
@@ -1138,6 +1394,26 @@ def list_connectors(user: dict = Depends(current_user)):
     return {"catalog": catalog, "connectors": mine, "local_allowed": local_ok}
 
 
+def _host_only_connector(row: dict) -> bool:
+    """Runs a command on this machine or talks to its local services: never allowed on a multi-user server."""
+    from ..connectors import catalog_entry
+
+    return row["kind"] == "stdio" or bool((catalog_entry(row.get("template") or "") or {}).get("local_only"))
+
+
+def _disable_host_only_connectors() -> None:
+    """Multi-user servers: such connectors may exist from local mode or from an import made before imports
+    were checked; they stay switched off (the chat only starts enabled connectors)."""
+    if settings.auth_enabled:
+        for row in db.all("SELECT id, kind, template FROM user_connectors WHERE enabled=1"):
+            if _host_only_connector(row):
+                db.execute("UPDATE user_connectors SET enabled=0 WHERE id=?", (row["id"],))
+
+
+_disable_host_only_connectors()
+LOCAL_ONLY_MSG = "Los conectores locales solo están disponibles en modo local (sin login)"
+
+
 def _start_and_list(user: dict, name: str) -> list[str]:
     """(Re)start a connector and return its tool names; raises HTTP 422 with the real error."""
     from ..connectors import manager
@@ -1145,6 +1421,8 @@ def _start_and_list(user: dict, name: str) -> list[str]:
 
     for row, cfg in connector_configs(db, user["id"]):
         if row["name"] == name:
+            if settings.auth_enabled and _host_only_connector(row):
+                raise HTTPException(403, LOCAL_ONLY_MSG)
             manager().stop(user["id"], name)
             try:
                 tools = [t.name for t in manager().tools(user["id"], cfg, timeout=150)]
@@ -1185,7 +1463,7 @@ def _unique_connector_name(user_id: int, base: str) -> str:
 def _insert_connector(user: dict, name: str, label: str, template: str, kind: str, command: str,
                       args: list[str], url: str, fields: list[dict], secrets_: dict[str, str]) -> dict:
     if kind == "stdio" and settings.auth_enabled:
-        raise HTTPException(403, "Los conectores locales solo están disponibles en modo local (sin login)")
+        raise HTTPException(403, LOCAL_ONLY_MSG)
     db.insert(
         "INSERT INTO user_connectors (user_id, name, label, template, kind, command, args, url, fields, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1222,6 +1500,8 @@ def add_connector(body: ConnectorAdd, user: dict = Depends(current_user)):
             if not re.fullmatch(r"[A-Za-z0-9.-]+(:\d{1,5})?", v):
                 raise HTTPException(422, f"{f['label']}: escribe solo el nombre del servidor")
             url = url.replace("{" + f["key"] + "}", v)
+    if url and not entry.get("local_only"):
+        url = check_base_url(url)  # the host comes from the user: same private-network rule as custom endpoints
     fields = [{k: v for k, v in f.items() if k in ("key", "label", "secret", "header", "prefix", "env")}
               for f in entry["fields"] if not f.get("url_param")]
     for f in entry["fields"]:
@@ -1237,14 +1517,60 @@ def add_connector(body: ConnectorAdd, user: dict = Depends(current_user)):
                              url, fields, secrets_)
 
 
-@app.post("/api/connectors/custom")
-def add_custom_connector(body: ConnectorCustom, user: dict = Depends(current_user)):
+def split_command(command: str, windows: bool | None = None) -> list[str]:
+    """A command line as the user typed it → argv. POSIX shlex would eat Windows backslashes
+    (C:\\Users\\ana\\mcp.js → C:Usersanamcp.js), so Windows uses its own rules (CommandLineToArgvW):
+    double quotes group words and vanish, backslashes are literal unless they come before a quote."""
     import shlex
 
+    if not (os.name == "nt" if windows is None else windows):
+        return shlex.split(command)
+    args: list[str] = []
+    cur: list[str] = []
+    quoted = have = False
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if ch == "\\":
+            n = len(command[i:]) - len(command[i:].lstrip("\\"))
+            i += n
+            if i < len(command) and command[i] == '"':
+                cur.append("\\" * (n // 2) + ('"' if n % 2 else ""))
+                i += n % 2  # an odd run escapes the quote; an even one leaves it to open/close a group
+            else:
+                cur.append("\\" * n)
+            have = True
+        elif ch == '"':
+            if quoted and command[i + 1:i + 2] == '"':  # "" inside quotes is a literal quote
+                cur.append('"')
+                i += 1
+            else:
+                quoted = not quoted
+            have = True
+            i += 1
+        elif ch in " \t" and not quoted:
+            if have:
+                args.append("".join(cur))
+            cur, have = [], False
+            i += 1
+        else:
+            cur.append(ch)
+            have = True
+            i += 1
+    if have:
+        args.append("".join(cur))
+    return args
+
+
+@app.post("/api/connectors/custom")
+def add_custom_connector(body: ConnectorCustom, user: dict = Depends(current_user)):
     name = _unique_connector_name(user["id"], body.label)
     if body.kind == "stdio":
-        parts = shlex.split(body.command)
-        if not parts:
+        try:
+            parts = split_command(body.command)
+        except ValueError as exc:  # an unclosed quote
+            raise HTTPException(422, f"Comando no válido: {exc}") from exc
+        if not parts or not parts[0].strip():
             raise HTTPException(422, "Escribe el comando que arranca el servidor MCP")
         return _insert_connector(user, name, body.label, "custom", "stdio", parts[0], parts[1:], "", [], {})
     url = check_base_url(body.url)
@@ -1262,8 +1588,11 @@ class ConnectorPatch(BaseModel):
 def patch_connector(name: str, body: ConnectorPatch, user: dict = Depends(current_user)):
     from ..connectors import manager
 
-    if not db.one("SELECT id FROM user_connectors WHERE user_id=? AND name=?", (user["id"], name)):
+    row = db.one("SELECT * FROM user_connectors WHERE user_id=? AND name=?", (user["id"], name))
+    if not row:
         raise HTTPException(404, "Conector no encontrado")
+    if body.enabled and settings.auth_enabled and _host_only_connector(row):
+        raise HTTPException(403, LOCAL_ONLY_MSG)
     if body.usage is not None:
         db.execute("UPDATE user_connectors SET usage=? WHERE user_id=? AND name=?", (body.usage, user["id"], name))
     if body.enabled is not None:
@@ -1374,6 +1703,33 @@ def pick_folder_hint(user: dict = Depends(current_user)):
     return {"local_mode": not settings.auth_enabled, "home": str(Path.home()) if not settings.auth_enabled else ""}
 
 
+GIT_ENV_KEYS = {"PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR", "GIT_SSL_CAINFO", "HTTP_PROXY", "HTTPS_PROXY",
+                "NO_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "no_proxy", "all_proxy"}
+
+
+def git_env(environ: dict | None = None, windows: bool | None = None) -> dict[str, str]:
+    """git's environment: this machine's PATH (plus, on Windows, SystemRoot & co., without which networking
+    does not even start), proxy and CA settings — and never a terminal prompt for credentials."""
+    from ..agent.workspace import WINDOWS_ENV
+
+    windows = os.name == "nt" if windows is None else windows
+    keep = GIT_ENV_KEYS | (WINDOWS_ENV if windows else set())
+    env = {k: v for k, v in (os.environ if environ is None else environ).items() if k.upper() in keep or k in keep}
+    if not env.get("PATH"):
+        env["PATH"] = os.defpath if windows else "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def run_git(cmd: list[str], timeout: int = 300) -> tuple[bool, str]:
+    """(ok, stderr) of a git command run with git_env()."""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=git_env())
+        return proc.returncode == 0, proc.stderr
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+
+
 @app.post("/api/projects")
 def create_project(body: ProjectCreate, user: dict = Depends(current_user)):
     folder = check_folder(body.folder) if body.folder.strip() else ""
@@ -1421,16 +1777,25 @@ def create_project(body: ProjectCreate, user: dict = Depends(current_user)):
     ws.mkdir(parents=True, exist_ok=True)
     if body.git_url.strip() and not folder:
         url = body.git_url.strip()
-        if not re.match(r"^https://[\w.-]+/[\w./~-]+$", url):
-            raise HTTPException(422, "Solo se admiten URLs git https://")
-        proc = subprocess.run(
-            ["git", "clone", "--depth", "1", url, str(ws)], capture_output=True, text=True, timeout=300,
-            env={"GIT_TERMINAL_PROMPT": "0", "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"},
-        )
-        if proc.returncode != 0:
+        try:
+            if not re.match(r"^https://[\w.-]+/[\w./~-]+$", url):
+                raise HTTPException(422, "Solo se admiten URLs git https://")
+            check_base_url(url)  # no clones from the server's own network on multi-user servers
+        except HTTPException:
             db.execute("DELETE FROM projects WHERE id=?", (pid,))
-            shutil.rmtree(ws, ignore_errors=True)
-            raise HTTPException(422, f"git clone falló: {proc.stderr[-500:]}")
+            shutil.rmtree(project_root(p), ignore_errors=True)
+            raise
+        # No redirects (they could lead to a private address) and no stored credentials of the server's account.
+        # Multi-user: links in a cloned repo could point at other users' files; check them out as plain files.
+        cmd = ["git", "-c", "http.followRedirects=false", "-c", "credential.helper=",
+               *(["-c", "core.symlinks=false"] if settings.auth_enabled else []), "clone", "--depth", "1", url, str(ws)]
+        ok, err = run_git(cmd)
+        if not ok:
+            db.execute("DELETE FROM projects WHERE id=?", (pid,))
+            shutil.rmtree(project_root(p), ignore_errors=True)
+            for path, label in ((str(ws), "<proyecto>"), (str(settings.data_dir), "<datos>")):
+                err = err.replace(path, label)  # git's messages name the server's own folders
+            raise HTTPException(422, f"git clone falló: {err[-500:]}")
     from .config_io import import_bots
 
     import_bots(db, bots, user["id"])  # bots imported before any project existed land here
@@ -1486,70 +1851,333 @@ def change_profile(project_id: int, body: ProfileChange, user: dict = Depends(cu
     return {**project_view(get_project(user, project_id)), "harness_version": v}
 
 
+THREAD_DELETE_GRACE, PROJECT_DELETE_GRACE = 1.5, 5.0  # seconds a deleted conversation's/project's runs get to stop
+
+
+def halt_runs(where: str, args: tuple, grace: float) -> dict[int, str]:
+    """Stop these runs (as the Stop button does) and give their workers up to `grace` seconds to wrap up.
+    Returns {id: status} of those still in a worker after that: 'running' (a step that ignores Stop: an MCP
+    call, a connector starting…) or 'queued' (its job has not started yet: every worker is busy). Their rows
+    must outlive that job: run ids are reused by SQLite, and a job that runs or finishes later works on its
+    id — on whatever new run (maybe another user's) got it meanwhile."""
+    ids = [r["id"] for r in db.all(f"SELECT id FROM runs WHERE {where} AND status IN ('waiting', 'queued', 'running')", args)]
+    if not ids:
+        return {}
+    for rid in ids:
+        jobs.cancel(rid)
+    marks = ",".join("?" * len(ids))
+    db.execute(f"UPDATE runs SET status='cancelled', finished_at=? WHERE status='waiting' AND id IN ({marks})", (time.time(), *ids))
+    deadline = time.time() + grace
+    while True:
+        busy = {r["id"]: r["status"] for r in db.all(f"SELECT id, status FROM runs WHERE status IN ('queued', 'running') "
+                                                     f"AND id IN ({marks})", tuple(ids))}
+        if "running" not in busy.values() or time.time() >= deadline:
+            return busy
+        time.sleep(0.05)
+
+
+def _drop_detached_run(run_id: int) -> None:
+    """The reply of a deleted conversation has finished: its run, kept only so its id could not be reused
+    while the worker was alive, goes now (see delete_thread)."""
+    db.execute("DELETE FROM runs WHERE id=? AND kind='chat' AND thread_id IS NULL", (run_id,))
+
+
+def _forget_telegram_targets(user_id: int, project_id: int | None = None, thread_ids: list[int] | tuple = ()) -> None:
+    """Telegram must not stay attached to a deleted conversation/project: the ids get reused."""
+    for tid in thread_ids:
+        db.execute("UPDATE telegram_links SET active_thread=NULL WHERE user_id=? AND active_thread=?", (user_id, tid))
+    if project_id is not None:
+        db.execute("UPDATE telegram_links SET active_project=NULL, active_thread=NULL WHERE user_id=? AND active_project=?",
+                   (user_id, project_id))
+
+
 @app.delete("/api/projects/{project_id}")
 def delete_project(project_id: int, user: dict = Depends(current_user)):
     p = get_project(user, project_id)
-    for r in db.all("SELECT id FROM runs WHERE project_id=?", (project_id,)):
-        jobs.cancel(r["id"])
+    # (a run still queued behind busy workers is not waited for: the job queue must notice that its run is
+    # gone — jobs-runtime#1 — before it would run whatever new run got the id)
+    if "running" in halt_runs("project_id=?", (project_id,), grace=PROJECT_DELETE_GRACE).values():
+        raise HTTPException(409, "Hay una respuesta de este proyecto que aún no se ha detenido (p. ej. esperando a un "
+                                 "conector). Vuelve a intentarlo en unos segundos.")
+    for b in db.all("SELECT id FROM bots WHERE project_id=? AND user_id=?", (project_id, user["id"])):
+        vault.delete(user["id"], f"bot:{b['id']}:webhook")  # vault rows do not cascade with the bot
+    thread_ids = [t["id"] for t in db.all("SELECT id FROM threads WHERE project_id=?", (project_id,))]
     db.execute("DELETE FROM projects WHERE id=?", (project_id,))
+    _forget_telegram_targets(user["id"], project_id, thread_ids)
     shutil.rmtree(project_root(p), ignore_errors=True)
     return {"ok": True}
 
 
-# ----------------------------------------------------------------- workspace
-@app.get("/api/projects/{project_id}/tree")
-def workspace_tree(project_id: int, user: dict = Depends(current_user)):
-    root = project_ws(get_project(user, project_id))
+# ------------------------------------- files inside a workspace, never through a symbolic link
+# Workspaces hold links the server must not follow: a cloned repo's, the agent's (`ln -s` works even in its
+# sandbox, and in docker mode the link is resolved on the host), the user's. Following one on a write or
+# on a read meant for the user lets a project reach outside itself — another user's files on a shared server.
+# So paths below a root are opened one component at a time with O_NOFOLLOW (openat-style).
+_OPENAT = hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY") and \
+    {os.open, os.mkdir, os.unlink, os.stat} <= os.supports_dir_fd
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)  # a FIFO planted in the workspace must not hang a server thread
+WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _NONBLOCK | getattr(os, "O_BINARY", 0)
+READ_FLAGS = os.O_RDONLY | _NONBLOCK | getattr(os, "O_BINARY", 0)
+
+
+class UnsafePath(Exception):
+    """A path that leaves its root or goes through a symbolic link (or something that is not a file/folder)."""
+
+
+def rel_parts(rel: str) -> list[str]:
+    parts = [p for p in str(rel).replace("\\", "/").split("/") if p not in ("", ".")]
+    if not parts or ".." in parts or str(rel).startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", str(rel)):
+        raise UnsafePath(str(rel))
+    return parts
+
+
+def _is_link_at(name: str, dir_fd: int) -> bool:
+    import stat as _stat
+
+    try:
+        return _stat.S_ISLNK(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+
+
+def _open_dirs(root: Path, names: list[str], mkdirs: bool) -> int:
+    """fd of root/names…, entered one folder at a time without following links (created if `mkdirs`)."""
+    dfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for name in names:
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            for attempt in (0, 1):
+                try:
+                    nfd = os.open(name, flags, dir_fd=dfd)
+                    break
+                except FileNotFoundError:
+                    if not mkdirs or attempt:
+                        raise
+                    try:
+                        os.mkdir(name, 0o755, dir_fd=dfd)
+                    except FileExistsError:
+                        pass
+                except OSError as exc:
+                    if _is_link_at(name, dfd):
+                        raise UnsafePath(name) from exc
+                    raise
+            os.close(dfd)
+            dfd = nfd
+        return dfd
+    except BaseException:
+        os.close(dfd)
+        raise
+
+
+def _plain_path(root: Path, parts: list[str], mkdirs: bool) -> Path:
+    """No openat (Windows, where links need admin rights): check each component instead."""
+    cur = Path(root)
+    for name in parts[:-1]:
+        cur = cur / name
+        if cur.is_symlink():
+            raise UnsafePath(name)
+        if mkdirs:
+            cur.mkdir(exist_ok=True)
+    if (cur / parts[-1]).is_symlink():
+        raise UnsafePath(parts[-1])
+    return cur / parts[-1]
+
+
+def open_in(root: Path, rel: str, flags: int, *, mkdirs: bool = False, mode: int = 0o644) -> int:
+    """os.open(root/rel) without following a symbolic link anywhere below root: UnsafePath if there is
+    one. Only regular files come back (a FIFO, socket or device is UnsafePath too)."""
+    import stat as _stat
+
+    parts = rel_parts(rel)
+    if _OPENAT:
+        dfd = _open_dirs(root, parts[:-1], mkdirs)
+        try:
+            fd = os.open(parts[-1], flags | os.O_NOFOLLOW, mode, dir_fd=dfd)
+        except OSError as exc:
+            if _is_link_at(parts[-1], dfd):
+                raise UnsafePath(rel) from exc
+            raise
+        finally:
+            os.close(dfd)
+    else:
+        fd = os.open(_plain_path(root, parts, mkdirs), flags, mode)
+    if not _stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise UnsafePath(rel)
+    return fd
+
+
+def unlink_in(root: Path, rel: str, *, only_link: bool = False) -> bool:
+    """Remove root/rel itself — a link is removed, never followed. False if there was nothing (or, with
+    only_link, if it is not a link)."""
+    parts = rel_parts(rel)
+    if not _OPENAT:
+        p = Path(root, *parts[:-1])
+        if any(Path(root, *parts[:i]).is_symlink() for i in range(1, len(parts))):
+            raise UnsafePath(rel)
+        target = p / parts[-1]
+        if only_link and not target.is_symlink():
+            return False
+        target.unlink(missing_ok=True)
+        return True
+    try:
+        dfd = _open_dirs(root, parts[:-1], False)
+    except FileNotFoundError:
+        return False
+    try:
+        if only_link and not _is_link_at(parts[-1], dfd):
+            return False
+        os.unlink(parts[-1], dir_fd=dfd)
+        return True
+    except FileNotFoundError:
+        return False
+    finally:
+        os.close(dfd)
+
+
+def mkdirs_in(root: Path, rel: str) -> None:
+    """mkdir -p root/rel, never through a link."""
+    parts = rel_parts(rel)
+    if _OPENAT:
+        os.close(_open_dirs(root, parts, True))
+    else:
+        _plain_path(root, [*parts, "x"], True)
+
+
+def write_in(root: Path, rel: str, data: bytes) -> None:
+    """Write root/rel (folders created) without following links: a link in the folders is UnsafePath; a
+    link AT rel is replaced by the file, never written through."""
+    try:
+        fd = open_in(root, rel, WRITE_FLAGS, mkdirs=True)
+    except UnsafePath:
+        if not unlink_in(root, rel, only_link=True):
+            raise
+        fd = open_in(root, rel, WRITE_FLAGS | os.O_EXCL, mkdirs=True)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+
+
+def read_in(root: Path, rel: str, limit: int) -> bytes:
+    """The first `limit` bytes of root/rel (never the whole file), not through a link."""
+    with os.fdopen(open_in(root, rel, READ_FLAGS), "rb") as fh:
+        return fh.read(limit)
+
+
+def resolved_rel(root: Path, path: str) -> tuple[Path, str]:
+    """(root resolved, path relative to it with internal links resolved) or 404 if it leaves root."""
+    try:
+        root = root.resolve()
+        f = (root / path).resolve()
+    except (OSError, ValueError, RuntimeError) as exc:  # a NUL byte, a link loop…
+        raise HTTPException(404, "Fichero no encontrado") from exc
+    if f == root or root not in f.parents:
+        raise HTTPException(404, "Fichero no encontrado")
+    return root, str(f.relative_to(root))
+
+
+def _sorted_entries(path) -> list:
+    try:
+        with os.scandir(path) as it:
+            return sorted(it, key=lambda e: e.name)
+    except OSError:
+        return []
+
+
+def list_tree(root: Path, cap: int = 3000) -> list[dict]:
+    """Files and folders under root in path order. Links are listed, never entered or followed; ignored
+    folders (node_modules, .git…) are skipped, not walked; one odd entry (a dangling link, a file deleted
+    meanwhile, no permission) never breaks the listing."""
     out: list[dict] = []
-    for p in sorted(root.rglob("*")):
-        rel = p.relative_to(root)
-        if any(part in IGNORE_DIRS for part in rel.parts):
+    stack, prefixes = [iter(_sorted_entries(root))], [""]
+    while stack and len(out) < cap:
+        e = next(stack[-1], None)
+        if e is None:
+            stack.pop()
+            prefixes.pop()
             continue
-        out.append({"path": str(rel), "dir": p.is_dir(), "size": 0 if p.is_dir() else p.stat().st_size})
-        if len(out) >= 3000:
-            break
+        if e.name in IGNORE_DIRS:
+            continue
+        rel = prefixes[-1] + e.name
+        try:
+            link = e.is_symlink()
+            is_dir = not link and e.is_dir(follow_symlinks=False)
+            size = 0 if is_dir or link else e.stat(follow_symlinks=False).st_size
+        except OSError:
+            continue
+        out.append({"path": rel, "dir": is_dir, "size": size, **({"link": True} if link else {})})
+        if is_dir:
+            stack.append(iter(_sorted_entries(e.path)))
+            prefixes.append(rel + "/")
     return out
 
 
-@app.get("/api/projects/{project_id}/file")
-def workspace_file(project_id: int, path: str, user: dict = Depends(current_user)):
-    root = project_ws(get_project(user, project_id)).resolve()
-    f = (root / path).resolve()
-    if root not in f.parents or not f.is_file():
-        raise HTTPException(404, "Fichero no encontrado")
-    data = f.read_bytes()[:300_000]
+def _view_text(root: Path, path: str) -> dict:
+    """What the file viewers return: at most the first 300 KB, never read whole (multi-GB logs/datasets)."""
+    root, rel = resolved_rel(root, path)
+    try:
+        data = read_in(root, rel, 300_000)
+    except (UnsafePath, OSError) as exc:
+        raise HTTPException(404, "Fichero no encontrado") from exc
     if b"\0" in data[:8192]:
         return {"path": path, "binary": True, "content": ""}
     return {"path": path, "binary": False, "content": data.decode("utf-8", "replace")}
 
 
+# ----------------------------------------------------------------- workspace
+@app.get("/api/projects/{project_id}/tree")
+def workspace_tree(project_id: int, user: dict = Depends(current_user)):
+    return list_tree(project_ws(get_project(user, project_id)))
+
+
+@app.get("/api/projects/{project_id}/file")
+def workspace_file(project_id: int, path: str, user: dict = Depends(current_user)):
+    return _view_text(project_ws(get_project(user, project_id)), path)
+
+
 @app.post("/api/projects/{project_id}/upload")
 async def upload(project_id: int, file: UploadFile = File(...), user: dict = Depends(current_user)):
     root = project_ws(get_project(user, project_id)).resolve()
-    data = await file.read()
+    data = await file.read(200 * 1024 * 1024 + 1)
     if len(data) > 200 * 1024 * 1024:
         raise HTTPException(413, "Máximo 200 MB")
-    name = Path(file.filename or "upload").name
-    if name.endswith(".zip"):
+    name = Path((file.filename or "upload").replace("\\", "/")).name or "upload"
+    return await asyncio.to_thread(_store_upload, root, name, data)
+
+
+def _store_upload(root: Path, name: str, data: bytes) -> dict:
+    if not name.endswith(".zip"):
         try:
-            zf = zipfile.ZipFile(io.BytesIO(data))
-        except zipfile.BadZipFile as exc:
-            raise HTTPException(422, "ZIP no válido") from exc
-        count = 0
-        for info in zf.infolist():
-            target = (root / info.filename).resolve()
-            if root not in target.parents and target != root:
-                raise HTTPException(422, f"Ruta peligrosa en el ZIP: {info.filename}")
+            write_in(root, name, data)
+        except (UnsafePath, OSError) as exc:
+            raise HTTPException(422, f"No se puede escribir {name}: {exc}") from exc
+        return {"ok": True, "files": 1}
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(422, "ZIP no válido") from exc
+    for info in zf.infolist():
+        try:
+            rel_parts(info.filename)
+        except UnsafePath as exc:
+            raise HTTPException(422, f"Ruta peligrosa en el ZIP: {info.filename}") from exc
+    count = 0
+    for info in zf.infolist():
+        try:
             if info.is_dir():
-                target.mkdir(parents=True, exist_ok=True)
+                mkdirs_in(root, info.filename)
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(info) as src, open(target, "wb") as dst:
+            try:
+                fd = open_in(root, info.filename, WRITE_FLAGS, mkdirs=True)
+            except UnsafePath:  # a link AT that name is replaced; one in its folders is refused below
+                if not unlink_in(root, info.filename, only_link=True):
+                    raise
+                fd = open_in(root, info.filename, WRITE_FLAGS | os.O_EXCL, mkdirs=True)
+            with zf.open(info) as src, os.fdopen(fd, "wb") as dst:  # links inside the ZIP become plain files
                 shutil.copyfileobj(src, dst)
-            count += 1
-        return {"ok": True, "files": count}
-    (root / name).write_bytes(data)
-    return {"ok": True, "files": 1}
+        except (UnsafePath, OSError) as exc:
+            raise HTTPException(422, f"Ruta peligrosa en el ZIP: {info.filename}") from exc
+        count += 1
+    return {"ok": True, "files": count}
 
 
 # ---------------------------------------------------------------------- harness
@@ -1777,14 +2405,16 @@ def approve_call(run_id: int, body: Decision, user: dict = Depends(current_user)
 @app.delete("/api/threads/{thread_id}")
 def delete_thread(thread_id: int, user: dict = Depends(current_user)):
     t, p = get_thread(user, thread_id)
-    for r in db.all("SELECT id FROM runs WHERE thread_id=?", (thread_id,)):
-        jobs.cancel(r["id"])
+    busy = halt_runs("thread_id=?", (thread_id,), grace=THREAD_DELETE_GRACE)
     # a bot IS its conversation: deleting the conversation deletes the bot (triggers, memory, webhook secret)
     for b in db.all("SELECT id FROM bots WHERE id=? AND user_id=?", (t.get("bot_id") or -1, user["id"])):
         vault.delete(user["id"], f"bot:{b['id']}:webhook")
         db.execute("UPDATE runs SET bot_id=NULL WHERE bot_id=?", (b["id"],))
         db.execute("DELETE FROM bots WHERE id=?", (b["id"],))
+    for rid in busy:  # still in a worker (or waiting for one): detach it so its id stays taken until its job ends
+        db.execute("UPDATE runs SET thread_id=NULL WHERE id=? AND status IN ('queued', 'running')", (rid,))
     db.execute("DELETE FROM threads WHERE id=?", (thread_id,))
+    _forget_telegram_targets(user["id"], thread_ids=[thread_id])
     shutil.rmtree(thread_dir(p, thread_id), ignore_errors=True)
     return {"ok": True}
 
@@ -1802,16 +2432,7 @@ def _in(root: Path, rel: str) -> Path:
 def thread_tree(thread_id: int, user: dict = Depends(current_user)):
     t, p = get_thread(user, thread_id)
     root = thread_ws(p, t)
-    out = []
-    if root.is_dir():
-        for f in sorted(root.rglob("*")):
-            rel = f.relative_to(root)
-            if any(part in IGNORE_DIRS for part in rel.parts):
-                continue
-            out.append({"path": str(rel), "dir": f.is_dir(), "size": 0 if f.is_dir() else f.stat().st_size})
-            if len(out) >= 3000:
-                break
-    return out
+    return list_tree(root) if root.is_dir() else []
 
 
 def _inline_local_images(body: bytes, page: Path, root: Path) -> bytes:
@@ -1819,6 +2440,8 @@ def _inline_local_images(body: bytes, page: Path, root: Path) -> bytes:
     import base64 as _b64
 
     html = body.decode("utf-8", "replace")
+    root = root.resolve()
+    limit = 5 * 1024 * 1024
 
     def repl(m):
         quote, ref = m.group(2), m.group(3)
@@ -1826,15 +2449,128 @@ def _inline_local_images(body: bytes, page: Path, root: Path) -> bytes:
             return m.group(0)
         try:
             target = (page.parent / ref.split("?")[0]).resolve()
-            target.relative_to(root.resolve())  # never outside the conversation's workspace
+            rel = str(target.relative_to(root))  # never outside the conversation's workspace
         except (ValueError, OSError):
             return m.group(0)
         mime = image_mime(target.name)
-        if not mime or not target.is_file() or target.stat().st_size > 5 * 1024 * 1024:
+        try:
+            data = read_in(root, rel, limit + 1) if mime else b""
+        except (UnsafePath, OSError):
             return m.group(0)
-        return f"{m.group(1)}{quote}data:{mime};base64,{_b64.b64encode(target.read_bytes()).decode()}{quote}"
+        if not data or len(data) > limit:
+            return m.group(0)
+        return f"{m.group(1)}{quote}data:{mime};base64,{_b64.b64encode(data).decode()}{quote}"
 
     return re.sub(r"""(<img\b[^>]*?\bsrc=)(["'])([^"']+)\2""", repl, html, flags=re.I).encode()
+
+
+def stream_fd(fd: int, media_type: str, filename: str | None = None) -> StreamingResponse:
+    """Send a file already opened safely (open_in): no second lookup of its path that a link swapped in
+    meanwhile could redirect."""
+    from urllib.parse import quote
+
+    fh = os.fdopen(fd, "rb")  # closed by the generator, or when collected if the client never reads
+    size = os.fstat(fd).st_size
+
+    def chunks():
+        with fh:
+            left = size
+            while left > 0 and (block := fh.read(min(256 * 1024, left))):
+                left -= len(block)
+                yield block
+
+    headers = {"Content-Length": str(size), "X-Content-Type-Options": "nosniff"}
+    if filename:
+        q = quote(filename)
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"' if q == filename else f"attachment; filename*=utf-8''{q}"
+    return StreamingResponse(chunks(), media_type=media_type, headers=headers)
+
+
+def _diff_side(root: Path, rel: str) -> tuple[bool, str | None]:
+    """(exists, text) of root/rel for a diff. text None = binary, too big, or behind a link (never read)."""
+    from ..agent.workspace import MAX_DIFF_FILE
+
+    try:
+        with os.fdopen(open_in(root, rel, READ_FLAGS), "rb") as fh:
+            data = fh.read(MAX_DIFF_FILE + 1)
+    except FileNotFoundError:
+        return False, ""
+    except (UnsafePath, OSError):
+        return True, None
+    if len(data) > MAX_DIFF_FILE or b"\0" in data[:8192]:
+        return True, None
+    return True, data.decode("utf-8", "replace")
+
+
+def cage_changes(base: dict, cage: Path, project: Path, max_chars: int = 80_000) -> dict:
+    """What a conversation changed since its starting manifest, diffed against the project. Same output as
+    workspace.changes_since, but the project side is read without following links: a linked folder in the
+    project (`d -> another user's project`) must not print someone else's .env as the 'old' side."""
+    import difflib
+
+    now = manifest(cage)
+    added = sorted(p for p in now if p not in base)
+    modified = sorted(p for p in now if p in base and now[p] != base[p])
+    removed = sorted(p for p in base if p not in now)
+    chunks: list[str] = []
+    for rel in added + modified + removed:
+        (had, ta), (has, tb) = _diff_side(project, rel), _diff_side(cage, rel)
+        if ta is None or tb is None:
+            chunks.append(f"Binary or large file changed: {rel}\n")
+            continue
+        chunks.extend(difflib.unified_diff(ta.splitlines(keepends=True), tb.splitlines(keepends=True),
+                                           fromfile=f"a/{rel}" if had else "/dev/null", tofile=f"b/{rel}" if has else "/dev/null"))
+    text = "".join(c if c.endswith("\n") else c + "\n" for c in chunks)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n... (diff truncated)\n"
+    return {"added": added, "modified": modified, "removed": removed, "diff": text}
+
+
+def prepare_targets(root: Path, writes: list[str], removes: list[str]) -> None:
+    """Before copying changes onto the project (apply_cage / apply_changes write with plain open()): a path
+    whose folders go through a link — or meet a file, FIFO… where a folder should be — refuses the whole
+    apply; a link AT a path about to be written is removed first, so the copy replaces the link instead of
+    writing wherever it points. Call it holding the project lock (shared-workspace runs hold it too)."""
+    import stat as _stat
+
+    blocked, links, writing = [], [], set(writes)
+    for rel in sorted(writing | set(removes)):
+        try:
+            parts = rel_parts(rel)
+        except UnsafePath:
+            blocked.append(rel)
+            continue
+        cur, bad = root, False
+        for name in parts[:-1]:
+            cur = cur / name
+            try:
+                if not _stat.S_ISDIR(os.lstat(cur).st_mode):
+                    bad = True
+            except FileNotFoundError:
+                break  # created as a real folder by the copy
+            except OSError:
+                bad = True
+            if bad:
+                break
+        if not bad:
+            try:
+                mode = os.lstat(root / rel).st_mode
+                if _stat.S_ISLNK(mode):
+                    if rel in writing:  # (a link that is removed goes itself: unlink never follows it)
+                        links.append(rel)
+                elif not _stat.S_ISREG(mode):
+                    bad = True
+            except FileNotFoundError:
+                pass
+            except OSError:
+                bad = True
+        if bad:
+            blocked.append(rel)
+    if blocked:
+        raise HTTPException(422, "No se ha aplicado nada: en el proyecto estas rutas pasan por un enlace simbólico o no "
+                                 "son ficheros normales: " + ", ".join(blocked[:10]) + ("…" if len(blocked) > 10 else ""))
+    for rel in links:
+        unlink_in(root, rel, only_link=True)
 
 
 HTML_SANDBOX_CSP = (
@@ -1848,26 +2584,31 @@ HTML_SANDBOX_CSP = (
 
 @app.get("/api/threads/{thread_id}/file")
 def thread_file(thread_id: int, path: str, download: int = 0, view: int = 0, user: dict = Depends(current_user)):
-    t, p = get_thread(user, thread_id)
-    f = _in(thread_ws(p, t), path)
-    if not f.is_file():
-        raise HTTPException(404, "Fichero no encontrado")
-    if download:
-        import mimetypes
+    import mimetypes
 
-        return FileResponse(f, media_type=mimetypes.guess_type(f.name)[0] or "application/octet-stream", filename=f.name)
-    if view and f.suffix.lower() in (".html", ".htm", ".svg"):
-        if f.stat().st_size > 15 * 1024 * 1024:
+    t, p = get_thread(user, thread_id)
+    root, rel = resolved_rel(thread_ws(p, t), path)
+    name, suffix = Path(rel).name, Path(rel).suffix.lower()
+    try:
+        fd = open_in(root, rel, READ_FLAGS)  # the very file checked above, even if a link is swapped in meanwhile
+    except (UnsafePath, OSError) as exc:
+        raise HTTPException(404, "Fichero no encontrado") from exc
+    if download:
+        return stream_fd(fd, mimetypes.guess_type(name)[0] or "application/octet-stream", filename=name)
+    if view and suffix in (".html", ".htm", ".svg"):
+        with os.fdopen(fd, "rb") as fh:
+            body = fh.read(15 * 1024 * 1024 + 1)
+        if len(body) > 15 * 1024 * 1024:
             raise HTTPException(413, "Demasiado grande para verlo aquí: descárgalo")
-        body = f.read_bytes()
-        if f.suffix.lower() in (".html", ".htm"):
-            body = _inline_local_images(body, f, thread_ws(p, t))
-        return Response(body, media_type="image/svg+xml" if f.suffix.lower() == ".svg" else "text/html; charset=utf-8",
+        if suffix in (".html", ".htm"):
+            body = _inline_local_images(body, root / rel, root)
+        return Response(body, media_type="image/svg+xml" if suffix == ".svg" else "text/html; charset=utf-8",
                         headers={"Content-Security-Policy": HTML_SANDBOX_CSP, "X-Content-Type-Options": "nosniff",
                                  "Cache-Control": "no-store"})
-    if image_mime(f.name):
-        return FileResponse(f, media_type=image_mime(f.name))
-    data = f.read_bytes()[:300_000]
+    if image_mime(name):
+        return stream_fd(fd, image_mime(name))
+    with os.fdopen(fd, "rb") as fh:
+        data = fh.read(300_000)  # a multi-GB log must not be loaded to show its first 300 KB
     if b"\0" in data[:8192]:
         return {"path": path, "binary": True, "content": ""}
     return {"path": path, "binary": False, "content": data.decode("utf-8", "replace")}
@@ -1878,8 +2619,7 @@ def thread_changes(thread_id: int, user: dict = Depends(current_user)):
     t, p = get_thread(user, thread_id)
     if not t["isolated"]:
         return {"isolated": False, "added": [], "modified": [], "removed": [], "diff": ""}
-    ch = changes_since(loads(t["manifest"], {}), thread_ws(p, t), project_ws(p))
-    return {"isolated": True, **ch}
+    return {"isolated": True, **cage_changes(loads(t["manifest"], {}), thread_ws(p, t), project_ws(p))}
 
 
 @app.post("/api/threads/{thread_id}/apply")
@@ -1889,9 +2629,11 @@ def thread_apply(thread_id: int, user: dict = Depends(current_user)):
         raise HTTPException(422, "Esta conversación ya trabaja directamente sobre el proyecto")
     if db.one("SELECT id FROM runs WHERE thread_id=? AND status IN ('queued', 'running')", (thread_id,)):
         raise HTTPException(409, "Espera a que termine la respuesta en curso")
-    cage = thread_ws(p, t)
+    cage, target, base = thread_ws(p, t), project_ws(p), loads(t["manifest"], {})
     with jobs._project_lock(p["id"]):
-        applied = apply_cage(loads(t["manifest"], {}), cage, project_ws(p))
+        now = manifest(cage)
+        prepare_targets(target, [r for r in now if base.get(r) != now[r]], [r for r in base if r not in now])
+        applied = apply_cage(base, cage, target)
     # Re-baseline: later applies only carry changes made after this one.
     db.execute("UPDATE threads SET manifest=? WHERE id=?", (json.dumps(manifest(cage)), thread_id))
     return applied
@@ -1900,30 +2642,51 @@ def thread_apply(thread_id: int, user: dict = Depends(current_user)):
 @app.post("/api/threads/{thread_id}/attachments")
 async def upload_attachments(thread_id: int, files: list[UploadFile] = File(...), user: dict = Depends(current_user)):
     t, p = get_thread(user, thread_id)
-    target = thread_ws(p, t) / ATTACHMENTS_DIR
-    target.mkdir(parents=True, exist_ok=True)
-    out = []
+    root = thread_ws(p, t)
+    blobs = []
     for up in files[:20]:
-        data = await up.read()
+        data = await up.read(MAX_ATTACHMENT + 1)
         if len(data) > MAX_ATTACHMENT:
             raise HTTPException(413, f"{up.filename}: máximo 25 MB por archivo")
-        name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(up.filename or "archivo").name).strip("._") or "archivo"
+        blobs.append((up.filename, data))
+    return await asyncio.to_thread(_store_attachments, root, blobs)
+
+
+def _store_attachments(root: Path, blobs: list[tuple[str | None, bytes]]) -> list[dict]:
+    root.mkdir(parents=True, exist_ok=True)
+    try:  # .attachments may be a link copied from the project: replace it, never write through it
+        unlink_in(root, ATTACHMENTS_DIR, only_link=True)
+        mkdirs_in(root, ATTACHMENTS_DIR)
+    except (UnsafePath, OSError) as exc:
+        raise HTTPException(422, f"No se pueden guardar adjuntos aquí: {exc}") from exc
+    out = []
+    for filename, data in blobs:
+        name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path((filename or "archivo").replace("\\", "/")).name).strip("._") or "archivo"
         stem, dot, ext = name.rpartition(".")
         if not dot:
             stem, ext = name, ""
         candidate, n = name, 1
-        while (target / candidate).exists():
-            n += 1
-            candidate = f"{stem}-{n}.{ext}" if ext else f"{stem}-{n}"
-        (target / candidate).write_bytes(data)
-        out.append(_attachment_meta(target / candidate, f"{ATTACHMENTS_DIR}/{candidate}"))
+        while True:  # O_EXCL: the first free name, atomically
+            try:
+                fd = open_in(root, f"{ATTACHMENTS_DIR}/{candidate}", WRITE_FLAGS | os.O_EXCL)
+                break
+            except FileExistsError:
+                n += 1
+                candidate = f"{stem}-{n}.{ext}" if ext else f"{stem}-{n}"
+            except (UnsafePath, OSError) as exc:
+                raise HTTPException(422, f"No se puede guardar {name}: {exc}") from exc
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        out.append(_attachment_meta(root / ATTACHMENTS_DIR / candidate, f"{ATTACHMENTS_DIR}/{candidate}", data[:8192], len(data)))
     return out
 
 
-def _attachment_meta(f: Path, rel: str) -> dict:
-    head = f.read_bytes()[:8192]
+def _attachment_meta(f: Path, rel: str, head: bytes | None = None, size: int | None = None) -> dict:
+    if head is None or size is None:
+        with open(f, "rb") as fh:
+            head, size = fh.read(8192), os.fstat(fh.fileno()).st_size
     kind = "image" if image_mime(f.name) else "pdf" if f.suffix.lower() == ".pdf" else ("binary" if b"\0" in head else "text")
-    return {"name": f.name, "path": rel, "kind": kind, "size": f.stat().st_size}
+    return {"name": f.name, "path": rel, "kind": kind, "size": size}
 
 
 @app.post("/api/threads/{thread_id}/messages")
@@ -2105,6 +2868,20 @@ def apply_run(run_id: int, user: dict = Depends(current_user)):
     run, p = get_run(user, run_id)
     if run["kind"] != "harness" or run["status"] != "done":
         raise HTTPException(422, "Solo se pueden aplicar ejecuciones de harnessing terminadas")
+    from ..agent.workspace import diff_workspaces
+
+    selected = (loads(run["result"], {}) or {}).get("selected")
+    rd = run_dir(p, run_id)
+    after = rd / "rollouts" / str(selected) / "ws"
+    if selected and after.is_dir():  # the same links/odd-files check as a conversation's apply
+        lock = jobs._project_lock(p["id"])
+        if not lock.acquire(blocking=False):
+            raise HTTPException(409, "Hay una respuesta en curso trabajando en este proyecto: espera a que termine")
+        try:
+            d = diff_workspaces(rd / "source", after, max_chars=0)
+            prepare_targets(project_ws(p), d["added"] + d["modified"], d["removed"])
+        finally:
+            lock.release()
     try:
         return {"changes": jobs.apply_later(run_id, p)}
     except FileNotFoundError as exc:
@@ -2113,7 +2890,22 @@ def apply_run(run_id: int, user: dict = Depends(current_user)):
 
 @app.get("/api/runs/{run_id}/stream")
 async def stream_run(run_id: int, request: Request, after: int = 0, user: dict = Depends(current_user)):
-    get_run(user, run_id)
+    run, _ = await asyncio.to_thread(get_run, user, run_id)
+    ident = (run["project_id"], run["created_at"])  # run ids are reused once deleted: this pins THIS run
+
+    def poll(last: int, gen_seen: int, idx: int):
+        events = db.events_after(run_id, last)
+        live = jobs.live.get(run_id)
+        items, gen = [], gen_seen
+        if live is not None:
+            if live.gen != gen_seen:
+                gen, idx = live.gen, 0
+            items = list(live.items[idx:])
+        # Checked AFTER reading: if the row is still the same run now, what we read was its own data.
+        row = db.one("SELECT status, project_id, created_at FROM runs WHERE id=?", (run_id,))
+        if not row or (row["project_id"], row["created_at"]) != ident:
+            return None
+        return events, items, gen, idx, row["status"]
 
     async def gen():
         last = after
@@ -2122,23 +2914,22 @@ async def stream_run(run_id: int, request: Request, after: int = 0, user: dict =
         while True:
             if await request.is_disconnected():
                 return
+            got = await asyncio.to_thread(poll, last, gen_seen, idx)
+            if got is None:  # deleted (its conversation or project): nothing more will ever come from this run
+                yield f"event: end\ndata: {json.dumps({'status': 'deleted'})}\n\n"
+                return
+            events, items, gen_seen, idx, status = got
             sent = False
-            for seq, ev in db.events_after(run_id, last):
+            for seq, ev in events:
                 last = seq
                 sent = True
                 yield f"id: {seq}\nevent: event\ndata: {json.dumps({'seq': seq, **ev}, ensure_ascii=False)}\n\n"
-            live = jobs.live.get(run_id)
-            if live is not None:
-                if live.gen != gen_seen:
-                    gen_seen, idx = live.gen, 0
-                items = live.items[idx:]
-                if items:
-                    idx += len(items)
-                    sent = True
-                    yield f"event: live\ndata: {json.dumps(items, ensure_ascii=False)}\n\n"
-            status = db.one("SELECT status FROM runs WHERE id=?", (run_id,))
-            if status and status["status"] in FINAL and not sent:
-                yield f"event: end\ndata: {json.dumps({'status': status['status']})}\n\n"
+            if items:
+                idx += len(items)
+                sent = True
+                yield f"event: live\ndata: {json.dumps(items, ensure_ascii=False)}\n\n"
+            if status in FINAL and not sent:
+                yield f"event: end\ndata: {json.dumps({'status': status})}\n\n"
                 return
             idle = 0 if sent else idle + 1
             if idle and idle % 50 == 0:

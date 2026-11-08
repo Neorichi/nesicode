@@ -12,8 +12,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import secrets
 import time
+from typing import Any, Callable
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -34,6 +36,18 @@ def _key(password: str, salt: bytes, n: int = N, r: int = R, p: int = P) -> byte
     return hashlib.scrypt(password.encode(), salt=salt, n=n, r=r, p=p, dklen=32, maxmem=128 * 1024 * 1024)
 
 
+def _kdf_params(env: dict) -> tuple[int, int, int]:
+    """The scrypt cost comes from the (untrusted) file: accept only what this app writes, give or take
+    one step, so a crafted file cannot keep the CPU busy for an hour before the password is even checked."""
+    try:
+        n, r, p = int(env.get("n", N)), int(env.get("r", R)), int(env.get("p", P))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("El archivo no es una configuración de Nesicode") from exc
+    if not (2**10 <= n <= 2**16 and n & (n - 1) == 0 and 1 <= r <= 8 and p == 1):
+        raise ConfigError("Archivo de configuración no válido (parámetros de cifrado fuera de rango)")
+    return n, r, p
+
+
 def seal(doc: dict, password: str) -> bytes:
     salt, nonce = secrets.token_bytes(16), secrets.token_bytes(12)
     ct = AESGCM(_key(password, salt)).encrypt(nonce, json.dumps(doc).encode(), FORMAT.encode())
@@ -48,14 +62,18 @@ def unseal(data: bytes, password: str) -> dict:
         env = json.loads(data)
     except Exception as exc:
         raise ConfigError("El archivo no es una configuración de Nesicode") from exc
-    if env.get("format") != FORMAT:
+    if not isinstance(env, dict) or env.get("format") != FORMAT:
         raise ConfigError("El archivo no es una configuración de Nesicode")
+    n, r, p = _kdf_params(env)
     try:
-        key = _key(password, base64.b64decode(env["salt"]), int(env.get("n", N)), int(env.get("r", R)), int(env.get("p", P)))
+        key = _key(password, base64.b64decode(env["salt"]), n, r, p)
         plain = AESGCM(key).decrypt(base64.b64decode(env["nonce"]), base64.b64decode(env["ciphertext"]), FORMAT.encode())
+        doc = json.loads(plain)
     except Exception as exc:
         raise ConfigError("Contraseña incorrecta o archivo dañado") from exc
-    return json.loads(plain)
+    if not isinstance(doc, dict):
+        raise ConfigError("Contraseña incorrecta o archivo dañado")
+    return doc
 
 
 # ------------------------------------------------------------------ build / apply
@@ -116,13 +134,238 @@ def summary(doc: dict) -> dict:
         "telegram": bool(doc.get("telegram")),
         "role_models": {k: v for k, v in (doc.get("role_models") or {}).items() if v and k in ROLE_KEYS},
         "bots": [b["name"] for b in doc.get("bots") or []],
+        # what the names stand for: where providers point, what connectors run, the preferences' values
+        "details": {
+            "providers": [{"name": p["name"], "kind": p.get("kind"), "base_url": p.get("base_url")} for p in doc.get("providers", [])],
+            "connectors": [{"name": c["name"], "kind": c.get("kind"), "enabled": bool(c.get("enabled", 1)),
+                            "command": " ".join([c.get("command") or "", *c.get("args", [])]).strip(), "url": c.get("url") or ""}
+                           for c in doc.get("connectors", [])],
+            "settings": {k: v for k, v in (doc.get("settings") or {}).items() if k not in ("project_template", "pending_bots")},
+            "check_command": (t or {}).get("check_command") or "",
+        },
     }
 
 
-def apply(db: DB, user_id: int, doc: dict) -> dict:
-    """Merge an imported configuration into this user's account (same names are overwritten)."""
+# ------------------------------------------------------------------ validation of an imported file
+# Whoever sealed the file chose its contents: an import passes the same checks as the API (and never
+# loosens the approvals), so a shared "team setup" cannot plant a command, redirect a stored key or
+# switch approvals off behind the user's back.
+PROVIDER_RX = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")  # = the API's NAME_RX
+CONNECTOR_RX = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
+FIELD_KEY_RX = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
+HEADER_RX = re.compile(r"^[A-Za-z0-9-]{1,60}$")
+ENV_RX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,60}$")
+TELEGRAM_RX = re.compile(r"^\d+:[A-Za-z0-9_-]{20,}$")
+BAD_HEADERS = {"host", "content-length", "transfer-encoding", "connection", "cookie", "upgrade"}
+# Preferences an import may make stricter but never looser (strictest first).
+STRICTER: dict[str, list] = {"exec_mode": ["ask_all", "ask_bash", "auto"], "browser_usage": ["ask", "mention", "auto"],
+                             "share_workspace": [False, True]}
+
+
+def _items(value) -> list:
+    return value if isinstance(value, list) else []
+
+
+def _text(value, limit: int) -> str | None:
+    return value if isinstance(value, str) and len(value) <= limit else None
+
+
+def validate_import(doc: dict, *, auth_enabled: bool, check_url: Callable[[str], str], settings_model: Any = None,
+                    current_settings: dict | None = None) -> tuple[dict, dict]:
+    """Clean copy of an imported document plus what was dropped or changed and why ({skipped, notes})."""
+    from ..connectors import catalog_entry
+
+    skipped: list[str] = []
+    notes: list[str] = []
+    out: dict = {}
+
+    def url_or_none(url, what: str) -> str | None:
+        try:
+            return check_url(str(url or ""))
+        except Exception as exc:
+            skipped.append(f"{what}: {getattr(exc, 'detail', None) or exc}")
+            return None
+
+    providers = []
+    for p in _items(doc.get("providers")):
+        name = p.get("name") if isinstance(p, dict) else None
+        if not (isinstance(name, str) and PROVIDER_RX.match(name) and p.get("kind") in ("openai", "anthropic")):
+            skipped.append(f"proveedor {str(name)[:40]!r}: nombre o tipo no válido")
+            continue
+        if (base := url_or_none(p.get("base_url"), f"proveedor «{name}»")) is None:
+            continue
+        models = sorted({m.strip() for m in _items(p.get("models")) if isinstance(m, str) and 0 < len(m.strip()) <= 200})
+        providers.append({"name": name, "label": (_text(p.get("label"), 60) or "").strip() or name, "kind": p["kind"],
+                          "base_url": base, "models": models[:500], "api_key": (_text(p.get("api_key"), 500) or "").strip()})
+    out["providers"] = providers
+
+    connectors = []
+    for c in _items(doc.get("connectors")):
+        if not isinstance(c, dict):
+            continue
+        name, label, kind, template = c.get("name"), c.get("label"), c.get("kind"), c.get("template") or ""
+        tag = f"conector «{str(label or name)[:40]}»"
+        entry = catalog_entry(template) if isinstance(template, str) and template not in ("", "custom") else None
+        command, args = c.get("command") or "", c.get("args") or []
+        if not (isinstance(name, str) and CONNECTOR_RX.match(name) and (_text(label, 60) or "").strip()
+                and kind in ("stdio", "http", "builtin") and isinstance(template, str)
+                and (template in ("", "custom") or (entry and entry["kind"] == kind))
+                and isinstance(command, str) and len(command) <= 1000 and isinstance(args, list) and len(args) <= 100
+                and all(isinstance(a, str) and len(a) <= 1000 for a in args)):
+            skipped.append(f"{tag}: datos no válidos o plantilla desconocida")
+            continue
+        if auth_enabled and (kind == "stdio" or (entry or {}).get("local_only")):
+            skipped.append(f"{tag}: los conectores locales solo están disponibles en modo local (sin login)")
+            continue
+        if kind == "builtin":
+            if not entry:
+                skipped.append(f"{tag}: conector integrado desconocido")
+                continue
+            command, args = entry["id"], []
+        if kind == "stdio" and not command.strip():
+            skipped.append(f"{tag}: sin comando")
+            continue
+        url = ""
+        if kind == "http" or (kind == "builtin" and c.get("url")):
+            if (entry or {}).get("local_only"):  # (local mode only) the user's own Burp & co. live on this machine
+                try:
+                    url = _basic_url(c.get("url"))
+                except ConfigError as exc:
+                    skipped.append(f"{tag}: {exc}")
+                    continue
+            elif (url := url_or_none(c.get("url"), tag)) is None:
+                continue
+        fields = []
+        for f in _items(c.get("fields")):
+            if not (isinstance(f, dict) and isinstance(f.get("key"), str) and FIELD_KEY_RX.match(f["key"])):
+                continue
+            g: dict = {"key": f["key"], "label": _text(f.get("label"), 100) or f["key"], "secret": bool(f.get("secret"))}
+            if isinstance(f.get("header"), str) and HEADER_RX.match(f["header"]) and f["header"].lower() not in BAD_HEADERS:
+                g["header"] = f["header"]
+            if (prefix := _text(f.get("prefix"), 40)) is not None and not re.search(r"[\r\n]", prefix):
+                g["prefix"] = prefix
+            if isinstance(f.get("env"), str) and ENV_RX.match(f["env"]):
+                g["env"] = f["env"]
+            if not g["secret"] and (value := _text(f.get("value"), 2000)) is not None:
+                g["value"] = value
+            fields.append(g)
+        # exactly a catalog entry (same command; its fields, nothing from the file): nothing to review
+        catalog_stdio = bool(entry) and kind == "stdio" and command == entry.get("command") and args == entry.get("args", [])
+        if catalog_stdio:
+            fields = [{k: v for k, v in f.items() if k in ("key", "label", "secret", "header", "prefix", "env")}
+                      for f in entry.get("fields", []) if not f.get("url_param")]
+        secret_keys = {f["key"] for f in fields if f.get("secret")}
+        raw = c.get("secrets") if isinstance(c.get("secrets"), dict) else {}
+        enabled = bool(c.get("enabled", True))
+        if kind == "stdio" and enabled and not catalog_stdio:  # a command that came in a file never starts by itself
+            enabled = False
+            notes.append(f"{tag}: importado DESACTIVADO. Ejecuta «{' '.join([command, *args])[:200]}»: revísalo y actívalo "
+                         "en Conectores si te fías de él")
+        connectors.append({"name": name, "label": label.strip(), "template": template, "kind": kind, "command": command,
+                           "args": list(args), "url": url, "fields": fields, "enabled": int(enabled),
+                           "usage": c.get("usage") if c.get("usage") in ("mention", "auto", "ask") else "mention",
+                           "secrets": {k: v for k, v in raw.items() if k in secret_keys and isinstance(v, str) and len(v) <= 4000}})
+    out["connectors"] = connectors
+
+    cur = current_settings or {}
+    allowed = set(getattr(settings_model, "model_fields", None) or {})
+    clean: dict = {}
+    for k, v in (doc.get("settings") if isinstance(doc.get("settings"), dict) else {}).items():
+        if k == "hidden_providers":
+            clean[k] = [x for x in _items(v) if isinstance(x, str) and PROVIDER_RX.match(x)][:50]
+            continue
+        if k not in allowed or v is None:
+            continue  # project_template / role_models / pending_bots travel in their own keys; the rest is not ours
+        try:
+            v = getattr(settings_model.model_validate({k: v}), k)
+        except Exception:
+            skipped.append(f"preferencia {k}: valor no válido")
+            continue
+        order = STRICTER.get(k)
+        if order and cur.get(k) in order and v in order and order.index(v) > order.index(cur[k]):
+            notes.append(f"preferencia {k}: se mantiene «{cur[k]}» (el archivo pedía «{v}», que relaja las aprobaciones; "
+                         "cámbialo tú en Ajustes si lo quieres)")
+            continue
+        clean[k] = v
+    out["settings"] = clean
+
+    t = doc.get("project_template")
+    if isinstance(t, dict):
+        tpl: dict = {"from": (_text(t.get("from"), 100) or "").strip() or "otro equipo"}
+        for k in (*ROLE_KEYS, "check_command", "domain"):
+            if (value := _text(t.get(k), 1000 if k == "check_command" else 200)) is not None:
+                tpl[k] = value
+        if isinstance(t.get("profile"), str) and re.match(r"^[a-z0-9_-]{1,30}$", t["profile"]):
+            tpl["profile"] = t["profile"]
+        if isinstance(t.get("max_steps"), int) and not isinstance(t["max_steps"], bool) and 5 <= t["max_steps"] <= 300:
+            tpl["max_steps"] = t["max_steps"]
+        h = t.get("harness")
+        if isinstance(h, dict) and len(h) <= 500 and all(isinstance(a, str) and isinstance(b, str) for a, b in h.items()):
+            tpl["harness"] = h
+        out["project_template"] = tpl
+    if isinstance(doc.get("role_models"), dict):
+        out["role_models"] = {k: v for k, v in doc["role_models"].items() if k in ROLE_KEYS and _text(v, 200)} | (
+            {"from": doc["role_models"]["from"]} if _text(doc["role_models"].get("from"), 100) else {})
+
+    bots = []
+    for b in _items(doc.get("bots")):
+        if not (isinstance(b, dict) and (_text(b.get("name"), 60) or "").strip()):
+            continue
+        b = {k: b.get(k) for k in ("name", "description", "instructions", "model", "policy", "max_steps", "daily_cap",
+                                   "notify", "project_name", "enabled", "triggers")} | {
+            "memory": [m for m in _items(b.get("memory")) if isinstance(m, dict) and _text(m.get("key"), 200)
+                       and _text(m.get("value"), 20_000) is not None][:200],
+            # the kinds an export writes; a webhook is only ever opened by the user (it shows its secret once)
+            "triggers": [x for x in _items(b.get("triggers")) if isinstance(x, dict) and x.get("kind") in ("cron", "interval", "url")][:20]}
+        if b.get("policy") == "auto":  # unattended runs without approvals: only the user can switch that on
+            b["policy"] = "ask"
+            notes.append(f"bot «{b['name']}»: importado con «pedir aprobación»; el archivo pedía «auto» (cámbialo tú si quieres)")
+        bots.append(b)
+    if bots:
+        out["bots"] = bots
+    tg = doc.get("telegram")
+    if isinstance(tg, dict) and isinstance(tg.get("token"), str) and TELEGRAM_RX.match(tg["token"]):
+        out["telegram"] = {"token": tg["token"]}
+    return out, {"skipped": skipped, "notes": notes}
+
+
+def redirected_keys(db: DB, user_id: int, doc: dict) -> tuple[list[str], list[str]]:
+    """Providers of a (validated) document that would point a stored key at another endpoint: their names,
+    and a note per name. Such keys are dropped on import (the file did not bring one of its own)."""
+    names, notes = [], []
+    for p in doc.get("providers", []):
+        old = db.one("SELECT kind, base_url FROM user_providers WHERE user_id=? AND name=?", (user_id, p["name"]))
+        if old and (old["base_url"].rstrip("/"), old["kind"]) != (p["base_url"], p["kind"]) and not p.get("api_key"):
+            names.append(p["name"])
+            notes.append(f"proveedor «{p['name']}»: cambia de dirección ({p['base_url']}); su clave guardada se borra, "
+                         "vuelve a ponerla si te fías de esa dirección")
+    return names, notes
+
+
+def _basic_url(url: str) -> str:
+    url = str(url or "").strip().rstrip("/")
+    if not re.match(r"^https?://[^\s/]+", url):
+        raise ConfigError("la URL debe ser http(s)://")
+    return url
+
+
+def apply(db: DB, user_id: int, doc: dict, *, auth_enabled: bool | None = None, check_url: Callable[[str], str] | None = None,
+          settings_model: Any = None, current_settings: dict | None = None) -> dict:
+    """Merge an imported configuration into this user's account (same names are overwritten). The
+    document is validated first (see validate_import); the result lists what was skipped and why."""
+    from ..config import settings as app_settings
+
     v = Vault(db)
+    row = db.one("SELECT settings FROM users WHERE id=?", (user_id,))
+    doc, report = validate_import(
+        doc, auth_enabled=app_settings.auth_enabled if auth_enabled is None else auth_enabled,
+        check_url=check_url or _basic_url, settings_model=settings_model,
+        current_settings=current_settings if current_settings is not None else (loads(row["settings"], {}) if row else {}))
     now = time.time()
+    dropped, notes = redirected_keys(db, user_id, doc)
+    report["notes"] += notes
+    for name in dropped:
+        v.delete(user_id, f"provider:{name}")  # never send a stored key to the endpoint a file chose
     for p in doc.get("providers", []):
         db.execute(
             "INSERT INTO user_providers (user_id, name, label, kind, base_url, models, created_at, updated_at) "
@@ -133,6 +376,11 @@ def apply(db: DB, user_id: int, doc: dict) -> dict:
         if p.get("api_key"):
             v.put(user_id, f"provider:{p['name']}", p["api_key"])
     for c in doc.get("connectors", []):
+        old = db.one("SELECT * FROM user_connectors WHERE user_id=? AND name=?", (user_id, c["name"]))
+        if old and (old["kind"], old["command"], loads(old["args"], []), old["url"]) != (c["kind"], c["command"], c["args"], c["url"]):
+            for f in loads(old["fields"], []):  # its stored tokens must not follow it to a new server or command
+                if f.get("secret") and not c["secrets"].get(f.get("key")):
+                    v.delete(user_id, f"connector:{c['name']}:{f.get('key')}")
         db.execute(
             "INSERT INTO user_connectors (user_id, name, label, template, kind, command, args, url, fields, enabled, created_at, usage) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, name) DO UPDATE SET label=excluded.label, "
@@ -161,7 +409,7 @@ def apply(db: DB, user_id: int, doc: dict) -> dict:
             "ON CONFLICT(user_id) DO UPDATE SET chat_id=NULL, chat_name='', update_offset=0",
             (user_id, now),
         )
-    return summary(doc)
+    return {**summary(doc), **report}
 
 
 def import_bots(db: DB, bots, user_id: int) -> list[str]:
@@ -183,6 +431,8 @@ def import_bots(db: DB, bots, user_id: int) -> list[str]:
         except Exception as exc:  # a bad trigger must not block the rest
             print("nesicode: could not import bot", b.get("name"), exc)
             continue
+        if not existing:  # a new bot may reuse a deleted bot's id: never its old webhook secret
+            Vault(db).delete(user_id, f"bot:{saved['id']}:webhook")
         for m in b.get("memory") or []:
             db.execute("INSERT INTO bot_memory (bot_id, key, value, updated_at) VALUES (?, ?, ?, ?) "
                        "ON CONFLICT(bot_id, key) DO UPDATE SET value=excluded.value", (saved["id"], m["key"], m["value"], time.time()))

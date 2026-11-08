@@ -17,6 +17,19 @@ from .db import DB
 SESSION_COOKIE = "nesi_session"
 SESSION_DAYS = 30
 _N, _R, _P = 2**14, 8, 1
+# Accounts made automatically for local mode (no login) have no password anyone knows: this marker
+# (never a valid hash) lets the first sign-up claim them when the server switches to NESICODE_AUTH=true.
+UNCLAIMED_PREFIX = "!local$"
+LOCAL_EMAIL = "local@nesicode.local"  # the default local account (also recognised in data from older versions)
+
+
+def unclaimed_hash() -> str:
+    return UNCLAIMED_PREFIX + secrets.token_urlsafe(16)
+
+
+def is_unclaimed(user: dict) -> bool:
+    """A local-mode account whose password nobody has set (so nobody can log into it)."""
+    return str(user.get("password_hash") or "").startswith(UNCLAIMED_PREFIX) or user.get("email") == LOCAL_EMAIL
 
 
 def hash_password(password: str) -> str:
