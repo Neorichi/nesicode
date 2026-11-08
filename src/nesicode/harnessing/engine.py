@@ -202,11 +202,11 @@ def scan_reply(reply: str) -> Reply:
                 if end == -1:  # unclosed notes run to the end of the reply
                     break
             else:
+                if end == -1 and reply[:m.start()].strip():  # named mid-reply, never closed: prose, not a block
+                    pos = m.end()
+                    continue
                 reasoned = True
                 if end == -1:
-                    if reply[:m.start()].strip():  # named mid-reply, never closed: prose, not a block
-                        pos = m.end()
-                        continue
                     break  # reasoning that opens the reply and never closes: no answer follows
             pos = end + len(tag) + 3
     return Reply(files, deletes, "\n\n".join(n for n in notes if n), open_file, complete)

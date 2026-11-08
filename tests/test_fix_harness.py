@@ -676,6 +676,8 @@ def test_quoted_reasoning_tags_never_discard_a_proposal():
         "prose names an opener that never closes": "My <analysis> of the runs is in the notes.\n" + answer + "<notes>n</notes>",
         "template reasoning, then notes quoting the tag": '<file path="memory.md">\n- DRAFT\n</file> no.</think>\n'
                                                           + answer + "<notes>base1 printed </think></notes>",
+        "template reasoning that names an opener": 'Its <analysis> was weak. <file path="memory.md">\n- DRAFT\n'
+                                                   '</file></think>\n' + answer + "<notes>n</notes>",
     }
     for why, reply in replies.items():
         new, touched = parse_edits(reply, h)
