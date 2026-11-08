@@ -314,6 +314,23 @@ export function compactionErrorText(text: string): string {
 }
 
 /**
+ * The live notice of a failed context summary, from one batch of a run's live items (top level only): the last
+ * 'compaction_error' while that compaction is still going; '' once it ended — every compaction ends with a live
+ * 'context' item, reason 'compacted', which often arrives in the same batch as the error (the fallback follows within
+ * ms) and is replayed with it on every reconnect; null when the batch says nothing about it (keep what is shown).
+ */
+export function compactionNotice(items: unknown[]): string | null {
+  let out: string | null = null
+  for (const i of Array.isArray(items) ? items : []) {
+    const e = i as { type?: unknown; depth?: unknown; reason?: unknown; text?: unknown } | null
+    if (!e || typeof e !== 'object' || e.depth) continue
+    if (e.type === 'compaction_error') out = String(e.text ?? '') || '?'
+    else if (e.type === 'context' && e.reason === 'compacted') out = ''
+  }
+  return out
+}
+
+/**
  * A compact line for an event this version doesn't know (a newer server's): its own words if it has some, else ''
  * (nothing to say). Known types and live deltas give ''.
  */

@@ -7,7 +7,7 @@ import Composer, { AttachmentChip } from '../components/Composer'
 import Diff from '../components/Diff'
 import Transcript from '../components/Transcript'
 import { t, useLang } from '../i18n'
-import { applySummary, compactReason, followAgainIn, mergeLoaded, queueStalled, runKey, withEvent, withRun, type ApplyResult } from '../logic'
+import { applySummary, compactionNotice, compactReason, followAgainIn, mergeLoaded, queueStalled, runKey, withEvent, withRun, type ApplyResult } from '../logic'
 
 type Ctx = { used: number; limit: number; reason?: string }
 
@@ -27,7 +27,7 @@ export default function Chat() {
   const [live, setLive] = useState('')
   const liveRef = useRef('')
   const [ctxLive, setCtxLive] = useState<Ctx | null>(null)
-  // a live-only 'compaction_error' (the summarizer failed): shown until the run's next event
+  // a live-only 'compaction_error' (the summarizer failed): shown until that compaction ends or the run's next event
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
   const [, setFrozen] = useState(0)
@@ -141,8 +141,9 @@ export default function Chat() {
       onLive: (items) => {
         const c = [...items].reverse().find((i) => i.type === 'context' && !i.depth)
         if (c) setCtxLive({ used: c.used, limit: c.limit, reason: c.reason })
-        const failed = [...items].reverse().find((i) => i.type === 'compaction_error' && !i.depth)
-        if (failed) setNotice(String(failed.text ?? '') || '?')
+        // shown while the compaction goes on; gone once it ended, even when both come in one batch (or a replay)
+        const failed = compactionNotice(items)
+        if (failed !== null) setNotice(failed)
         const txt = items.filter((i) => i.type === 'text_delta' && !i.depth).map((i) => i.text).join('')
         if (txt) appendLive(txt)
       },
@@ -515,7 +516,7 @@ function ContextMeter({ runs, live }: { runs: Run[]; live: Ctx | null }) {
       }
     }
   }
-  if (!c || !c.limit) return null
+  if (!c || !c.limit || typeof c.used !== 'number' || typeof c.limit !== 'number') return null // (an odd item: no meter, never a crash)
   const pct = Math.min(100, Math.round((c.used / c.limit) * 100))
   // the step that just compacted/lightened the context says so: the drop has a visible reason
   const dropped = c.reason === 'compacted' || c.reason === 'masked'

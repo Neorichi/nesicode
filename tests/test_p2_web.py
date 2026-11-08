@@ -187,6 +187,79 @@ def test_connectors_in_ask_mode_say_which_words_switch_them_on(tmp_path):
     assert out["words"] == [["burp"], ["navegacion"], [], None, None, ["raro"]]
 
 
+# ---------------------------------------------------------------------------------------------------- S5 learned limits
+def test_a_model_limit_learned_meanwhile_shows_and_forgetting_it_updates_every_picker(tmp_path):
+    """S5 (review): the pickers' limits are cached per page, but asked again whenever a picker shows the model — a
+    chat may have learned its real window since (context_learned), and «aprendido» + «Olvidar» must show without a
+    reload. «Olvidar» updates every picker of that model (only those), also when DELETE answers no limits, and a
+    failure is the server's message with nothing changed."""
+    out = run_ts(tmp_path, f"""
+      import {{ cachedLimits, forgetLearned, watchLimits }} from {json.dumps(str(SRC / 'limits.ts'))}
+      type Lim = {{ context: number; output: number | null; source: string }}
+      const fresh = (): Lim => ({{ context: 128000, output: 16000, source: 'default' }})
+      const server: Record<string, Lim> = {{ 'p/m': fresh(), 'p/otro': {{ context: 64000, output: 8000, source: 'table' }} }}
+      let del = 'fresh'
+      const calls: string[] = []
+      const json = (status: number, body: unknown) => new Response(JSON.stringify(body), {{ status, headers: {{ 'Content-Type': 'application/json' }} }})
+      ;(globalThis as any).fetch = async (url: string, init: {{ method: string }}) => {{
+        const spec = decodeURIComponent(String(url).split('spec=')[1] ?? '')
+        calls.push(`${{init.method}} ${{spec}}`)
+        if (init.method === 'DELETE') {{
+          if (del === 'fail') return json(500, {{ detail: 'No se pudo olvidar' }})
+          server[spec] = fresh()
+          return del === 'ok' ? json(200, {{ ok: true }}) : json(200, {{ spec, ...server[spec] }})
+        }}
+        return json(200, {{ spec, ...server[spec] }})
+      }}
+      const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+      const rec = (xs: string[]) => (l: Lim) => xs.push(`${{l.context}}:${{l.source}}`)
+      void (async () => {{
+        const a: string[] = []
+        let stop = watchLimits('p/m', rec(a), 20)
+        out.first = [...a]
+        await sleep(80)
+        out.loaded = [...a]
+        stop()
+        server['p/m'] = {{ context: 12000, output: 16000, source: 'learned' }} // a chat learned the real window
+        const b: string[] = []
+        stop = watchLimits('p/m', rec(b), 20) // the settings page shown again (no reload)
+        out.atOnce = [...b]
+        await sleep(50)
+        out.again = [...b]
+        const c: string[] = [], d: string[] = []
+        const stopC = watchLimits('p/m', rec(c), 20) // Chat and Mejora on the same model, Visión on another
+        const stopD = watchLimits('p/otro', rec(d), 20)
+        await sleep(80)
+        const n = [b.length, c.length, d.length]
+        out.forgotten = (await forgetLearned('p/m')).source
+        out.heard = [b.slice(n[0]), c.slice(n[1]), d.slice(n[2])]
+        server['p/m'] = {{ context: 12000, output: 16000, source: 'learned' }}
+        del = 'ok'
+        calls.length = 0
+        out.okAnswer = (await forgetLearned('p/m')).source
+        out.okCalls = [...calls]
+        del = 'fail'
+        try {{ await forgetLearned('p/m'); out.fail = 'no error' }} catch (e) {{ out.fail = (e as Error).message }}
+        out.cached = cachedLimits('p/m')
+        stop(); stopC(); stopD()
+        const m = [b.length, c.length]
+        server['p/m'] = {{ context: 32000, output: 16000, source: 'learned' }}
+        const stopE = watchLimits('p/m', () => {{}}, 20)
+        await sleep(50)
+        stopE()
+        out.afterStop = [b.length - m[0], c.length - m[1]]
+        console.log(JSON.stringify(out)) // (the last line is what the test reads)
+      }})()
+    """)
+    assert out["first"] == [] and out["loaded"] == ["128000:default"]
+    assert out["atOnce"] == ["128000:default"] and out["again"] == ["128000:default", "12000:learned"]
+    assert out["forgotten"] == "default"
+    assert out["heard"] == [["128000:default"], ["128000:default"], []]
+    assert out["okAnswer"] == "default" and out["okCalls"] == ["DELETE p/m", "GET p/m"]
+    assert out["fail"] == "No se pudo olvidar" and out["cached"] == {"context": 128000, "output": 16000, "source": "default", "spec": "p/m"}
+    assert out["afterStop"] == [0, 0]
+
+
 # ---------------------------------------------------------------------------------------------------- S6 events
 EMIT_RX = re.compile(r'emit(?:ter\([^)]*\))?\(\s*\{\s*"type":\s*(f?)"([^"]+)"')
 
@@ -221,7 +294,8 @@ def test_every_event_type_the_backend_emits_has_a_place_in_the_ui(tmp_path):
     out = run_ts(tmp_path, f"""
       out.known = [...L.KNOWN_EVENTS]
       out.later = {json.dumps(sorted(types - PHASE1_EVENTS - {"*_delta"}))}
-        .filter((t: string) => !L.KNOWN_EVENTS.has(t)).map((t: string) => L.unknownEventNote({{ type: t, text: 'algo' }}))
+        .filter((t: string) => !L.KNOWN_EVENTS.has(t) && !t.endsWith('_delta')) // (live text: the streaming reply)
+        .map((t: string) => L.unknownEventNote({{ type: t, text: 'algo' }}))
       out.notes = [
         {{ type: 'connector_skipped', connector: 'Burp', text: 'no arrancó hace 1 min; se reintenta en 4 min' }},
         {{ type: 'brand_new', value: 3 }},
@@ -314,6 +388,118 @@ def test_a_failed_context_summary_is_explained(tmp_path):
     assert out["t"] == [lead.format(w) for w in (
         "el resumen salió vacío", "el resumen salió cortado", "el modelo se quedó razonando sin escribir el resumen",
         "otra cosa", "read timeout (stalled stream)", "?")]
+
+
+def _failed_summary_stream(tmp_path: Path, monkeypatch) -> dict:
+    """The real loop, whose summarizer call fails, wired to the real jobs emitter: the live items a client gets
+    replayed when it connects during that compaction, and right after it; and the batch a poll taken just before the
+    failure delivers (the fallback compaction follows within ms, so usually in the same batch)."""
+    from types import SimpleNamespace
+
+    import nesicode.agent.loop as loop
+    from nesicode.agent import Agent, Workspace
+    from nesicode.harness import base_harness
+    from nesicode.llm.base import Conversation, LLMError, Provider, ToolCall, Turn, Usage
+    from nesicode.server.jobs import Jobs
+
+    steps: list[int] = []
+
+    class Conv(Conversation):
+        def __init__(self, model, system, tools, options):
+            super().__init__(model, system, tools, options)
+            self.chars = len(system)
+
+        def add_user(self, text):
+            self.chars += len(text)
+
+        def add_assistant_text(self, text):
+            self.chars += len(text or "")
+
+        def add_tool_results(self, results):
+            self.chars += sum(len(r.content or "") + 40 for r in results)
+
+        def mask_tool_results(self, keep_last, marker, *, keep_chars=0, apply=True):
+            return 0
+
+        def ntokens(self):
+            return self.chars // 4
+
+        def step(self, on_event=None):
+            if self.options.role == "summarizer":
+                raise LLMError("read timeout (stalled stream)")
+            steps.append(1)
+            if len(steps) >= 8:
+                return Turn("fin", [], "end_turn", Usage(self.ntokens(), 10))
+            call = ToolCall(f"w{len(steps)}", "write_file", {"path": f"p{len(steps)}.txt", "content": "y" * 6_000})
+            self.chars += 6_100
+            return Turn("", [call], "tool_use", Usage(self.ntokens(), 40))
+
+    class Prov(Provider):
+        name = "fake"
+
+        def conversation(self, model, system, tools, options):
+            return Conv(model, system, tools, options)
+
+    monkeypatch.setattr(loop, "get_provider", lambda spec, keys=None: (Prov(), "m"))
+    server = SimpleNamespace(db=SimpleNamespace(add_event=lambda run_id, event: None), live={})
+    server_emit = Jobs.emitter(server, 1)  # what the stream replays: server.live[1].items (this generation's)
+    seen: dict = {"persisted": []}
+
+    def emit(event: dict) -> None:
+        server_emit(event)
+        live = server.live[1].items
+        if not event.get("_persist", True) and event.get("type") == "compaction_error" and "during" not in seen:
+            seen["during"], seen["mark"] = list(live), len(live) - 1
+        elif event.get("_persist", True) and "during" in seen and "after" not in seen:
+            seen["persisted"].append(event.get("type"))
+        elif event.get("type") == "context" and event.get("reason") == "compacted" and "during" in seen and "after" not in seen:
+            seen["after"], seen["batch"] = list(live), live[seen["mark"]:]
+
+    res = Agent(model="fake/m", harness=base_harness(), workspace=Workspace(tmp_path / "ws"), emit=emit,
+                context_limit=8_000, output_limit=4_000).run("tarea")
+    assert res.status == "done" and "after" in seen, seen.keys()
+    return seen
+
+
+def test_the_failed_summary_notice_ends_with_its_compaction(tmp_path, monkeypatch):
+    """S6 (review): the live 'compaction_error' notice shows while that compaction goes on and is gone once it ended,
+    also when the fallback compaction comes in the same batch as the failure (the usual case: within ms) and when a
+    reconnect replays the generation's live items — never a stale «se reintenta…» during the next model call."""
+    seen = _failed_summary_stream(tmp_path, monkeypatch)
+    assert seen["persisted"][:1] == ["compacted"]  # (the setup: the fallback compaction follows the failure)
+    err = lambda text, depth=0: {"type": "compaction_error", "text": text, "depth": depth}  # noqa: E731
+    ctx = lambda reason=None, depth=0: {"type": "context", "used": 9000, "limit": 32000, "reason": reason, "depth": depth}  # noqa: E731
+    out = run_ts(tmp_path, f"""
+      const seen = {json.dumps({k: seen[k] for k in ("during", "after", "batch")})}
+      out.real = [seen.during, seen.after, seen.batch].map((items) => L.compactionNotice(items))
+      out.n = {json.dumps([
+          [err("read timeout")],  # the summary failed: shown
+          [err("read timeout"), {"type": "text_delta", "text": "x"}, ctx("compacted")],  # its compaction ended: gone
+          [ctx("compacted"), err("summary rejected: empty")],  # an earlier compaction, then this one failing: shown
+          [{"type": "text_delta", "text": "x"}, ctx("masked"), ctx()],  # nothing about it: keep what is shown
+          [err("x", 1), ctx("compacted", 1)],  # a sub-agent's: not this run's notice
+          [err("")],
+      ])}.map((items: unknown[]) => L.compactionNotice(items))
+      out.odd = [L.compactionNotice([null, 3, 'x']), L.compactionNotice(undefined as any)]
+    """)
+    assert out["real"] == ["read timeout (stalled stream)", "", ""]
+    assert out["n"] == ["read timeout", "", "summary rejected: empty", None, None, "?"]
+    assert out["odd"] == [None, None]
+
+
+def test_an_odd_done_or_cost_never_blanks_the_chat(tmp_path):
+    """S6 (review): the run's last line ('done': steps, cost) is drawn outside the per-event boundary, so an odd value
+    there must not throw (it used to: a non-number cost crashed the whole chat page)."""
+    out = run_ts(tmp_path, f"""
+      import Transcript from {json.dumps(str(SRC / 'components' / 'Transcript.tsx'))}
+      import {{ money }} from {json.dumps(str(SRC / 'api.ts'))}
+      out.page = html(<Transcript events={{[{{ type: 'assistant', text: 'hola' }}, {{ type: 'done', status: 'done', usage: {{ cost_usd: '0.5' }} }}] as any}} status="done" />)
+      out.ok = html(<Transcript events={{[{{ type: 'done', status: 'done', steps: 3, usage: {{ cost_usd: 0.0123 }} }}] as any}} status="done" />)
+      out.money = [0.5, 0.001, undefined, null, '0.5', NaN, Infinity].map((x) => money(x as any))
+    """)
+    assert "hola" in out["page"] and "? pasos · —" in out["page"] and "undefined" not in out["page"]
+    assert "3 pasos · $0.01" in out["ok"]
+    assert out["money"] == ["$0.50", "$0.0010", "—", "—", "—", "—", "—"]
 
 
 # ---------------------------------------------------------------------------------------------------- S7 409 answers

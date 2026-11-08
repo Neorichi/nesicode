@@ -397,7 +397,7 @@ export default function Transcript({
       {!running && (
         <div className="run-meta">
           {statusLabel(status)}
-          {done && ` · ${t('{n} pasos', { n: done.steps })} · ${money(done.usage?.cost_usd)}`}
+          {done && ` · ${t('{n} pasos', { n: num(done.steps) })} · ${money(done.usage?.cost_usd)}`}
         </div>
       )}
     </div>
