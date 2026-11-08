@@ -9,6 +9,7 @@ and approval requests (with inline buttons) come back to Telegram.
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import threading
@@ -675,20 +676,22 @@ class TelegramBridge:
 
     def _send_file(self, chat_id: int, ws, rel: str, caption: str, photo: bool) -> None:
         """Send a file the run produced. A picture Telegram won't take as a photo (a tall screenshot, too big) goes as
-        a document; one it won't take at all (over 50 MB) or that still fails is named in a message, never dropped."""
+        a document; one it won't take at all (over 50 MB) or that still fails is named in a message, never dropped.
+        Read like every server read of a workspace (Workspace.open_file): no link followed below it, even one swapped in
+        after the path was checked (the server would send a file from outside the cage), never blocking on a FIFO (the
+        relay would hang for good), regular files only; the size is the opened file's, the bytes are the ones read."""
         try:
             p = ws.resolve(rel)
-            size = p.stat().st_size
+            with ws.open_file(p) as fh:
+                size = os.fstat(fh.fileno()).st_size
+                data = fh.read(MAX_UPLOAD + 1) if size <= MAX_UPLOAD else b""  # checked before reading it into memory
         except Exception:
             return
         caption = (caption or p.name)[:1000]
-        if size > MAX_UPLOAD:  # checked before reading it into memory
+        size = max(size, len(data))  # (it may have grown meanwhile)
+        if size > MAX_UPLOAD:
             self._safe_send(chat_id, f"📎 «{p.name}» ocupa {size / 2**20:.0f} MB y Telegram no deja a los bots enviar más de "
                                      f"{MAX_UPLOAD // 2**20} MB: lo tienes en la conversación, en la app.")
-            return
-        try:
-            data = p.read_bytes()
-        except OSError:
             return
         if photo and image_mime(p.name) and size <= MAX_PHOTO:
             try:

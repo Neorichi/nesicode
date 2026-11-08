@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from ..agent import Agent, Workspace, copy_workspace
-from ..agent.workspace import ATTACHMENTS_DIR, ToolError
+from ..agent.workspace import ATTACHMENTS_DIR, Stopped as _Stopped, ToolError, interruptible
 from ..config import settings
 from ..harness import normalize, validate
 from ..harnessing import HarnessingConfig, HarnessingRun, apply_rollout
@@ -130,8 +130,9 @@ def save_harness_version(db: DB, project_id: int, files: dict, source: str, note
     return v
 
 
-def attachments_note(ws: Workspace, attachments: list[dict], vision: str, keys: dict, emit) -> str:
-    """Tell the agent what was attached; describe images up front with the vision model."""
+def attachments_note(ws: Workspace, attachments: list[dict], vision: str, keys: dict, emit, cancel=None) -> str:
+    """Tell the agent what was attached; describe images up front with the vision model (`cancel`: the run's Stop
+    ends a description at once — a stalled vision endpoint would otherwise hold the run for its timeouts)."""
     from ..agent.vision import describe_image
 
     lines = ["The user attached these files (paths relative to the workspace):"]
@@ -144,7 +145,8 @@ def attachments_note(ws: Workspace, attachments: list[dict], vision: str, keys: 
             continue
         emit({"type": "tool_call", "id": f"att-{a['path']}", "name": "view_image", "args": {"path": a["path"]}})
         try:
-            text = describe_image(ws, a["path"], vision, keys, "Describe this image in detail for a software engineer.")
+            text = describe_image(ws, a["path"], vision, keys, "Describe this image in detail for a software engineer.",
+                                  cancel=cancel)
             emit({"type": "tool_result", "id": f"att-{a['path']}", "name": "view_image", "output": text, "is_error": False})
             lines.append("  Image description (from the vision model):\n    " + text.replace("\n", "\n    "))
         except Exception as exc:
@@ -532,38 +534,10 @@ def _mcp_caller(user_id: int, cfg, tool: str, alive=None):
     return call
 
 
-class _Stopped(ToolError):
-    """The user pressed Stop while a connector call was in flight (the call is abandoned, not waited for)."""
-
-
 def _interruptible(cancel: threading.Event | None, fn):
-    """Run a blocking connector call (an MCP request, a Chrome command, VirusTotal polling…) in a helper thread and
-    wait for it in short slices, so Stop returns at once instead of when the call ends (up to minutes). The abandoned
-    call finishes, or times out, in the background and its result is dropped."""
-    if cancel is None:
-        return fn()
-    if cancel.is_set():
-        raise _Stopped("stopped by the user")
-    box: dict = {}
-    done = threading.Event()
-
-    def target() -> None:
-        try:
-            box["value"] = fn()
-        except BaseException as exc:  # noqa: BLE001 - re-raised in the caller's thread
-            box["error"] = exc
-        finally:
-            done.set()
-
-    threading.Thread(target=target, daemon=True, name="nesi-connector-call").start()
-    while not done.wait(0.2):
-        if cancel.is_set():
-            raise _Stopped("stopped by the user")
-    if "error" in box:
-        if cancel.is_set():  # a call that honours Stop itself ended because of it: the same answer either way
-            raise _Stopped("stopped by the user") from box["error"]
-        raise box["error"]
-    return box["value"]
+    """A blocking connector call (an MCP request, a Chrome command, VirusTotal polling…) that Stop abandons at once
+    (_Stopped) instead of waiting for it to end (up to minutes); see agent.workspace.interruptible."""
+    return interruptible(cancel, fn, "nesi-connector-call")
 
 
 # Chrome's answer when a tab is gone or was taken out of the agent's group (extension/background.js assertAllowed).
@@ -914,6 +888,7 @@ class Jobs:
         self._lock = threading.RLock()
         self._jobs: dict[int, _Job] = {}  # run_id -> the job that owns it (queued or running)
         self._closing = False
+        self._waiting_since: float | None = None  # when closing first waited for the runs to end (see shutdown)
         # A message accepted but never started goes back to its conversation's queue (resume_waiting starts the queues
         # in order); a run that was working when the app closed is 'interrupted'.
         db.execute("UPDATE runs SET status='waiting' WHERE status='queued' AND kind='chat' AND thread_id IS NOT NULL")
@@ -1006,13 +981,18 @@ class Jobs:
             persist = event.pop("_persist", True)
             if persist:
                 kind = event.get("type")
-                # The streamed deltas end here: the final text is in this event, or (a retry of a reply that had
-                # started streaming) they belong to a failed attempt that a reconnecting client must not see again.
-                # Cleared BEFORE the event is stored: a stream never reads the event together with the old deltas.
-                if kind in ("assistant", "done", "error") or (kind == "llm_retry" and event.get("partial")
-                                                              and not event.get("depth")):
+                # The streamed deltas end here: they are on record now (the reply's text, its reasoning — a model that
+                # reasons in every step and calls tools without text would otherwise keep every step's deltas until the
+                # answer, all resent to each (re)connecting client —, the tool calls after them), or (a retry of a reply
+                # that had started streaming) they belong to a failed attempt that a reconnecting client must not see
+                # again. Cleared BEFORE the event is stored: a stream never reads the event together with the old
+                # deltas. The newest context meter stays (what a client connecting now shows).
+                if kind in ("assistant", "thinking", "tool_call", "done", "error") or (
+                        kind == "llm_retry" and event.get("partial") and not event.get("depth")):
+                    meter = next((i for i in reversed(live.items) if i.get("type") == "context" and not i.get("depth")),
+                                 None)
                     live.gen += 1
-                    live.items = []
+                    live.items = [meter] if meter is not None else []
                 self.db.add_event(run_id, event)
             else:
                 live.items.append(event)
@@ -1022,9 +1002,14 @@ class Jobs:
     def shutdown(self, wait: float = 0.0) -> None:
         """Stop everything — when the app closes (automatically, see _stop_all_at_exit) and in the tests. Running runs
         are told to stop (they end 'interrupted'), pending approvals end, nothing new starts; messages that had not
-        started stay in their queue for the next start. `wait`: seconds to give the running ones to end cleanly."""
+        started stay in their queue for the next start. `wait`: seconds to give the running ones to end cleanly,
+        counted from the first call that waited: the server's own stop and the exit hook never add up (a run stuck in a
+        call that ignores Stop delays closing the app `wait` seconds in all, not once per caller)."""
         with self._lock:
             self._closing = True
+            if wait > 0 and self._waiting_since is None:
+                self._waiting_since = time.monotonic()
+            until = (self._waiting_since or 0.0) + wait
             for ev in list(self.cancels.values()):
                 ev.set()
             for job in list(self._jobs.values()):
@@ -1035,7 +1020,7 @@ class Jobs:
                 print("nesicode: could not keep the queued messages:", exc)
         self.pool.shutdown()
         if wait > 0:
-            self.pool.join(wait)
+            self.pool.join(until - time.monotonic())
 
     def cancel(self, run_id: int) -> bool:
         """Stop a run. A running one is told to stop (it ends 'cancelled'). One that has not started — 'queued' for a
@@ -1132,9 +1117,12 @@ class Jobs:
                       "Reply with the title only: no quotes, no trailing period, no emoji.\n\n" + convo)
             text, _ = provider.complete(model, "You name conversations.", prompt,
                                         ModelOptions(effort="low", role="titler", max_tokens=60))
+            text = text or ""
             title = clean_title(text)
-            if not title and (_REASONING_OPEN.search(text or "") or _REASONING_CLOSE.search(text or "")):
-                # a reasoning model spent the few tokens thinking: one more try with room for the thinking
+            if not title and (not text.strip() or _REASONING_OPEN.search(text) or _REASONING_CLOSE.search(text)):
+                # A reasoning model spent the few tokens thinking: in the text (<think>…, no reasoning parser) or apart
+                # from it (nesi3 through LiteLLM's reasoning_content, DeepSeek, vLLM/SGLang parsers, Claude thinking:
+                # then the text is empty). One more try with room for the thinking.
                 text, _ = provider.complete(model, "You name conversations.", prompt,
                                             ModelOptions(effort="low", role="titler", max_tokens=1024))
                 title = clean_title(text)
@@ -1310,19 +1298,20 @@ class Jobs:
         # A shared workspace is serialised per project (waiting for it holds no worker and Stop works meanwhile);
         # a cage is already one-run-at-a-time.
         lock = None if thread["isolated"] else self._project_lock(project["id"])
-        if lock is not None and not self._acquire(lock, cancel):
+        # Attached images are described first, holding no lock of the project: a slow vision call never blocks the
+        # project's other shared conversations (nor «Aplicar»), and Stop ends it at once.
+        attachments = loads(run["attachments"], [])
+        attached = attachments_note(ws, attachments, vision, keys, emit, cancel) if attachments else ""
+        if (attachments and cancel.is_set()) or (lock is not None and not self._acquire(lock, cancel)):
             emit({"type": "cancelled"})
             self._finish(run_id, "cancelled", job=job)
             return
         try:
             db.execute("UPDATE runs SET harness_version=? WHERE id=?", (project["harness_version"], run_id))
-            task = run["task"]
+            task = run["task"] + (f"\n\n{attached}" if attached else "")
             archive = f".nesicode/chats/{thread['id']}"
             _fresh_archive(db, ws, run, thread["id"])
             _write_thread_history(db, ws, run, archive)
-            attachments = loads(run["attachments"], [])
-            if attachments:
-                task += "\n\n" + attachments_note(ws, attachments, vision, keys, emit)
             harness = current_harness(db, project)
             info: dict = {}
             # "only when I ask": the user's recent words, the agent's recent answers and the connectors already used in

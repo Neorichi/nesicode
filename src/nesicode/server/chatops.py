@@ -7,7 +7,7 @@ import re
 import time
 
 from ..agent.vision import image_mime
-from ..agent.workspace import ATTACHMENTS_DIR
+from ..agent.workspace import ATTACHMENTS_DIR, ToolError, store_new_file
 from .db import DB, loads
 from .jobs import Jobs, create_cage, thread_ws
 
@@ -32,21 +32,21 @@ def ensure_thread(db: DB, project: dict, user_id: int, first_text: str) -> dict:
 
 
 def save_attachment(project: dict, thread: dict, name: str, data: bytes) -> dict:
-    target = thread_ws(project, thread) / ATTACHMENTS_DIR
-    target.mkdir(parents=True, exist_ok=True)
+    """Store a file the user sent (Telegram) in the conversation's .attachments, as the web upload does: never through
+    a link the agent planted in its folder (.attachments itself, or a dangling one at the file's name), never over a
+    file."""
+    root = thread_ws(project, thread)
+    root.mkdir(parents=True, exist_ok=True)
     clean = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._") or "archivo"
-    stem, dot, ext = clean.rpartition(".")
-    if not dot:
-        stem, ext = clean, ""
-    candidate, n = clean, 1
-    while (target / candidate).exists():
-        n += 1
-        candidate = f"{stem}-{n}.{ext}" if ext else f"{stem}-{n}"
-    f = target / candidate
-    f.write_bytes(data)
+    try:
+        stored = store_new_file(root, ATTACHMENTS_DIR, clean, data)
+    except (ToolError, OSError) as exc:
+        raise ToolError(f"No se puede guardar el adjunto «{clean}» en {ATTACHMENTS_DIR} de esta conversación: "
+                        f"{getattr(exc, 'strerror', None) or exc}") from exc
     head = data[:8192]
-    kind = "image" if image_mime(f.name) else "pdf" if f.suffix.lower() == ".pdf" else ("binary" if b"\0" in head else "text")
-    return {"name": f.name, "path": f"{ATTACHMENTS_DIR}/{candidate}", "kind": kind, "size": len(data)}
+    kind = ("image" if image_mime(stored) else "pdf" if stored.lower().endswith(".pdf")
+            else "binary" if b"\0" in head else "text")
+    return {"name": stored, "path": f"{ATTACHMENTS_DIR}/{stored}", "kind": kind, "size": len(data)}
 
 
 def post_message(db: DB, jobs: Jobs, project: dict, thread: dict, text: str, attachments: list[dict],

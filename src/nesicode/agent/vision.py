@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import shutil
 import subprocess
@@ -10,7 +11,7 @@ import tempfile
 from pathlib import Path
 
 from ..llm import LLMError, get_provider
-from .workspace import ToolError, Workspace, _q, _sandbox_paths
+from .workspace import ToolError, Workspace, _q, _sandbox_paths, interruptible
 
 IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 # By extension, not via mimetypes: Python's own table has no .webp (it only worked where the OS supplied one).
@@ -92,7 +93,22 @@ def _shrink(src: Path, size: int) -> tuple[bytes, str]:
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def describe_image(ws: Workspace, path: str, vision_model: str, user_keys: dict | None, question: str) -> str:
+def _call(cancel, method, *args):
+    """A vision / image-model request that Stop ends at once (a stalled endpoint would otherwise hold the run — and a
+    shared project — for its read timeouts, ~20 min). A provider whose method takes `cancel` gets it and aborts the
+    request itself; the wait is abandoned on Stop in any case (Stopped, a ToolError)."""
+    try:
+        takes = cancel is not None and "cancel" in inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        takes = False
+    return interruptible(cancel, lambda: method(*args, cancel=cancel) if takes else method(*args), "nesi-vision-call")
+
+
+def describe_image(ws: Workspace, path: str, vision_model: str, user_keys: dict | None, question: str,
+                   cancel=None) -> str:
+    """The vision model's answer about an image of the workspace. `cancel`: the run's Stop (default: the workspace's,
+    which the agent sets)."""
+    cancel = cancel if cancel is not None else getattr(ws, "cancel", None)
     if not vision_model:
         raise ToolError("no vision model is configured for this project")
     p = ws.resolve(path)
@@ -113,7 +129,7 @@ def describe_image(ws: Workspace, path: str, vision_model: str, user_keys: dict 
         mime = sniff_mime(data) or mime
     try:
         provider, model = get_provider(vision_model, user_keys)
-        text, _ = provider.vision(model, question or "Describe this image in detail.", data, mime)
+        text, _ = _call(cancel, provider.vision, model, question or "Describe this image in detail.", data, mime)
     except LLMError as exc:
         raise ToolError(f"vision model failed: {exc}") from exc
     return text.strip() or "(the vision model returned nothing)"
@@ -122,17 +138,20 @@ def describe_image(ws: Workspace, path: str, vision_model: str, user_keys: dict 
 EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
 
 
-def generate_image(ws: Workspace, prompt: str, path: str, image_model: str, user_keys: dict | None) -> str:
-    """Generate an image with the image model and save it in the workspace. Returns the relative path."""
+def generate_image(ws: Workspace, prompt: str, path: str, image_model: str, user_keys: dict | None,
+                   cancel=None) -> str:
+    """Generate an image with the image model and save it in the workspace. Returns the relative path. `cancel`: the
+    run's Stop (default: the workspace's, which the agent sets)."""
     import re
 
+    cancel = cancel if cancel is not None else getattr(ws, "cancel", None)
     if not image_model:
         raise ToolError("no image-generation model is configured for this project")
     if not prompt.strip():
         raise ToolError("`prompt` is required")
     try:
         provider, model = get_provider(image_model, user_keys)
-        data, mime = provider.generate_image(model, prompt.strip())
+        data, mime = _call(cancel, provider.generate_image, model, prompt.strip())
     except LLMError as exc:
         raise ToolError(f"image model failed: {exc}") from exc
     ext = EXT.get(mime, "png")
