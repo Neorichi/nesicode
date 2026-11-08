@@ -7,6 +7,7 @@ Used by the macOS .app and the Windows installer (PyInstaller bundles), and by
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import socket
 import sys
@@ -17,6 +18,100 @@ import webbrowser
 
 
 PREFERRED_PORT = 47821  # stable, so the Chrome extension's connection code keeps working across launches
+
+
+# ------------------------------------------------------------- the native bridge (window.pywebview.api)
+# WebKit gives `window.webkit.messageHandlers.jsBridge` to EVERY frame of the window, including the
+# sandboxed iframes that show HTML files the agent wrote or downloaded, and pywebview neither checks the
+# sender nor escapes the call id it pastes into JS it then runs in the app's own page. A preview could
+# thus run code as the app (its cookie, its whole API: connectors that run commands, exports with keys).
+# Two locks: only the app's own page may call the bridge (macOS: checked natively per message), and a
+# call's name and id must be plain identifiers (all platforms), so nothing can be smuggled into that JS.
+_BRIDGE_FUNC = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}(\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3}$")
+_BRIDGE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_guarded_bridge: dict[str, object] = {}
+
+
+def bridge_call_ok(func_name, value_id) -> bool:
+    """pywebview evaluates `…_returnValuesCallbacks["<func_name>"]["<value_id>"](…)` in the main frame."""
+    if isinstance(value_id, int) and not isinstance(value_id, bool):
+        value_id = str(value_id)
+    return (isinstance(func_name, str) and bool(_BRIDGE_FUNC.match(func_name))
+            and isinstance(value_id, str) and bool(_BRIDGE_ID.match(value_id)))
+
+
+def trusted_frame(message, port: int) -> bool:
+    """Was this WKScriptMessage posted by the app's own page: the main frame, origin http://127.0.0.1:<port>,
+    and not a file served under /api/ (an HTML file opened as the whole page is still a sandboxed preview)?"""
+    try:
+        info = message.frameInfo()
+        if info is None or not info.isMainFrame():
+            return False
+        origin = info.securityOrigin()
+        if origin is None or (str(origin.protocol()), str(origin.host()), int(origin.port())) != ("http", "127.0.0.1", port):
+            return False
+        req = info.request()
+        url = req.URL() if req is not None else None
+        return url is not None and not str(url.path() or "").startswith("/api/")
+    except Exception:  # anything unexpected: refuse
+        return False
+
+
+def _guarded_js_bridge_call(original):
+    def js_bridge_call(window, func_name, param, value_id):
+        if not bridge_call_ok(func_name, value_id):
+            print("nesicode: blocked a desktop bridge call with an invalid name or id", file=sys.stderr)
+            return None
+        return original(window, func_name, param, value_id)
+
+    js_bridge_call._nesi_original = original
+    return js_bridge_call
+
+
+def guard_js_bridge(port: int) -> list[str]:
+    """Lock pywebview's bridge to the app page (see above). Returns the backends it guarded."""
+    import importlib
+
+    native = ("cocoa",) if sys.platform == "darwin" else ("edgechromium", "mshtml", "cef") if os.name == "nt" else ("gtk", "qt", "cef")
+    done = []
+    for name in ("cocoa", "gtk", "qt", "edgechromium", "mshtml", "cef"):  # the backends that call js_bridge_call
+        modname = f"webview.platforms.{name}"
+        if modname not in sys.modules and name not in native:
+            continue  # only the backends this platform can load (importing the others fails or is slow)
+        try:
+            mod = importlib.import_module(modname)
+        except Exception:
+            continue
+        fn = getattr(mod, "js_bridge_call", None)
+        if fn is None:
+            continue
+        if not hasattr(fn, "_nesi_original"):
+            mod.js_bridge_call = _guarded_js_bridge_call(fn)
+        if name == "cocoa" and "cocoa" not in _guarded_bridge:
+            try:
+                _guarded_bridge["cocoa"] = _guard_cocoa_bridge(mod, port)
+            except Exception as exc:
+                print("nesicode: could not guard the macOS bridge:", exc, file=sys.stderr)
+                continue
+        done.append(name)
+    return done
+
+
+def _guard_cocoa_bridge(cocoa, port: int):
+    """WKWebView tells who sent each message (WKScriptMessage.frameInfo): drop all but the app page's."""
+    import objc
+
+    base = cocoa.BrowserView.JSBridge
+
+    class NesiJSBridge(base):
+        def userContentController_didReceiveScriptMessage_(self, controller, message):
+            if trusted_frame(message, port):
+                objc.super(NesiJSBridge, self).userContentController_didReceiveScriptMessage_(controller, message)
+            else:
+                print("nesicode: blocked a desktop bridge call from a frame that is not the app", file=sys.stderr)
+
+    cocoa.BrowserView.JSBridge = NesiJSBridge  # pywebview creates BrowserView.JSBridge for every window
+    return NesiJSBridge
 
 
 def _free_port() -> int:
@@ -108,7 +203,7 @@ def _enable_native_context_menu(webview) -> None:
             print("nesicode: could not enable the context menu:", exc)
 
 
-def _allow_microphone() -> None:
+def _allow_microphone(port: int) -> None:
     """Let the app's own page use the microphone (mic button) without WebKit asking on every recording.
     macOS still asks the user once for the app (NSMicrophoneUsageDescription in Info.plist)."""
     if sys.platform != "darwin":
@@ -124,9 +219,13 @@ def _allow_microphone() -> None:
         })
 
         def grant(self, webview, origin, frame, kind, decision_handler):
-            host = str(origin.host() or "") if origin is not None else ""
-            # 1 = WKPermissionDecisionGrant, 2 = Deny: only our own local page
-            decision_handler(1 if host in ("127.0.0.1", "localhost") else 2)
+            try:
+                ours = (origin is not None and str(origin.host() or "") == "127.0.0.1" and int(origin.port()) == port
+                        and (frame is None or frame.isMainFrame()))
+            except Exception:
+                ours = False
+            # 1 = WKPermissionDecisionGrant, 2 = Deny: only our own page (never a preview iframe)
+            decision_handler(1 if ours else 2)
 
         objc.classAddMethods(cocoa.BrowserView.BrowserDelegate, [
             objc.selector(grant, selector=sel, signature=b"v@:@@@q@?"),
@@ -222,8 +321,15 @@ def main() -> None:
             return True
 
     _enable_native_context_menu(webview)
-    _allow_microphone()
-    webview.create_window("Nesicode", url, width=1360, height=880, min_size=(900, 600), text_select=True, js_api=Api())
+    _allow_microphone(port)
+    guarded = guard_js_bridge(port)  # before the window exists: pywebview builds its bridge when creating it
+    # macOS must have the per-frame check (WebKit hands the bridge to every frame); without any guard,
+    # no native API at all: folder picking, Finder and "Save as…" fall back to what the page can do itself
+    safe = "cocoa" in guarded if sys.platform == "darwin" else bool(guarded)
+    if not safe:
+        print("nesicode: the desktop bridge could not be secured; native dialogs are disabled", file=sys.stderr)
+    webview.create_window("Nesicode", url, width=1360, height=880, min_size=(900, 600), text_select=True,
+                          js_api=Api() if safe else None)
     webview.start(private_mode=False, storage_path=str(app_data_dir() / "webview"))
     server.should_exit = True
     thread.join(timeout=5)
