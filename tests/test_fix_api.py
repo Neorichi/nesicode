@@ -461,7 +461,8 @@ def test_apply_and_changes_never_follow_project_links():
     (cage / "pwn").unlink()
     (cage / "pwn").write_text("replaced through apply\n")  # what the agent's bash would do in its cage
     r = a.post(f"/api/threads/{t['id']}/apply")
-    assert r.status_code == 200 and r.json()["added"] == ["pwn"]
+    # (reported as added, or as modified where manifests also record the link the cage started with)
+    assert r.status_code == 200 and "pwn" in r.json()["added"] + r.json()["modified"]
     assert (bws / "secret.py").read_text() == "victim\n"
     assert not (aws / "pwn").is_symlink() and (aws / "pwn").read_text() == "replaced through apply\n"
     # a linked FOLDER in the project: the diff never shows the other side, and nothing is applied
