@@ -452,15 +452,20 @@ def test_bot_cron_parser_and_schedule():
         interval_seconds("1")  # below the 5-minute minimum
 
 
-def test_bot_fetch_blocks_local_network():
+def test_bot_fetch_blocks_local_network(monkeypatch):
+    import socket
+
     import httpx
 
+    from nesicode.server import bots as botmod
     from nesicode.server.bots import check_public_url, page_text, safe_fetch
 
     for url in ("http://127.0.0.1:47821/api/projects", "http://localhost/", "http://192.168.1.1/", "http://169.254.169.254/",
                 "file:///etc/passwd", "http://[::1]/"):
         with pytest.raises(ToolError):
             check_public_url(url)
+    # every hop is vetted (and pinned) even with a custom transport: the fake host resolves to a public address
+    monkeypatch.setattr(botmod, "_getaddrinfo", lambda host, port: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.215.14", port))])
     hops = []
 
     def handler(req):
