@@ -86,6 +86,13 @@ def apply_rollout(before: Path, after: Path, target: Path) -> dict:
     d = diff_workspaces(before, after, max_chars=0)
     root = os.path.realpath(target)
     done: dict = {"added": [], "removed": [], "modified": [], "conflicts": []}
+    if not target.is_dir():
+        # The project's folder is not there now (a disk that is not connected, a folder moved or renamed): nothing can
+        # be written and nothing counts as applied — every change could not be written, so the run's copies are kept
+        # for another «Aplicar» (without this, every path looked like it left the project: 'unsafe', copies dropped).
+        done["conflicts"] = [{"path": rel, "reason": ERROR, "side_file": None}
+                             for rel in d["removed"] + d["added"] + d["modified"]]
+        return done
 
     def conflict(rel: str, reason: str, side: bool = True) -> None:
         side_file = None

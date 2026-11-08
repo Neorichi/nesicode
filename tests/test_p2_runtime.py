@@ -735,7 +735,17 @@ def test_aplicar_never_overwrites_later_edits_nor_writes_through_a_link(env, tmp
     assert reasons == {"app.py": ("changed", "app.py.nesicode-new"), "notas.md": ("changed", None),
                        "enlace/evil.txt": ("unsafe", None), "fuera": ("unsafe", None)}
     assert json.loads(e.run(rid)["result"])["applied"] == changes
-    # everything is in the project now (or beside it): the run's copies are gone, what the UI shows stays
+    # (review) enlace/evil.txt is nowhere in the project — its folder is a link there now — so the run's copies stay
+    # for another «Aplicar» instead of losing that file
+    assert (rd / "source").is_dir() and ws.is_dir()
+    os.unlink(proj / "enlace")  # the user removes that link: «Aplicar» again puts the file in a real folder
+    again = e.jobs.apply_later(rid, p)
+    assert "enlace/evil.txt" in again["added"] and (proj / "enlace" / "evil.txt").read_text() == "pwned\n"
+    assert {c["path"]: c["reason"] for c in again["conflicts"]} == {"app.py": "changed", "notas.md": "changed",
+                                                                     "fuera": "unsafe"}
+    assert not list(outside.iterdir()) and not os.path.lexists(proj / "fuera")
+    # everything is in the project now (or beside it; a link out of it is refused whatever happens): the run's copies
+    # are gone, what the UI shows stays
     assert not (rd / "source").exists() and not ws.exists() and (rd / "rollouts/agg1/trajectory.txt").exists()
     with pytest.raises(FileNotFoundError) as gone:
         e.jobs.apply_later(rid, p)
@@ -863,6 +873,88 @@ def test_auto_apply_is_three_way_and_drops_the_copies(env, monkeypatch, tmp_path
     rd = run_dir(p, rid)
     assert not (rd / "source").exists() and not list(rd.glob("rollouts/*/ws"))  # applied: no copy is kept
     assert list(rd.glob("rollouts/*/trajectory.txt"))
+
+
+# ---------------------------------------------------------------------- (review) the project's folder is not there
+def _folder_project(e: Env, folder: Path) -> dict:
+    """A project that lives in a folder of the user's (e.g. on an external disk)."""
+    p = e.project()
+    e.db.execute("UPDATE projects SET folder=? WHERE id=?", (str(folder), p["id"]))
+    return e.db.one("SELECT * FROM projects WHERE id=?", (p["id"],))
+
+
+@POSIX
+def test_aplicar_while_the_project_folder_is_not_there_keeps_the_result(env, tmp_path):
+    """The folder is not there when «Aplicar» runs (a disk that is not connected, a folder moved): nothing is written,
+    every change comes back as not written, and the run's copies stay until it is back — they used to be deleted (every
+    path looked like it left the project: 'unsafe'), and the result was lost for good."""
+    e = env()
+    disk = tmp_path / "disco"
+    folder = disk / "proyecto"
+    _tree(folder, {"app.py": "v1\n", "viejo.md": "viejo\n"})
+    p = _folder_project(e, folder)
+    rid, rd, ws = _harness_run(e, p)
+    _tree(ws, {"app.py": "v2\n", "nuevo.md": "nuevo\n"})
+    os.unlink(ws / "viejo.md")
+    disk.rename(tmp_path / "desconectado")
+    changes = e.jobs.apply_later(rid, p)
+    assert not changes["added"] and not changes["modified"] and not changes["removed"]
+    assert sorted((c["path"], c["reason"], c["side_file"]) for c in changes["conflicts"]) == \
+        [("app.py", "error", None), ("nuevo.md", "error", None), ("viejo.md", "error", None)]
+    assert (rd / "source").is_dir() and ws.is_dir() and not disk.exists()  # kept; nothing made in the folder's place
+    (tmp_path / "desconectado").rename(disk)  # connected again
+    again = e.jobs.apply_later(rid, p)
+    assert (again["added"], again["modified"], again["removed"], again["conflicts"]) == (["nuevo.md"], ["app.py"], ["viejo.md"], [])
+    assert (folder / "app.py").read_text() == "v2\n" and not (folder / "viejo.md").exists()
+    assert not (rd / "source").exists() and not ws.exists()
+
+
+def test_auto_apply_while_the_project_folder_is_not_there_keeps_the_result(env, monkeypatch, tmp_path):
+    from nesicode.harnessing.engine import HarnessingRun
+
+    disk = tmp_path / "disco"
+    real = HarnessingRun.run
+
+    def run_then_unplug(self):
+        result = real(self)
+        disk.rename(tmp_path / "desconectado")  # the disk goes away while the run finishes
+        return result
+
+    monkeypatch.setattr(HarnessingRun, "run", run_then_unplug)
+    e = env()
+    folder = disk / "proyecto"
+    _tree(folder, {"app.py": "print(1)\n"})
+    p = _folder_project(e, folder)
+    rid = _harnessing(e, p, apply_changes=True, adopt_harness=False)
+    run = e.wait(rid, timeout=60)
+    assert run["status"] == "done", e.events(rid)
+    applied = json.loads(run["result"])["applied"]
+    assert applied["conflicts"] and {c["reason"] for c in applied["conflicts"]} == {"error"} and not applied["added"]
+    rd = run_dir(p, rid)
+    assert (rd / "source").is_dir() and list(rd.glob("rollouts/*/ws"))  # kept for «Aplicar»
+    (tmp_path / "desconectado").rename(disk)
+    assert "NESICODE_RESULT.md" in e.jobs.apply_later(rid, p)["added"] and (folder / "NESICODE_RESULT.md").is_file()
+
+
+def test_an_applied_run_shows_done_only_once_its_copies_are_gone(env, monkeypatch):
+    """Once a run is 'done', «Aplicar» is offered: its copies must not be half deleted under an «Aplicar» then (a file
+    missing from the copy of the result looks like the result deleted it). An applied run drops them before."""
+    e = env()
+    p = e.project()
+    (project_ws(p) / "app.py").write_text("print(1)\n")
+    seen, real = [], Jobs._finish
+
+    def finish(self, run_id, status, **kw):
+        if status == "done":
+            rd = run_dir(p, run_id)
+            seen.append((rd / "source").exists() or bool(list(rd.glob("rollouts/*/ws"))))
+        return real(self, run_id, status, **kw)
+
+    monkeypatch.setattr(Jobs, "_finish", finish)
+    rid = _harnessing(e, p, apply_changes=True, adopt_harness=False)
+    assert e.wait(rid, timeout=60)["status"] == "done", e.events(rid)
+    assert json.loads(e.run(rid)["result"])["applied"]["added"] == ["NESICODE_RESULT.md"]
+    assert seen == [False]
 
 
 def test_harnessing_sizes_the_improver_with_its_own_output_limit(env, monkeypatch):

@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import threading
 import time
 import traceback
@@ -628,16 +629,29 @@ def _drop_copies(rd: Path) -> None:
 def _fully_applied(rd: Path, selected: str, applied: dict | None) -> bool:
     """After an apply: is everything of the result in the project now — applied, already there, kept beside the user's
     file as a conflict's side file, or a removal the user's later edit overrides? Then its copies are no longer worth
-    their disk. A change that could not be written (or whose side file could not) keeps them, for another «Aplicar»."""
+    their disk. A change that could not be written (or whose side file could not) keeps them, for another «Aplicar»:
+    also a file of the result refused as 'unsafe' (its path goes through a link in the project now), whose content is
+    nowhere in the project. (A link of the result that points out of the project is refused whatever happens: it does
+    not keep them.)"""
     if not isinstance(applied, dict) or not applied:
         return False
+    ws = rd / "rollouts" / str(selected) / "ws"
     for c in applied.get("conflicts") or []:
-        if c.get("reason") == "error":
+        reason, p = c.get("reason"), ws / str(c.get("path", ""))
+        if reason == "error":
             return False
-        written = os.path.lexists(rd / "rollouts" / str(selected) / "ws" / str(c.get("path", "")))
-        if c.get("reason") in ("changed", "exists") and written and not c.get("side_file"):
+        if reason in ("changed", "exists") and os.path.lexists(p) and not c.get("side_file"):
+            return False
+        if reason == "unsafe" and _regular_file(p):
             return False
     return True
+
+
+def _regular_file(p: Path) -> bool:
+    try:
+        return stat.S_ISREG(os.lstat(p).st_mode)
+    except OSError:
+        return False
 
 
 def _fresh_archive(db: DB, ws: Workspace, run: dict, thread_id: int) -> None:
@@ -1678,17 +1692,22 @@ class Jobs:
             for label, ro in hr.rollouts.items():
                 if label != selected and ro.ws_path:
                     remove_tree(ro.ws_path)
+            if applied_all:
+                # applied: nothing is left to apply, no copy of the project is worth its disk. Dropped BEFORE the run
+                # shows 'done': from then on «Aplicar» is offered, and it must never read copies half deleted (a file
+                # missing from the copy of the result would look like the result deleted it)
+                _drop_copies(rd)
             emit({"type": "done", "status": "done", "usage": result["usage"]})
             sel = result["rollouts"].get(selected, {})
             self._finish(run_id, "done", job=job, result=json.dumps(result, ensure_ascii=False),
                          final_text=sel.get("final_text", ""))
             done = True
         finally:
-            # cancelled or failed: nothing can be applied later; applied: nothing is left to apply. Either way no copy of
-            # the project is worth its disk any more (the trajectories, diffs and checks the UI shows stay).
-            if not done or applied_all:
+            # cancelled or failed: nothing can be applied later, so no copy of the project is worth its disk any more
+            # (the trajectories, diffs and checks the UI shows stay)
+            if not done:
                 _drop_copies(rd)
-            if done:
+            else:
                 self._prune_copies(project)
 
     def _adopt(self, project_id: int, base_version: int, adopted: dict, run_id: int, label: str) -> tuple[int | None, str, bool]:
