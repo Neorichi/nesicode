@@ -43,7 +43,8 @@ TRIM_NOTE = "\n\n... [evidence trimmed to fit the model's context window] ...\n\
 TAG_RX = re.compile(
     r'<file path="([^"]+)">|<delete path="([^"]+)"\s*/>|<(notes|think|thinking|analysis)>|</(think|thinking)>'
 )
-REASONING_RX = re.compile(r"<(think|thinking|analysis)>.*?(?:</\1>|\Z)", re.S)
+REASONING_RX = re.compile(r"<(think|thinking|analysis)>.*?</\1>", re.S)  # closed blocks, anywhere
+LEADING_REASONING_RX = re.compile(r"\s*<(think|thinking|analysis)>")  # one that opens the reply may be cut
 CHOICE_RX = re.compile(r"<choice>\s*([A-Z])\s*</choice>")
 TRIGGER_RX = re.compile(r"load (?:the )?`([a-z0-9][a-z0-9_-]{0,47})` skill")
 LABEL_PATH_RX = re.compile(r"(rollouts[\\/]+)(?:base|inv|dom|agg|c)\d+")
@@ -154,8 +155,14 @@ def _after_orphan_close(text: str) -> str:
 
 
 def strip_reasoning(text: str) -> str:
-    """The answer part of a reply: no inline reasoning blocks (a <choice> drafted there is not the choice)."""
-    return REASONING_RX.sub("", _after_orphan_close(text))
+    """The answer part of a reply: no inline reasoning blocks (a <choice> drafted there is not the choice).
+    As in scan_reply, a reasoning block that opens the reply and never closes holds no answer, while an opener
+    quoted mid-reply that never closes ("B's answer starts with <think>") is text: it must not erase the rest."""
+    text = _after_orphan_close(text)
+    lead = LEADING_REASONING_RX.match(text)
+    if lead and f"</{lead.group(1)}>" not in text[lead.end():]:
+        return ""
+    return REASONING_RX.sub("", text)
 
 
 def scan_reply(reply: str) -> Reply:

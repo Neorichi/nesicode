@@ -719,3 +719,21 @@ def test_blind_never_rewrites_ordinary_text_for_a_relative_run_dir(tmp_path, mon
     ws = (tmp_path / "r/rollouts/base1/ws").resolve()
     out = hr._blind(f"error: result was wrong ({ws}/t.py, rollouts/agg1/ws/t.py)")
     assert out == "error: result was wrong (<workspace>/t.py, rollouts/<candidate>/ws/t.py)"
+
+
+def test_an_unclosed_tag_quoted_mid_reply_does_not_erase_the_choice_or_the_lesson(tmp_path, monkeypatch):
+    sel = ("<reasoning>B's final answer starts with <think> and never closes it.</reasoning>\n<choice>B</choice>")
+    use_improver(monkeypatch, lambda role, prompt, o: sel)
+    hr = make_run(tmp_path)
+    hr.rollouts = {l: engine.Rollout(l, status="done", delivered=True) for l in ("base1", "agg1")}
+    order = ["base1", "agg1"]
+    random.Random(hr.seed).shuffle(order)
+    chosen, reason = hr._select(["base1", "agg1"])
+    assert chosen == order[1] and "never closes it" in reason  # the selector's own pick, not the fallback
+    ref = ("<edits>\nobserved: base1 answered with an unclosed <analysis> tag\n</edits>\n"
+           "<experience>\ncue: c\nlesson: l\nevidence: e\n</experience>")
+    use_improver(monkeypatch, lambda role, prompt, o: ref)
+    out = make_run(tmp_path)._reflect("base1")
+    assert "unclosed <analysis> tag" in out["edits"] and out["experience"]["lesson"] == "l"
+    # a reasoning block that opens the reply and never closes is still no answer
+    assert engine.strip_reasoning("<think>\nmaybe <choice>A</choice>") == ""
