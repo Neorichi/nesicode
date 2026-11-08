@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -29,7 +30,7 @@ CREATE TABLE IF NOT EXISTS user_keys (
     PRIMARY KEY (user_id, provider)
 );
 CREATE TABLE IF NOT EXISTS projects (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     domain TEXT NOT NULL DEFAULT 'general',
@@ -52,14 +53,14 @@ CREATE TABLE IF NOT EXISTS harness_versions (
     UNIQUE (project_id, version)
 );
 CREATE TABLE IF NOT EXISTS threads (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS runs (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     thread_id INTEGER REFERENCES threads(id) ON DELETE CASCADE,
     kind TEXT NOT NULL,
@@ -136,7 +137,7 @@ CREATE TABLE IF NOT EXISTS telegram_links (
     created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS bots (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
@@ -156,7 +157,7 @@ CREATE TABLE IF NOT EXISTS bots (
     updated_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS bot_triggers (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     bot_id INTEGER NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
     kind TEXT NOT NULL,
     spec TEXT NOT NULL DEFAULT '',
@@ -235,6 +236,97 @@ MIGRATIONS = [
 ]
 
 
+# Ids that leave the app (URLs, live streams, jobs in memory, Telegram anchors, webhook secrets 'bot:<id>:webhook')
+# must never be handed out twice: without AUTOINCREMENT SQLite gives a new row the highest free id, so deleting the
+# newest conversation/run/project/bot let the next one take its id and receive what was meant for the deleted one.
+AUTOINC_TABLES = ("projects", "threads", "runs", "bots", "bot_triggers")
+# Columns (with no foreign key) that may still name a deleted row: a migrated table's sequence starts above them too.
+_DANGLING = {
+    "projects": ("SELECT MAX(active_project) FROM telegram_links", "SELECT MAX(project_id) FROM lessons"),
+    "threads": ("SELECT MAX(active_thread) FROM telegram_links", "SELECT MAX(thread_id) FROM bots"),
+    "runs": ("SELECT MAX(run_id) FROM harness_versions", "SELECT MAX(run_id) FROM lessons"),
+    "bots": ("SELECT MAX(bot_id) FROM runs", "SELECT MAX(bot_id) FROM threads",
+             "SELECT MAX(CAST(substr(ref, 5, instr(substr(ref, 5), ':') - 1) AS INTEGER)) FROM vault_secrets "
+             "WHERE ref LIKE 'bot:%:%'"),
+}
+_HEAD = re.compile(r'^\s*CREATE\s+TABLE\s+(?:"\w+"|`\w+`|\[\w+\]|\w+)\s*\(', re.I)
+_PK = re.compile(r"\bid\s+INTEGER\s+PRIMARY\s+KEY\b(?!\s+AUTOINCREMENT)", re.I)
+
+
+def _autoinc_sql(table: str, sql: str) -> str | None:
+    """The CREATE TABLE of `table` (as stored, with every column added since) for a copy named _autoinc_<table> whose
+    id is AUTOINCREMENT — None when the statement is not the expected shape (then the table is left alone)."""
+    if not _HEAD.match(sql) or len(_PK.findall(sql)) != 1:
+        return None
+    return _PK.sub("id INTEGER PRIMARY KEY AUTOINCREMENT", _HEAD.sub(f'CREATE TABLE "_autoinc_{table}" (', sql, 1), 1)
+
+
+def _rebuild_autoinc(conn: sqlite3.Connection, table: str, new_sql: str) -> None:
+    """SQLite's documented table rebuild (inside the caller's transaction, foreign keys off): new table, copy, drop,
+    rename, then the table's own indexes and triggers again (telegram.py's telegram_unanchor_* among them)."""
+    extra = [r[0] for r in conn.execute(
+        "SELECT sql FROM sqlite_master WHERE tbl_name=? AND type IN ('index', 'trigger') AND sql IS NOT NULL", (table,))]
+    cols = ", ".join(f'"{r[1]}"' for r in conn.execute(f'PRAGMA table_info("{table}")'))
+    conn.execute(new_sql)
+    conn.execute(f'INSERT INTO "_autoinc_{table}" ({cols}) SELECT {cols} FROM "{table}"')
+    conn.execute(f'DROP TABLE "{table}"')
+    conn.execute(f'ALTER TABLE "_autoinc_{table}" RENAME TO "{table}"')
+    for sql in extra:
+        conn.execute(sql)
+    floor = [conn.execute(f'SELECT MAX(id) FROM "{table}"').fetchone()[0]]
+    for q in _DANGLING.get(table, ()):
+        try:
+            floor.append(conn.execute(q).fetchone()[0])
+        except sqlite3.Error:  # a table or column of a much older database: nothing to protect there
+            pass
+    top = max((int(v) for v in floor if isinstance(v, int)), default=0)
+    if not conn.execute("UPDATE sqlite_sequence SET seq=MAX(seq, ?) WHERE name=?", (top, table)).rowcount:
+        conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)", (table, top))
+
+
+def migrate_autoincrement(conn: sqlite3.Connection, path: Path | None) -> list[str]:
+    """Give AUTOINCREMENT ids to the AUTOINC_TABLES of a database created before it (idempotent: a database that has
+    it — every new one — is not touched). One transaction for all the tables: a failure leaves the file as it was.
+    The first time, the file is copied to <db>.pre-autoinc.bak. Returns the tables migrated."""
+
+    def todo() -> dict[str, str]:
+        out = {}
+        for t in AUTOINC_TABLES:
+            row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone()
+            if row and row[0] and not re.search(r"\bAUTOINCREMENT\b", row[0], re.I) and (new := _autoinc_sql(t, row[0])):
+                out[t] = new
+        return out
+
+    if not todo():
+        return []
+    if path is not None and str(path) != ":memory:":
+        bak = Path(f"{path}.pre-autoinc.bak")
+        if not bak.exists():
+            dst = sqlite3.connect(bak)
+            try:
+                conn.backup(dst)  # a consistent copy, WAL included (a plain file copy could miss recent writes)
+            finally:
+                dst.close()
+    before = {tuple(r) for r in conn.execute("PRAGMA foreign_key_check")}
+    conn.execute("PRAGMA foreign_keys=OFF")  # (a no-op inside a transaction: set before BEGIN)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            tables = todo()  # again under the write lock: another process may have just done it
+            for table, new_sql in tables.items():
+                _rebuild_autoinc(conn, table, new_sql)
+            broken = {tuple(r) for r in conn.execute("PRAGMA foreign_key_check")} - before
+            if broken:
+                raise sqlite3.IntegrityError(f"the rebuild would break foreign keys: {list(broken)[:5]}")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+    return list(tables)
+
+
 class DB:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -249,6 +341,11 @@ class DB:
                 cols = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
                 if column not in cols:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            try:
+                if done := migrate_autoincrement(self.conn, path):
+                    print(f"nesicode: ids are never reused now in {', '.join(done)} (backup: {path}.pre-autoinc.bak)")
+            except Exception as exc:  # never keep the app from starting: it works as before, and retries next time
+                print("nesicode: could not migrate the database to AUTOINCREMENT ids (retried at the next start):", exc)
 
     def execute(self, sql: str, params: tuple | dict = ()) -> sqlite3.Cursor:
         with self.lock:

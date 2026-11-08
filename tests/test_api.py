@@ -1037,6 +1037,8 @@ def test_reused_thread_id_is_never_a_bot(alice, project):
     old_tid = b["thread_id"]
     db.execute("DELETE FROM threads WHERE id=?", (old_tid,))  # what the old delete did (bot left pointing at it)
     other = alice.post("/api/projects", json={"name": "Test2", "executor_model": "mock/demo", "improver_model": "mock/demo"}).json()
+    # ids are AUTOINCREMENT now; emulate a database its migration could not convert, where SQLite reuses the id
+    db.execute("DELETE FROM sqlite_sequence WHERE name='threads'")
     t = alice.post(f"/api/projects/{other['id']}/threads", json={}).json()
     assert t["id"] == old_tid  # SQLite really reuses it
     assert alice.get(f"/api/threads/{t['id']}").json()["thread"]["bot"] is None

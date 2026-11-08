@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Callable
 
 from ..agent import Agent, Workspace, copy_workspace, diff_workspaces, trajectory_text
+from ..agent.workspace import copy_files_into
 from ..harness import Harness, diff_summary, inventory, normalize, skills, unified_diff, validate
 from ..harness.profiles import marker_problems
 from ..llm import DEFAULT_LIMITS, LLMError, ModelOptions, Usage, get_provider, known_limits
@@ -662,9 +663,9 @@ class HarnessingRun:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         try:
             copy_workspace(self.source_ws, self.snapshot)
-            for src, rel in self.extra_files:
-                if Path(src).is_dir():
-                    shutil.copytree(src, self.snapshot / rel, dirs_exist_ok=True)
+            for src, rel in self.extra_files:  # e.g. the attachments in a conversation's cage, which its agent controls:
+                if Path(src).is_dir():  # files and links only, never followed (a FIFO there would hang a plain copy)
+                    copy_files_into(Path(src), self.snapshot, rel)
             k = self.cfg.k
             self.emit({"type": "phase", "phase": "base"})
             base_labels = [f"base{i}" for i in range(1, k + 1)]

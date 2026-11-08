@@ -70,6 +70,11 @@ class Env:
     def run(self, rid) -> dict:
         return self.db.one("SELECT * FROM runs WHERE id=?", (rid,))
 
+    def reuse_ids(self) -> None:
+        """Ids are AUTOINCREMENT now (never reused); emulate a database the migration could not convert, where SQLite
+        hands out the highest free id again, to test the jobs' own guard against reused ids."""
+        self.db.execute("DELETE FROM sqlite_sequence")
+
     def events(self, rid) -> list[dict]:
         return [e for _, e in self.db.events_after(rid, 0, limit=5000)]
 
@@ -143,7 +148,7 @@ class _BotsStub:
     def agent_tools(self, bot, run_id):
         return {}
 
-    def system_section(self, bot, trigger=""):
+    def system_section(self, bot, trigger="", run_id=None):
         return "You are a bot."
 
 
@@ -204,6 +209,7 @@ def test_stale_job_never_runs_a_reused_run_id(env, models, workers):
         b = e.post(fast, x, "B")
         assert e.run(b["id"])["status"] == "queued"
         e.delete_thread(fast, x)  # the user deletes that conversation and writes in a new one: SQLite reuses B's id
+        e.reuse_ids()
         c = e.post(fast, e.thread(fast), "C")
         assert c["id"] == b["id"]
         gate.release.set()
@@ -227,6 +233,7 @@ def test_stuck_job_of_a_deleted_conversation_never_writes_into_the_new_run(env, 
         old = e.post(slow, x, "se queda colgado")
         gate.wait_entered()  # running, inside a call that does not honour Stop
         e.delete_thread(slow, x)
+        e.reuse_ids()
         c = e.post(fast, e.thread(fast), "nuevo")
         assert c["id"] == old["id"]
         assert e.wait(c["id"])["status"] == "done"
@@ -528,6 +535,7 @@ def test_a_new_conversation_never_inherits_a_deleted_ones_archive(env):
     stale.parent.mkdir(parents=True, exist_ok=True)
     stale.write_text("el servidor de staging es 10.0.0.7 y la clave del cliente ACME es hunter2\n")
     e.delete_thread(p, t1)  # the shared folder keeps that conversation's archive
+    e.reuse_ids()
     t2 = e.thread(p)
     assert t2["id"] == t1["id"]
     e.wait(e.post(p, t2, "hola")["id"])
@@ -607,16 +615,19 @@ class _FakeManager:
     def __init__(self, text="ok", delay=0.0):
         self.text, self.delay, self.calls = text, delay, []
 
-    def call(self, user_id, cfg, tool, args, timeout=180):
+    def call(self, user_id, cfg, tool, args, timeout=180, cancel=None):
         from nesicode.connectors import McpResult
 
         self.calls.append((cfg.name, tool, args))
         time.sleep(self.delay)
         return McpResult(self.text, [], False)
 
-    def tools(self, user_id, cfg, timeout=120):
+    def tools(self, user_id, cfg, timeout=120, cancel=None):
         time.sleep(self.delay)
         return []
+
+    def tools_many(self, user_id, cfgs, timeout=90, cancel=None):
+        return [self.tools(user_id, c, timeout) for c in cfgs]
 
 
 def test_remote_connectors_get_their_arguments_as_written(tmp_path, monkeypatch):
@@ -669,7 +680,7 @@ class _FakeHub:
     def connected(self, user_id):
         return True
 
-    def call(self, user_id, cmd, args, timeout=45):
+    def call(self, user_id, cmd, args, timeout=45, cancel=None):
         self.sent.append((cmd, dict(args)))
         time.sleep(self.delay)
         tab = args.get("tab_id", self.default)
@@ -954,6 +965,7 @@ def test_a_job_stuck_in_a_deleted_conversation_never_blocks_a_new_one(env, model
             gate.release.set()
             assert e.jobs.pool.join(10)
             assert not e.jobs._jobs and not e.jobs.cancels  # the dead job let go of everything
+        e.reuse_ids()
         y = e.thread(fast)
         assert y["id"] == x["id"]
         new = e.post(fast, y, "hola de nuevo")

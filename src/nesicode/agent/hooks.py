@@ -24,6 +24,20 @@ def _applies(rule: dict, tool: str) -> bool:
     return t == "*" or t == tool or (isinstance(t, list) and tool in t)
 
 
+def truncate(output: str, limit: int) -> str:
+    """`output` cut to at most `limit` chars (limit >= 1), marker included: its head and its tail, with the number of
+    chars removed between them. A limit too small for the marker keeps just the first `limit` chars. Never longer
+    than the original."""
+    if len(output) <= limit:
+        return output
+    room = limit - len(f"\n... [{len(output)} chars trimmed by hook] ...\n")  # (the real count has no more digits)
+    if room < 2:
+        return output[:limit]
+    head, tail = (room + 1) // 2, room // 2
+    return (output[:head] + f"\n... [{len(output) - head - tail} chars trimmed by hook] ...\n"
+            + output[len(output) - tail:])
+
+
 def _strings(value, out: list[str], limit: int = 200) -> list[str]:
     """Every string inside the (JSON-like) arguments."""
     if len(out) >= limit:
@@ -83,13 +97,7 @@ class Hooks:
                     limit = max(1, int(rule.get("max_chars") or 20000))
                 except (TypeError, ValueError):
                     limit = 20000
-                if len(output) > limit:
-                    half = max(1, limit // 2)  # output[-0:] would be the whole string
-                    output = (
-                        output[:half]
-                        + f"\n... [{len(output) - 2 * half} chars trimmed by hook] ...\n"
-                        + output[-half:]
-                    )
+                output = truncate(output, limit)
         return output
 
     def finish(self, tool: str, output: str, warnings: list[str]) -> str:

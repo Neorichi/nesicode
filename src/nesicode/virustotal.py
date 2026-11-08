@@ -290,16 +290,19 @@ def vt_scan_file(args, ws, cfg):
     p = ws.resolve(rel)
     if not p.is_file():
         raise ToolError(f"no existe el archivo {rel}")
-    size = p.stat().st_size
+    if p.stat().st_size > MAX_UPLOAD:
+        raise ToolError("archivo demasiado grande (máx. 32 MB con la API estándar)")
+    # read once, through the workspace: never a link swapped in meanwhile, never a FIFO (its read would never end)
+    data = ws.read_bytes(p, MAX_UPLOAD + 1)
+    size = len(data)
     if size > MAX_UPLOAD:
         raise ToolError("archivo demasiado grande (máx. 32 MB con la API estándar)")
-    sha = hashlib.sha256(p.read_bytes()).hexdigest()
+    sha = hashlib.sha256(data).hexdigest()
     known = _req(cfg, "GET", f"/files/{sha}")
     if known:  # already known: no need to upload anything
         text, _ = vt_file_report({"hash": sha}, ws, cfg)
         return "Already known to VirusTotal (not uploaded again).\n" + text, None
-    with p.open("rb") as fh:
-        aid = _submitted_id(_req(cfg, "POST", "/files", files={"file": (p.name, fh)}))
+    aid = _submitted_id(_req(cfg, "POST", "/files", files={"file": (p.name, data)}))
     a, why = _wait_analysis(cfg, ws, aid, timeout=150)
     report = f"{GUI}/file/{sha}"
     lines = [f"Uploaded {rel} ({size} bytes) to VirusTotal", f"SHA-256 {sha}"]

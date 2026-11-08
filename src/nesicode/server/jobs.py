@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import atexit
 import base64
+import functools
 import json
+import os
 import re
 import secrets
 import shutil
@@ -16,15 +18,25 @@ from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
 
-from ..agent import Agent, Workspace, apply_changes, copy_workspace
+from ..agent import Agent, Workspace, copy_workspace
 from ..agent.workspace import ATTACHMENTS_DIR, ToolError
 from ..config import settings
 from ..harness import normalize, validate
-from ..harnessing import HarnessingConfig, HarnessingRun
+from ..harnessing import HarnessingConfig, HarnessingRun, apply_rollout
+from ..harnessing.engine import remove_tree
 from .auth import user_keys
 from .db import DB, loads
 
 FINAL = {"done", "error", "cancelled", "interrupted", "max_steps", "refusal"}
+
+
+class ProjectBusy(RuntimeError):
+    """The project's folder is in use by another conversation (a shared one holds its lock for its whole run): what
+    serves an HTTP request answers this at once (the API turns it into a 409) instead of hanging until it ends."""
+
+
+BUSY = "El proyecto está ocupado por otra conversación; inténtalo cuando termine."
+LOCK_TRY = 2.0  # seconds an «Aplicar» waits for the project's lock before answering ProjectBusy
 
 
 # Three isolation layers on disk, each nested in the previous one:
@@ -177,9 +189,10 @@ def browser_tools(user_id: int) -> dict:
             injected = a.get("tab_id") is None and last["tab"] is not None and name not in ("chrome_tabs", "chrome_open")
             if injected:
                 a["tab_id"] = last["tab"]
-            try:
-                res = _interruptible(getattr(agent, "cancel", None),
-                                     lambda: hub.call(user_id, name.removeprefix("chrome_"), a, timeout=60))
+            cancel = getattr(agent, "cancel", None)
+            try:  # Stop abandons the wait and cancels the command (the outer wait also covers a call stuck elsewhere)
+                res = _interruptible(cancel, lambda: hub.call(user_id, name.removeprefix("chrome_"), a, timeout=60,
+                                                              cancel=cancel))
             except _Stopped:
                 raise
             except Exception as exc:
@@ -198,9 +211,7 @@ def browser_tools(user_id: int) -> dict:
             if name == "chrome_screenshot" and res.get("image"):
                 data = base64.b64decode(res.pop("image").split(",", 1)[-1])
                 rel = f".chrome/screenshot-{int(time.time() * 1000)}.jpg"
-                target = agent.ws.resolve(rel)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(data)
+                agent.ws.write_bytes(agent.ws.resolve(rel), data)  # never through a link, never into a FIFO
                 agent.emit({"type": "image", "path": rel, "caption": res.get("title", "Chrome")})
                 res["saved_to"] = rel
             return _connector_output(agent, name, _browser_json(res))
@@ -210,8 +221,9 @@ def browser_tools(user_id: int) -> dict:
     return {name: (spec, make(name)) for name, spec in TOOLS.items()}
 
 
-def builtin_agent_tools(connector: str, label: str, which: str, cfg=None) -> dict:
-    """Built-in connectors (Office, Burp REST) run in-process on the conversation's own workspace."""
+def builtin_agent_tools(connector: str, label: str, which: str, cfg=None, alive=None) -> dict:
+    """Built-in connectors (Office, Burp REST) run in-process on the conversation's own workspace.
+    `alive()` -> '' while the connector may be used, else why not (the user turned it off or removed it meanwhile)."""
     from ..connectors import builtin_module, tool_name
     from ..llm import ToolSpec
 
@@ -225,6 +237,8 @@ def builtin_agent_tools(connector: str, label: str, which: str, cfg=None) -> dic
 
     def make(fn):
         def call(args: dict, agent) -> str:
+            if alive is not None and (why := alive()):
+                raise ToolError(f"{label}: {why}")
             go = (lambda: fn(args or {}, agent.ws, cfg)) if takes_cfg else (lambda: fn(args or {}, agent.ws))
             text, written = _interruptible(getattr(agent, "cancel", None), go) if remote else go()
             if written:
@@ -404,16 +418,21 @@ def absolutize_paths(args: dict, ws) -> dict:
     return out
 
 
-def _mcp_caller(user_id: int, cfg, tool: str):
+def _mcp_caller(user_id: int, cfg, tool: str, alive=None):
+    """An MCP tool as an agent tool. `alive()` -> '' while the connector may be used, else why not."""
+
     def call(args: dict, agent) -> str:
         from ..connectors import manager
 
+        if alive is not None and (why := alive()):
+            raise ToolError(f"{cfg.name}: {why}")
         if cfg.kind == "stdio":
             # a local server shares this computer's files; a remote one (GitHub…) gets the arguments as written:
             # its `path` is a path in a repository, and a local absolute path would only leak the user's home folder
             args = absolutize_paths(args, agent.ws)
-        try:
-            res = _interruptible(getattr(agent, "cancel", None), lambda: manager().call(user_id, cfg, tool, args))
+        cancel = getattr(agent, "cancel", None)
+        try:  # Stop cancels the MCP request itself, not only our wait for it
+            res = _interruptible(cancel, lambda: manager().call(user_id, cfg, tool, args, cancel=cancel))
         except _Stopped:
             raise
         except Exception as exc:
@@ -422,9 +441,7 @@ def _mcp_caller(user_id: int, cfg, tool: str):
         for i, (data, mime) in enumerate(res.images[:4]):  # screenshots etc. land in the cage and in the chat
             ext = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}.get(mime, "png")
             rel = f".mcp/{cfg.name}-{int(time.time() * 1000)}-{i}.{ext}"
-            target = agent.ws.resolve(rel)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
+            agent.ws.write_bytes(agent.ws.resolve(rel), data)  # never through a link, never into a FIFO
             agent.emit({"type": "image", "path": rel, "caption": f"{cfg.name} · {tool}"})
             text += f"\n[image saved to {rel}]"
         if res.is_error:
@@ -462,6 +479,8 @@ def _interruptible(cancel: threading.Event | None, fn):
         if cancel.is_set():
             raise _Stopped("stopped by the user")
     if "error" in box:
+        if cancel.is_set():  # a call that honours Stop itself ended because of it: the same answer either way
+            raise _Stopped("stopped by the user") from box["error"]
         raise box["error"]
     return box["value"]
 
@@ -517,6 +536,7 @@ def needs_improvement(res, max_steps: int, prefs: dict) -> str:
     return ""
 
 
+MCP_START_TIMEOUT = 90  # s a message waits for its MCP servers to start (all at once; a hung one is then skipped a while)
 EXEC_MODES = ("auto", "ask_bash", "ask_all")
 APPROVAL_TIMEOUT = 30 * 60
 WRITE_TOOLS = {"write_file", "edit_file", "generate_image"}
@@ -582,26 +602,50 @@ def _version_files(db: DB, project_id: int, version: int) -> dict:
     return loads(row["files"], {}) if row else {}
 
 
-KEEP_HARNESS_COPIES = 3  # finished harnessing runs per project whose workspace copies stay for «Aplicar» later
+KEEP_HARNESS_COPIES = 3  # finished, not yet applied harnessing runs per project whose copies stay for «Aplicar» later
+GONE = ("Ya no se puede aplicar: las copias del proyecto de esta ejecución ya no existen (sus cambios ya se aplicaron, "
+        "o se borraron para liberar espacio: solo se guardan las de las últimas ejecuciones sin aplicar).")
+
+
+def _has_copies(rd: Path) -> bool:
+    return not rd.is_symlink() and (rd / "source").is_dir()
 
 
 def _drop_copies(rd: Path) -> None:
-    """Delete a harnessing run's workspace copies (its snapshot and every rollout's workspace, which hold a whole copy
-    of the project each); trajectories, diffs and checks — what the UI shows — stay."""
+    """Delete a harnessing run's workspace copies (its snapshot, every rollout's workspace — a whole copy of the project
+    each — and their private HOMEs with tool caches); trajectories, diffs and checks — what the UI shows — stay."""
     if rd.is_symlink():
         return
-    shutil.rmtree(rd / "source", ignore_errors=True)
+    remove_tree(rd / "source")
     rollouts = rd / "rollouts"
     if rollouts.is_dir() and not rollouts.is_symlink():
         for d in rollouts.iterdir():
-            if (d / "ws").is_dir() and not d.is_symlink():
-                shutil.rmtree(d / "ws", ignore_errors=True)
+            if d.is_dir() and not d.is_symlink():
+                remove_tree(d / "ws")
+                remove_tree(d / ".ws.home")
+
+
+def _fully_applied(rd: Path, selected: str, applied: dict | None) -> bool:
+    """After an apply: is everything of the result in the project now — applied, already there, kept beside the user's
+    file as a conflict's side file, or a removal the user's later edit overrides? Then its copies are no longer worth
+    their disk. A change that could not be written (or whose side file could not) keeps them, for another «Aplicar»."""
+    if not isinstance(applied, dict) or not applied:
+        return False
+    for c in applied.get("conflicts") or []:
+        if c.get("reason") == "error":
+            return False
+        written = os.path.lexists(rd / "rollouts" / str(selected) / "ws" / str(c.get("path", "")))
+        if c.get("reason") in ("changed", "exists") and written and not c.get("side_file"):
+            return False
+    return True
 
 
 def _fresh_archive(db: DB, ws: Workspace, run: dict, thread_id: int) -> None:
-    """Thread ids are reused after a delete (SQLite), and in a shared project folder a deleted conversation's archive
-    (.nesicode/chats/<id>) stays behind. Before a conversation's first turn that does any work, an archive found
-    there is therefore someone else's: remove it, so search_history never serves a deleted conversation."""
+    """In a shared project folder a deleted conversation's archive (.nesicode/chats/<id>) stays behind, and thread ids
+    were reused after a delete before they became AUTOINCREMENT (db.migrate_autoincrement; an archive from back then, or
+    a database the migration could not convert, can still meet a new conversation with its id). Before a conversation's
+    first turn that does any work, an archive found there is therefore someone else's: remove it, so search_history
+    never serves a deleted conversation."""
     if db.one("SELECT 1 FROM runs r WHERE r.thread_id=? AND r.id<>? AND EXISTS (SELECT 1 FROM events e WHERE e.run_id=r.id) "
               "LIMIT 1", (thread_id, run["id"])):
         return
@@ -634,9 +678,10 @@ class Live:
 class _Job:
     """One submission of a run to the pool.
 
-    Run ids are reused after a delete (SQLite gives a new row the highest free id) and a run can be put back in its
-    queue, so whatever a job does — starting the run, emitting events, waiting for an approval, finishing — first checks
-    that this job still owns the run (Jobs._owns). A stale job does nothing."""
+    A run can be put back in its queue, and in a database still without AUTOINCREMENT ids (db.migrate_autoincrement could
+    not convert it) a deleted run's id is given to the next one, so whatever a job does — starting the run, emitting
+    events, waiting for an approval, finishing — first checks that this job still owns the run (Jobs._owns). A stale
+    job does nothing."""
 
     def __init__(self, run_id: int, kind: str, thread_id: int | None = None):
         self.run_id = run_id
@@ -866,10 +911,15 @@ class Jobs:
             event = dict(event)
             persist = event.pop("_persist", True)
             if persist:
-                self.db.add_event(run_id, event)
-                if event.get("type") in ("assistant", "done", "error"):
+                kind = event.get("type")
+                # The streamed deltas end here: the final text is in this event, or (a retry of a reply that had
+                # started streaming) they belong to a failed attempt that a reconnecting client must not see again.
+                # Cleared BEFORE the event is stored: a stream never reads the event together with the old deltas.
+                if kind in ("assistant", "done", "error") or (kind == "llm_retry" and event.get("partial")
+                                                              and not event.get("depth")):
                     live.gen += 1
                     live.items = []
+                self.db.add_event(run_id, event)
             else:
                 live.items.append(event)
 
@@ -924,10 +974,14 @@ class Jobs:
             if status == "cancelled" and self._closing:
                 status = "interrupted"  # stopped because the app is closing, not by the user
             sets = ["status=?", "finished_at=?"] + [f"{k}=?" for k in fields]
+            now = time.time()
             self.db.execute(
                 f"UPDATE runs SET {', '.join(sets)} WHERE id=?",
-                (status, time.time(), *fields.values(), run_id),
+                (status, now, *fields.values(), run_id),
             )
+            # however it ended (an answer, Stop, a crash in _safe, deleted meanwhile…): its conversation changed, so a
+            # chat list that is not open (it watches updated_at) sees it
+            self.db.execute("UPDATE threads SET updated_at=? WHERE id=(SELECT thread_id FROM runs WHERE id=?)", (now, run_id))
             if job is not None:
                 self._forget(job)
             else:  # finished by hand (no job of its own): drop whatever is registered under the id
@@ -1195,11 +1249,17 @@ class Jobs:
                         "explicitly ask for them by name: " + ", ".join(sorted(set(info["on_request"]))) + ". Do the task with "
                         "your other tools. If one of them would clearly help, say so at the end and suggest the user ask for it "
                         "(e.g. 'use Burp to …'); never pretend you used it.")
+            if info["skipped"]:
+                note += ("\n\n" if note else "") + ("# Connectors that could not start\nThese connectors are switched on but "
+                         "did not start for this message, so their tools are missing: " + "; ".join(info["skipped"]) +
+                         ". Never pretend you used them. If the task needs one, do what you can without it and tell the user "
+                         "it was unavailable and why (they can press «Probar» on it in Integraciones to retry now).")
             steps, system_base = project["max_steps"], None
             if bot and self.bots:
                 tools.update(self.bots.agent_tools(bot, run_id))
                 steps = min(steps, bot["max_steps"])
-                system_base = harness.get("system_prompt.md", "").strip() + "\n\n" + self.bots.system_section(bot, run.get("trigger") or "")
+                system_base = (harness.get("system_prompt.md", "").strip() + "\n\n"
+                               + self.bots.system_section(bot, run.get("trigger") or "", run_id=run_id))
             agent = Agent(
                 model=model,
                 harness=harness,
@@ -1229,11 +1289,10 @@ class Jobs:
                 self._auto_improve(run, project, thread, res, emit)
         except Exception as exc:  # never break the chat because of the auto-improver
             emit({"type": "auto_harness_error", "text": f"{type(exc).__name__}: {exc}"})
-        self._finish(
+        self._finish(  # (it also marks the conversation as updated)
             run_id, res.status, job=job, final_text=res.final_text, error=res.error,
             result=json.dumps({"usage": res.usage.to_dict(), "steps": res.steps}),
         )
-        db.execute("UPDATE threads SET updated_at=? WHERE id=?", (time.time(), run["thread_id"]))
 
     # ----------------------------------------------------------- connectors
     def chat_tools(self, project: dict, emit) -> dict:
@@ -1289,7 +1348,10 @@ class Jobs:
 
         `context` (the user's recent words): connectors in 'mention' mode are only offered when named there;
         the others are listed in info['on_request'] so the agent can suggest them. info['ask'] collects the
-        tool names that need the user's OK on every use. context=None → everything (connector tests, etc.).
+        tool names that need the user's OK on every use; info['skipped'] says which offered connectors could not
+        start and why (the agent is told). context=None → everything (connector tests, etc.).
+        The offered MCP servers start all at once; one that hung at startup recently is skipped at once (see
+        McpManager.tools_many), so a hung server costs one timeout per few minutes, not one per message.
         `cancel`: the run's Stop — starting a slow connector (up to 90 s) does not delay it."""
         from ..connectors import catalog_entry, manager, mentioned, tool_name
         from ..llm import ToolSpec
@@ -1298,6 +1360,7 @@ class Jobs:
         info = info if info is not None else {}
         info.setdefault("on_request", [])
         info.setdefault("ask", set())
+        info.setdefault("skipped", [])
         out: dict = {}
         browser = browser_tools(user_id)
         usage = (loads((self.db.one("SELECT settings FROM users WHERE id=?", (user_id,)) or {}).get("settings"), {}) or {}).get("browser_usage", "mention")
@@ -1309,6 +1372,7 @@ class Jobs:
             else:
                 info["on_request"].append("the user's own Chrome (Nesicode extension)")
         own_chrome = bool(browser)
+        offered = []
         for row, cfg in connector_configs(self.db, user_id, enabled_only=True):
             if own_chrome and row["template"] == "chrome":
                 continue  # the user's own Chrome is connected: don't offer a second, separate Chrome
@@ -1317,27 +1381,51 @@ class Jobs:
                                                                           template=row["template"]):
                 info["on_request"].append(row["label"])
                 continue
-            before = set(out)
-            if cfg.kind == "builtin":
-                out.update(builtin_agent_tools(row["name"], row["label"], cfg.command, cfg))
-                if mode == "ask":
-                    info["ask"].update(set(out) - before)
-                continue
+            offered.append((row, cfg, mode))
+        mcp = [cfg for _, cfg, _ in offered if cfg.kind != "builtin"]
+        started: list = []
+        if mcp:
             try:
-                tools = _interruptible(cancel, lambda cfg=cfg: manager().tools(user_id, cfg, timeout=90))
-            except _Stopped:
-                break  # Stop: the run ends right away, no point starting the remaining connectors
-            except Exception as exc:
-                emit({"type": "connector_error", "connector": row["label"], "text": str(exc)[:300]})
-                continue
-            hint = (catalog_entry(row["template"]) or {}).get("hint", "")
-            for tool in tools:
-                name = tool_name(row["name"], tool.name)
-                desc = f"[{row['label']}] {tool.description}".strip()[:1600] + (f" ({hint})" if hint else "")
-                out[name] = (ToolSpec(name, desc, tool.schema), _mcp_caller(user_id, cfg, tool.name))
+                started = _interruptible(cancel, lambda: manager().tools_many(user_id, mcp, timeout=MCP_START_TIMEOUT,
+                                                                              cancel=cancel))
+            except Exception as exc:  # Stop (the run ends right away) or the manager itself failed
+                if cancel is not None and cancel.is_set():
+                    mcp = []
+                started = [exc] * len(mcp)
+        results = iter(started)
+        for row, cfg, mode in offered:  # in the user's order (the tool list stays stable between messages)
+            before = set(out)
+            alive = functools.partial(self._connector_off, user_id, row["name"])
+            if cfg.kind == "builtin":
+                out.update(builtin_agent_tools(row["name"], row["label"], cfg.command, cfg, alive=alive))
+            else:
+                tools = next(results, None)
+                if tools is None:
+                    continue  # stopped before it started
+                if isinstance(tools, BaseException):
+                    why = str(tools)[:300]
+                    emit({"type": "connector_error", "connector": row["label"], "text": why})
+                    info["skipped"].append(f"{row['label']} ({why.splitlines()[0][:200] if why else type(tools).__name__})")
+                    continue
+                hint = (catalog_entry(row["template"]) or {}).get("hint", "")
+                for tool in tools:
+                    name = tool_name(row["name"], tool.name)
+                    desc = f"[{row['label']}] {tool.description}".strip()[:1600] + (f" ({hint})" if hint else "")
+                    out[name] = (ToolSpec(name, desc, tool.schema), _mcp_caller(user_id, cfg, tool.name, alive=alive))
             if mode == "ask":
                 info["ask"].update(set(out) - before)
         return out
+
+    def _connector_off(self, user_id: int, name: str) -> str:
+        """'' while the user's connector `name` is switched on, else why it can't be used any more. Checked on every
+        call: a connector turned off or removed mid-conversation stops working at once, not at the next message."""
+        row = self.db.one("SELECT enabled FROM user_connectors WHERE user_id=? AND name=?", (user_id, name))
+        if row is None:
+            return "the user removed this connector from Nesicode during this conversation: it can no longer be used"
+        if not row["enabled"]:
+            return ("the user turned this connector off in Nesicode during this conversation: it can't be used until they "
+                    "turn it on again (don't retry it)")
+        return ""
 
     # ------------------------------------------------------------ approvals
     def exec_mode(self, thread: dict, user_id: int) -> str:
@@ -1505,6 +1593,7 @@ class Jobs:
         from .limits import model_limits
 
         _lim = model_limits(db, project["user_id"], project["executor_model"])
+        _imp = model_limits(db, project["user_id"], project["improver_model"])  # its window AND its output cap
         cfg = HarnessingConfig(
             task=run["task"],
             executor_model=project["executor_model"],
@@ -1517,7 +1606,8 @@ class Jobs:
             rollout_width=settings.rollout_width,
             context_limit=_lim["context"],
             output_limit=_lim["output"],
-            improver_context=model_limits(db, project["user_id"], project["improver_model"])["context"],
+            improver_context=_imp["context"],
+            improver_output=_imp["output"],
         )
         rd = run_dir(project, run_id)
         extra = []
@@ -1538,7 +1628,7 @@ class Jobs:
             self._finish(run_id, "cancelled", job=job,
                          **({"result": json.dumps(result, ensure_ascii=False)} if result else {}))
 
-        done = False
+        done = applied_all = False
         try:
             try:
                 result = hr.run()
@@ -1561,8 +1651,9 @@ class Jobs:
                 finally:
                     lock.release()
                 emit({"type": "applied", "changes": result["applied"]})
-                if cancel.is_set():
-                    return stopped(result)
+                applied_all = _fully_applied(rd, selected, result["applied"])
+            if cancel.is_set():  # Stop pressed meanwhile (also while it waited for the project): adopt and learn nothing
+                return stopped(result if result["applied"] else None)
             result["adopted_version"] = None
             if result["harness_changed"] and params.get("adopt_harness", True):
                 v, why, merged = self._adopt(project["id"], base_version, result["adopted_harness"], run_id, selected)
@@ -1572,6 +1663,8 @@ class Jobs:
                 else:
                     result["adopt_skipped"] = why
                     emit({"type": "adopt_skipped", "label": selected, "reason": why})
+            if cancel.is_set():
+                return stopped(result)
             exp = (result.get("reflection") or {}).get("experience")
             if exp:
                 db.insert(
@@ -1581,19 +1674,21 @@ class Jobs:
                      exp["evidence"], exp.get("confidence", ""), run_id, time.time()),
                 )
                 emit({"type": "lesson", **exp})
-            # Keep only the selected rollout's workspace (for a later "apply"), drop the rest.
+            # Keep only the selected rollout's workspace (for a later "apply"), drop the rest (run() already did).
             for label, ro in hr.rollouts.items():
                 if label != selected and ro.ws_path:
-                    shutil.rmtree(ro.ws_path, ignore_errors=True)
+                    remove_tree(ro.ws_path)
             emit({"type": "done", "status": "done", "usage": result["usage"]})
             sel = result["rollouts"].get(selected, {})
             self._finish(run_id, "done", job=job, result=json.dumps(result, ensure_ascii=False),
                          final_text=sel.get("final_text", ""))
             done = True
         finally:
-            if not done:  # cancelled or failed: nothing can be applied later, so no copy of the project is worth its disk
+            # cancelled or failed: nothing can be applied later; applied: nothing is left to apply. Either way no copy of
+            # the project is worth its disk any more (the trajectories, diffs and checks the UI shows stay).
+            if not done or applied_all:
                 _drop_copies(rd)
-            else:
+            if done:
                 self._prune_copies(project)
 
     def _adopt(self, project_id: int, base_version: int, adopted: dict, run_id: int, label: str) -> tuple[int | None, str, bool]:
@@ -1636,8 +1731,8 @@ class Jobs:
                 rd = run_dir(project, r["id"])
                 if not rd.is_dir():
                     continue
-                if r["status"] == "done" and kept < KEEP_HARNESS_COPIES:
-                    kept += 1
+                if r["status"] == "done" and _has_copies(rd) and kept < KEEP_HARNESS_COPIES:
+                    kept += 1  # (an applied run has no copies left: it never takes the place of one not applied yet)
                     continue
                 _drop_copies(rd)
         finally:
@@ -1651,16 +1746,41 @@ class Jobs:
             except Exception as exc:
                 print("nesicode: could not prune harnessing copies:", exc)
 
-    def apply_later(self, run_id: int, project: dict) -> dict:
-        run = self.db.one("SELECT result FROM runs WHERE id=?", (run_id,))
-        result = loads(run["result"], {})
+    def _try_lock(self, lock: threading.Lock, cancel: threading.Event | None = None, wait: float = LOCK_TRY) -> bool:
+        """Take a project's lock for something that serves a request: at most `wait` s, in short slices (Stop or the
+        app closing end the wait). False: another conversation is working in the project (it may for long)."""
+        deadline = time.monotonic() + wait
+        while not lock.acquire(timeout=max(0.0, min(0.1, deadline - time.monotonic()))):
+            if time.monotonic() >= deadline or self._closing or (cancel is not None and cancel.is_set()):
+                return False
+        return True
+
+    def apply_later(self, run_id: int, project: dict, cancel: threading.Event | None = None) -> dict:
+        """«Aplicar» on a finished harnessing run: the chosen result's file changes go into the project, three-way — a
+        file the user changed since the run started is never overwritten or deleted (it comes back in `conflicts`, the
+        result's version beside it as <name>.nesicode-new) and nothing is written through a link (apply_rollout).
+        Then the run's copies of the project go (kept when something could not be written, for another try).
+        It serves an HTTP request, so it never waits long for a busy project: ProjectBusy after LOCK_TRY s.
+        FileNotFoundError (with a message for the user) when the copies are gone: applied already, or cleaned up."""
+        row = self.db.one("SELECT result FROM runs WHERE id=?", (run_id,))
+        result = loads(row["result"], {}) if row else {}
         selected = result.get("selected")
         rd = run_dir(project, run_id)
         after = rd / "rollouts" / str(selected) / "ws"
-        with self._project_lock(project["id"]):  # (pruning old copies takes this lock too)
-            if not selected or not after.exists() or not (rd / "source").exists():
-                raise FileNotFoundError("the selected rollout's workspace is no longer available")
-            changes = apply_changes(rd / "source", after, project_ws(project))
-        result["applied"] = changes
-        self.db.execute("UPDATE runs SET result=? WHERE id=?", (json.dumps(result, ensure_ascii=False), run_id))
+        lock = self._project_lock(project["id"])  # (pruning old copies takes it too)
+        if not self._try_lock(lock, cancel):
+            raise ProjectBusy(BUSY)
+        try:
+            if not selected or not _has_copies(rd) or after.is_symlink() or not after.is_dir():
+                raise FileNotFoundError(GONE)
+            try:
+                changes = apply_rollout(rd / "source", after, project_ws(project))
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(GONE) from exc
+            result["applied"] = changes
+            self.db.execute("UPDATE runs SET result=? WHERE id=?", (json.dumps(result, ensure_ascii=False), run_id))
+            if _fully_applied(rd, selected, changes):
+                _drop_copies(rd)
+        finally:
+            lock.release()
         return changes
