@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { api, type Profile } from '../api'
+import { api, type Profile, type Thread } from '../api'
 import { useApp, useProject } from '../App'
+import { forgetDraft } from '../drafts'
 import ProvidersSection, { RolePicker } from '../components/Providers'
 import ConnectorsSection from '../components/Connectors'
 import { t, useLang } from '../i18n'
@@ -55,7 +56,10 @@ export default function ProjectSettings() {
 
   const remove = async () => {
     if (!confirm(t('¿Eliminar "{name}" con su carpeta, harness y conversaciones? No se puede deshacer.', { name: project.name }))) return
+    // its conversations go too: forget their unsent drafts (a new conversation may get one of their ids)
+    const gone = await api.get<Thread[]>(`/api/projects/${project.id}/threads`).catch(() => [] as Thread[])
     await api.del(`/api/projects/${project.id}`)
+    gone.forEach((th) => forgetDraft(`chat:${th.id}`))
     await Promise.all([refreshProjects(), refreshThreads()])
     navigate('/')
   }

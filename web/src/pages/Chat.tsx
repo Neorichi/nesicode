@@ -6,13 +6,14 @@ import Composer, { AttachmentChip } from '../components/Composer'
 import Diff from '../components/Diff'
 import Transcript from '../components/Transcript'
 import { t, useLang } from '../i18n'
-import { compactReason, followAgainIn, mergeLoaded, withEvent, withRun } from '../logic'
+import { compactReason, followAgainIn, mergeLoaded, runKey, withEvent, withRun } from '../logic'
 
 type Ctx = { used: number; limit: number; reason?: string }
 
 // The text of a reply cut short by Stop or an error exists only in the browser (the server keeps finished replies).
-// Keep it for the rest of the session, per run, so it doesn't vanish while the user is reading it.
-const interruptedText = new Map<number, string>()
+// Keep it for the rest of the session, per run (runKey: ids of deleted runs are reused), so it doesn't vanish while
+// the user is reading it.
+const interruptedText = new Map<string, string>()
 
 // One instance per conversation (App keys it by tid): nothing here can belong to another conversation.
 export default function Chat() {
@@ -106,9 +107,10 @@ export default function Chat() {
     const after = Math.max(0, ...(run.events ?? []).map((e) => e.seq ?? 0))
     let alive = true
     let again: number | undefined
+    const key = runKey(run)
     const freeze = () => {
       if (!liveRef.current.trim()) return
-      interruptedText.set(activeId, liveRef.current)
+      interruptedText.set(key, liveRef.current)
       setFrozen((n) => n + 1)
     }
     const close = streamRun(activeId, after, {
@@ -305,7 +307,7 @@ export default function Chat() {
                 events={r.events ?? []}
                 status={r.status}
                 live={r.id === activeId ? live : undefined}
-                interrupted={r.id === activeId ? undefined : interruptedText.get(r.id)}
+                interrupted={r.id === activeId ? undefined : interruptedText.get(runKey(r))}
                 runId={r.id}
               />
               {r.status !== 'running' && r.status !== 'queued' && <ImproveButton run={r} pid={Number(pid)} />}

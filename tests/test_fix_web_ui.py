@@ -318,3 +318,16 @@ def test_run_stream_resumes_after_drops_and_hidden_tabs_and_is_followed_again_af
     assert out["attempts"] == 7 and out["lost"] == ["stream-lost"]  # gives up once, with a status that isn't the run's
     assert out["afterClose"] == 1 and out["lostAfterClose"] == 1  # the caller closing it stops every retry
     assert out["follow"] == [5000, 0, 0, None, None, None]  # unreachable: try again soon; over: never
+
+
+def test_interrupted_text_never_shows_on_a_new_run_that_reuses_a_deleted_runs_id(tmp_path):
+    """Review of web-ui#11: the partial text kept for a stopped run is keyed by id AND creation time. SQLite reuses
+    the id of a deleted run (stop a reply, delete the conversation, start another one: the new reply got id 27 like
+    the stopped one and showed its text as 'interrumpida')."""
+    out = run_ts(tmp_path, """
+      const stopped = { id: 27, created_at: 1762600000.25 }
+      const reused = { id: 27, created_at: 1762600090.5 }
+      out.same = L.runKey(stopped) === L.runKey({ ...stopped })
+      out.reused = L.runKey(stopped) === L.runKey(reused)
+    """)
+    assert out == {"same": True, "reused": False}

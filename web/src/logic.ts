@@ -79,6 +79,13 @@ export function followAgainIn(runs: { id: number; status: string }[] | null, run
   return runs.some((r) => r.id === runId && (r.status === 'queued' || r.status === 'running')) ? 0 : null
 }
 
+/**
+ * Key for what the page keeps about a run for the session (its interrupted text): the id alone is not enough, since
+ * SQLite gives a new run the id of a deleted one (delete a conversation, start another), and the new reply must
+ * never show the old one's text.
+ */
+export const runKey = (r: { id: number; created_at: number }) => `${r.id}:${r.created_at}`
+
 /** Was the text of a stopped/failed reply saved by the server after all (so the local copy can go)? */
 export function interruptedSaved(events: RunEvent[], text: string): boolean {
   const head = text.trim().slice(0, 200)
