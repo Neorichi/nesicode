@@ -29,9 +29,13 @@ from .base import LLMError
 
 CANCELLED = "cancelled by the user"
 CONNECT_TIMEOUT = 15.0
-DEFAULT_ATTEMPTS = 5
+# Long autonomous runs must outlive a short provider incident (seen live: ~2 minutes of bad replies from nesi3's
+# endpoint): 8 attempts with this backoff wait ~3 minutes in all, and no new attempt starts after RETRY_BUDGET seconds
+# (slow failures — a first byte that never comes — stop after a few 300-s tries instead of 8).
+DEFAULT_ATTEMPTS = 8
 BACKOFF_BASE = 2.0  # seconds before the 2nd attempt; doubles each time (±25% jitter), capped
-BACKOFF_CAP = 30.0
+BACKOFF_CAP = 60.0
+RETRY_BUDGET = 900.0
 RETRY_AFTER_CAP = 60.0  # never wait longer than this before one retry, whatever Retry-After says
 RETRY_AFTER_GIVE_UP = 300.0  # a provider asking for a longer wait (quota exhausted) is not retried
 RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529}
@@ -114,6 +118,7 @@ def with_retries(attempt: Callable[[int], Any], *, label: str, cancel=None, noti
     total = max(1, int(attempts or DEFAULT_ATTEMPTS))
     last = Retryable("no attempt was made")
     n = 0
+    start = time.monotonic()
     for n in range(1, total + 1):
         if cancel is not None and cancel.is_set():
             raise LLMError(CANCELLED)
@@ -126,6 +131,8 @@ def with_retries(attempt: Callable[[int], Any], *, label: str, cancel=None, noti
         if last.retry_after is not None and last.retry_after > RETRY_AFTER_GIVE_UP:
             raise LLMError(f"{label} request failed: {last.reason} (the provider asks to wait {last.retry_after:.0f} s)")
         wait = backoff(n, last.retry_after)
+        if time.monotonic() - start + wait > RETRY_BUDGET:
+            break  # slow failures: the time budget, not the attempt count, ends them
         notify_safely(notify, {"type": "llm_retry", "attempt": n + 1, "max": total, "wait": round(wait, 1),
                                "reason": last.reason[:300], "partial": last.partial})
         wait_or_cancel(cancel, wait)

@@ -1114,8 +1114,14 @@ class Agent:
                         self._add_user(conv, note)
                         conv = self._after_step(conv, provider, model, system, options, turn, [])
                         continue
-                    msg = (f"La respuesta del modelo se cortó en el límite de salida ({options.max_tokens:,} tokens) "
-                           f"{self._continuations + 1} veces seguidas.")
+                    out, cap = turn.usage.output_tokens, options.max_tokens or 0
+                    if out and out * 4 < cap:  # stopped far below the cap: not the model running out of room
+                        msg = (f"El proveedor cortó la respuesta del modelo {self._continuations + 1} veces seguidas "
+                               f"(finish_reason=length) tras solo {out:,} tokens de {cap:,} permitidos: fallo temporal "
+                               "del servidor o un límite de salida menor en el proveedor. Escribe «continúa» para reintentar.")
+                    else:
+                        msg = (f"La respuesta del modelo se cortó en el límite de salida ({cap:,} tokens) "
+                               f"{self._continuations + 1} veces seguidas.")
                     self.emit({"type": "error", "text": msg})
                     return AgentResult(final_text, "error", steps, usage, self.events, error=msg)
                 if turn.text:

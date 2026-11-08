@@ -45,6 +45,7 @@ MAX_BODY = 64 * 1024 * 1024
 STOP = {"stop": "end_turn", "tool_calls": "tool_use", "function_call": "tool_use", "length": "max_tokens",
         "model_context_window_exceeded": "max_tokens", "content_filter": "refusal"}
 REASONING_KEYS = ("reasoning_content", "reasoning")  # the names servers give the reasoning of a reply
+PREMATURE_TOKENS = 64  # a 'length' stop below this many output tokens, when thousands were allowed, is a provider hiccup
 # A 400/422 that refuses a field we sent without naming it (pydantic, JSON-schema and protobuf wordings)
 _FIELD_REFUSED = re.compile(r"extra (?:inputs?|fields?|keys?|properties)|not permitted|unrecogni[sz]ed|additional propert|"
                             r"unknown (?:field|name|parameter|key|argument|variant)|unexpected (?:field|key|property|keyword)|"
@@ -268,12 +269,16 @@ class OpenAICompatProvider(Provider):
                 req = self._prepare(body)
                 try:
                     if self.stream:
-                        return self._stream(req, cancel, on_event)
-                    return self._post_once("/chat/completions", req, cancel, timeouts), False
+                        reply = self._stream(req, cancel, on_event)
+                    else:
+                        reply = self._post_once("/chat/completions", req, cancel, timeouts), False
                 except _Status as exc:
                     if not self._adapt(exc, req):
                         raise exc.error(self.name) from None
                     last = exc
+                    continue
+                _premature_cut(reply[0], req, streamed=reply[1])
+                return reply
             raise last.error(self.name)  # type: ignore[union-attr]
 
         return with_retries(attempt, label=self.name, cancel=cancel, notify=getattr(options, "notify", None),
@@ -501,6 +506,36 @@ class _Timeout(Retryable):
 
 class _Incomplete(Exception):
     """The reply stream ended before it was complete (no finish_reason and no [DONE])."""
+
+
+def _premature_cut(data: dict, req: dict, streamed: bool) -> None:
+    """finish_reason 'length' after (almost) nothing although thousands of tokens were allowed is not the output limit
+    but a provider hiccup — seen live behind LiteLLM: for about two minutes every reply stopped as 'length' after 1-5
+    tokens. Raise Retryable so the request goes again after a backoff instead of being taken for a cut reply (the loop
+    would 'continue' it four times and give up with a misleading message). Both the reported usage and what actually
+    came back must be tiny: a server that leaves reasoning out of completion_tokens is not mistaken for a hiccup."""
+    limit = req.get("max_tokens") or req.get("max_completion_tokens")
+    try:
+        choice = data["choices"][0]
+    except (KeyError, IndexError, TypeError):
+        return
+    if not isinstance(choice, dict) or choice.get("finish_reason") != "length" or not isinstance(limit, int) \
+            or limit < 1024:
+        return
+    msg = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    chars = len(_text(msg.get("content")))
+    for k in REASONING_KEYS:
+        if isinstance(msg.get(k), str):
+            chars += len(msg[k])
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        if isinstance(fn, dict):
+            chars += len(str(fn.get("name") or "")) + len(str(fn.get("arguments") or ""))
+    u = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    out = max(_int(u.get("completion_tokens")), chars // 4)
+    if out < PREMATURE_TOKENS:
+        raise Retryable(f"the reply stopped as 'length' after {out} tokens although {limit} were allowed (a provider "
+                        "hiccup, not the output limit)", partial=streamed and chars > 0)
 
 
 def _check_status(resp: httpx.Response, call: Call, name: str) -> None:
