@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, type Project } from '../api'
 import { t, useLang } from '../i18n'
+import { previewSections, type ImportPreview } from '../logic'
 import { downloadFile } from './ImageViewer'
 
 type Summary = {
   providers: string[]; connectors: string[]; settings: string[]; project_template: string | null; telegram: boolean
-  role_models?: Record<string, string>; projects_updated?: string[]
+  role_models?: Record<string, string>; projects_updated?: string[]; bots?: string[]; bots_created?: string[]; notes?: string[]
+  skipped?: string[]
 }
 
 const ROLE_LABEL: Record<string, string> = {
@@ -18,6 +20,8 @@ function describe(s: Summary): string {
   if (roles.length) parts.push(`${t('modelos por función')} (${roles.map(([k, v]) => `${t(ROLE_LABEL[k] ?? k)}: ${v}`).join(', ')})`)
   if (s.projects_updated?.length) parts.push(`${t('aplicados a')} ${s.projects_updated.join(', ')}`)
   if (s.project_template) parts.push(`${t('plantilla de proyecto')} «${s.project_template}»`)
+  const bots = s.bots_created?.length ? s.bots_created : s.bots ?? [] // (an import creates them once there is a project)
+  if (bots.length) parts.push(t('bots: {names}', { names: bots.join(', ') }))
   if (s.telegram) parts.push(t('bot de Telegram'))
   return parts.join(' · ')
 }
@@ -78,46 +82,142 @@ export function ConfigExport({ projects }: { projects: Project[] }) {
   )
 }
 
-/** Import a .nesicode file (from another computer). Calls onDone after a successful import. */
+/** What the file brought that needs a look: notes (switched off, kept stricter, keys dropped…) and what was left out. */
+function Warnings({ notes, skipped }: { notes?: string[]; skipped?: string[] }) {
+  return (
+    <>
+      {!!notes?.length && (
+        <div className="small">
+          <b>{t('Ten en cuenta:')}</b>
+          <ul className="warn-list">{notes.map((n, i) => <li key={i}>{n}</li>)}</ul>
+        </div>
+      )}
+      {!!skipped?.length && (
+        <div className="small">
+          <b>{t('No se importará:')}</b>
+          <ul className="warn-list">{skipped.map((n, i) => <li key={i}>{n}</li>)}</ul>
+        </div>
+      )}
+    </>
+  )
+}
+
+/** The confirm step: everything the file would import here (where providers point, what connectors run…). */
+export function ImportPreviewView({ p }: { p: ImportPreview }) {
+  const sections = previewSections(p)
+  return (
+    <>
+      {sections.length === 0 && <div className="muted small">{t('El archivo no trae nada que importar.')}</div>}
+      {sections.map((sec) => (
+        <div key={sec.title}>
+          <h5>{sec.title}</h5>
+          <ul>
+            {sec.items.map((it, i) => (
+              <li key={i} className={it.warn ? 'warn' : undefined}>
+                <b>{it.label}</b>
+                {it.code && <> <code>{it.code}</code></>}
+                {it.note && <span className="muted"> · {it.note}</span>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
+      <Warnings notes={p.notes} skipped={p.skipped} />
+    </>
+  )
+}
+
+/**
+ * Import a .nesicode file (from another computer). Whoever made the file chose its contents, so nothing is applied
+ * before the user has seen it: «Revisar» asks the server for a preview (form field preview=1, nothing is written)
+ * and «Importar» applies it. Calls onDone after a successful import.
+ */
 export function ConfigImport({ onDone, compact }: { onDone?: (s: Summary) => void; compact?: boolean }) {
   useLang()
   const fileRef = useRef<HTMLInputElement>(null)
   const [file, setFile] = useState<File | null>(null)
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
-  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null)
+  const [preview, setPreview] = useState<ImportPreview | null>(null)
+  const [msg, setMsg] = useState<{ ok: boolean; text: string; notes?: string[]; skipped?: string[] } | null>(null)
 
-  const run = async () => {
-    if (!file) return
+  const send = async (dry: boolean) => {
+    const fd = new FormData()
+    fd.append('file', file!)
+    fd.append('password', password)
+    if (dry) fd.append('preview', '1')
+    return api.post<{ preview?: ImportPreview; imported?: Summary }>('/api/config/import', fd)
+  }
+  const imported = (s: Summary) => {
+    setPreview(null)
+    setPassword('')
+    setMsg({ ok: true, text: `${t('Importado')}: ${describe(s)}`, notes: s.notes, skipped: s.skipped })
+    onDone?.(s)
+  }
+  const review = async () => {
+    if (!file || !password) return
     setBusy(true)
     setMsg(null)
+    setPreview(null)
     try {
-      const fd = new FormData()
-      fd.append('file', file)
-      fd.append('password', password)
-      const r = await api.post<{ imported: Summary }>('/api/config/import', fd)
-      setMsg({ ok: true, text: `${t('Importado')}: ${describe(r.imported)}` })
-      setPassword('')
-      onDone?.(r.imported)
+      const r = await send(true)
+      if (r.preview) setPreview(r.preview)
+      else if (r.imported) imported(r.imported) // a server without the preview step imported it already: say what it did
     } catch (e) {
       setMsg({ ok: false, text: (e as Error).message })
     } finally {
       setBusy(false)
     }
   }
+  const confirmImport = async () => {
+    if (!file || !preview) return
+    setBusy(true)
+    setMsg(null)
+    try {
+      const r = await send(false)
+      if (r.imported) imported(r.imported)
+    } catch (e) {
+      setMsg({ ok: false, text: (e as Error).message })
+    } finally {
+      setBusy(false)
+    }
+  }
+  // another file or password: whatever was previewed is no longer what would be imported
+  const reset = () => {
+    setPreview(null)
+    setMsg(null)
+  }
 
   return (
     <div className="stack">
       <input ref={fileRef} type="file" accept=".nesicode,application/json,application/octet-stream" hidden
-        onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
+        onChange={(e) => { setFile(e.target.files?.[0] ?? null); reset(); e.target.value = '' }} />
       <div className="row wrap">
-        <button type="button" className="btn" onClick={() => fileRef.current?.click()}>{file ? file.name : t('Elegir archivo .nesicode…')}</button>
-        <input type="password" placeholder={t('Contraseña del archivo')} value={password} onChange={(e) => setPassword(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); run() } }} />
-        <button type="button" className="btn primary" disabled={busy || !file || !password} onClick={run}>{busy ? t('Importando…') : t('Importar')}</button>
+        <button type="button" className="btn" disabled={busy} onClick={() => fileRef.current?.click()}>{file ? file.name : t('Elegir archivo .nesicode…')}</button>
+        <input type="password" placeholder={t('Contraseña del archivo')} value={password} onChange={(e) => { setPassword(e.target.value); if (preview) reset() }}
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); if (!preview) review() } }} />
+        {!preview && (
+          <button type="button" className="btn primary" disabled={busy || !file || !password} onClick={review}>{busy ? t('Leyendo…') : t('Revisar')}</button>
+        )}
       </div>
-      {!compact && <p className="muted small">{t('Los proveedores y conectores con el mismo nombre se sobrescriben; el resto se conserva. Las keys se vuelven a guardar en la bóveda cifrada de este equipo. Los modelos por función se aplican a tus proyectos y a los nuevos.')}</p>}
-      {msg && <div className={msg.ok ? 'ok-box' : 'error-box'}>{msg.text}</div>}
+      {!compact && !preview && <p className="muted small">{t('Antes de importar verás lo que trae el archivo. Los proveedores y conectores con el mismo nombre se sobrescriben; el resto se conserva. Las keys se vuelven a guardar en la bóveda cifrada de este equipo. Los modelos por función se aplican a tus proyectos y a los nuevos.')}</p>}
+      {preview && (
+        <div className="import-preview">
+          <b>{t('Esto es lo que se importará desde «{file}»:', { file: file?.name ?? '' })}</b>
+          <ImportPreviewView p={preview} />
+          <div className="muted small">{t('Lo que tenga el mismo nombre aquí se sobrescribe; el resto se conserva.')}</div>
+          <div className="row wrap">
+            <button type="button" className="btn primary" disabled={busy} onClick={confirmImport}>{busy ? t('Importando…') : t('Importar')}</button>
+            <button type="button" className="btn ghost" disabled={busy} onClick={reset}>{t('Cancelar')}</button>
+          </div>
+        </div>
+      )}
+      {msg && (
+        <div className={msg.ok ? 'ok-box' : 'error-box'}>
+          {msg.text}
+          <Warnings notes={msg.notes} skipped={msg.skipped} />
+        </div>
+      )}
     </div>
   )
 }

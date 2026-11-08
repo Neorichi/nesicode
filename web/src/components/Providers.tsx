@@ -127,16 +127,27 @@ export function RolePicker({
   )
 }
 
-const limitsCache = new Map<string, { context: number; output: number | null; source: string }>()
+type Limits = { context: number; output: number | null; source: string }
+const limitsCache = new Map<string, Limits>()
+// every ModelLimits showing a spec (Chat and Mejora may use the same model) hears when its limits change
+const limitsListeners = new Set<(spec: string, l: Limits) => void>()
 
 function ModelLimits({ spec }: { spec: string }) {
   const [l, setL] = useState(limitsCache.get(spec) ?? null)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  useEffect(() => {
+    const hear = (s: string, v: Limits) => s === spec && setL(v)
+    limitsListeners.add(hear)
+    return () => void limitsListeners.delete(hear)
+  }, [spec])
   useEffect(() => {
     let alive = true
+    setErr('')
     if (limitsCache.has(spec)) return setL(limitsCache.get(spec)!)
     const id = setTimeout(async () => {
       try {
-        const r = await api.get<{ context: number; output: number | null; source: string }>(`/api/models/limits?spec=${encodeURIComponent(spec)}`)
+        const r = await api.get<Limits>(`/api/models/limits?spec=${encodeURIComponent(spec)}`)
         limitsCache.set(spec, r)
         if (alive) setL(r)
       } catch {
@@ -149,11 +160,39 @@ function ModelLimits({ spec }: { spec: string }) {
     }
   }, [spec])
   if (!l) return null
+  // A limit the model itself reported (its server rejected a bigger request) is kept until the user forgets it, e.g.
+  // after the server got a bigger window: then the provider's / known value applies again.
+  const forget = async () => {
+    setBusy(true)
+    setErr('')
+    try {
+      const url = `/api/models/limits?spec=${encodeURIComponent(spec)}`
+      let r = await api.del<Limits>(url)
+      if (typeof r?.context !== 'number') r = await api.get<Limits>(url)
+      limitsCache.set(spec, r)
+      limitsListeners.forEach((fn) => fn(spec, r))
+    } catch (e) {
+      setErr((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
   const k = (n: number) => (n >= 1_000_000 ? `${n / 1_000_000}M` : `${Math.round(n / 1000)}k`)
-  const src = l.source === 'provider' ? t('según el proveedor') : l.source === 'learned' ? t('medido') : l.source === 'table' ? t('valor conocido') : t('estimado')
+  const learned = l.source === 'learned'
+  const src = l.source === 'provider' ? t('según el proveedor') : learned ? t('aprendido') : l.source === 'table' ? t('valor conocido') : t('estimado')
   return (
-    <div className="muted small">
-      {t('Contexto')}: <b>{k(l.context)}</b> {t('tokens')}{l.output ? ` · ${t('salida')} ${k(l.output)}` : ''} <span>({src})</span>
+    <div className="muted small limits-line">
+      <span>
+        {t('Contexto')}: <b>{k(l.context)}</b> {t('tokens')}{l.output ? ` · ${t('salida')} ${k(l.output)}` : ''}{' '}
+        <span title={learned ? t('El modelo avisó de que su contexto real es menor y Nesicode lo recuerda.') : undefined}>({src})</span>
+      </span>
+      {learned && (
+        <button type="button" className="link small" disabled={busy} onClick={forget}
+          title={t('Vuelve al valor del proveedor o de la tabla de modelos conocidos (p. ej. si su servidor ya admite más contexto).')}>
+          {busy ? '…' : t('Olvidar')}
+        </button>
+      )}
+      {err && <span className="error-text">{err}</span>}
     </div>
   )
 }

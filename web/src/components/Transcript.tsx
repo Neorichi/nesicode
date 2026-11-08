@@ -1,8 +1,8 @@
-import { useState } from 'react'
+import { Component, useState, type ReactNode } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { api, money, statusLabel, type RunEvent } from '../api'
 import { t, translateError, useLang } from '../i18n'
-import { compactReason, interruptedSaved, retryGroups, retryText } from '../logic'
+import { compactionErrorText, compactReason, interruptedSaved, retryGroups, retryText, unknownEventNote } from '../logic'
 import Markdown from './Markdown'
 import { downloadFile, showImage } from './ImageViewer'
 
@@ -62,20 +62,22 @@ function ToolBlock({ call, result }: { call: RunEvent; result?: RunEvent }) {
   const [open, setOpen] = useState(false)
   const pending = !result
   const err = result?.is_error
+  const name = String(call.name ?? '')
+  const args = call.args ?? {}
   return (
     <div className={`tool ${err ? 'tool-err' : ''}`}>
       <button className="tool-head" onClick={() => setOpen((v) => !v)}>
         <span className={`tool-dot ${pending ? 'pending' : err ? 'err' : 'ok'}`} />
-        <span className="tool-name">{TOOL_LABEL()[call.name] ?? mcpLabel(call.name) ?? call.name}</span>
-        <code className="tool-arg">{argSummary(call.name, call.args)}</code>
+        <span className="tool-name">{TOOL_LABEL()[name] ?? mcpLabel(name) ?? name}</span>
+        <code className="tool-arg">{argSummary(name, args)}</code>
         <span className="chev">{open ? '▾' : '▸'}</span>
       </button>
       {open && (
         <div className="tool-body">
-          {call.name === 'write_file' || call.name === 'edit_file' ? (
-            <pre className="code">{call.name === 'write_file' ? call.args.content : `- ${call.args.old}\n+ ${call.args.new}`}</pre>
+          {name === 'write_file' || name === 'edit_file' ? (
+            <pre className="code">{name === 'write_file' ? args.content : `- ${args.old}\n+ ${args.new}`}</pre>
           ) : (
-            call.name !== 'bash' && <pre className="code dim">{JSON.stringify(call.args, null, 2)}</pre>
+            name !== 'bash' && <pre className="code dim">{JSON.stringify(args, null, 2)}</pre>
           )}
           {result && <pre className={`code ${err ? 'err' : ''}`}>{result.output}</pre>}
         </div>
@@ -108,7 +110,7 @@ function ApprovalCard({ req, runId, decision, live }: { req: RunEvent; runId?: n
       setBusy(false)
     }
   }
-  const what = req.name === 'bash' ? String(req.args?.command ?? '') : req.name === 'write_file' || req.name === 'edit_file' ? String(req.args?.path ?? '') : JSON.stringify(req.args)
+  const what = req.name === 'bash' ? String(req.args?.command ?? '') : req.name === 'write_file' || req.name === 'edit_file' ? String(req.args?.path ?? '') : JSON.stringify(req.args ?? {})
   if (decision) {
     const ok = decision === 'allow' || decision === 'always'
     // Stop while the card was waiting: nobody answered it, so it must not read as "denied"
@@ -199,13 +201,17 @@ function FileCard({ path, size, caption }: { path: string; size?: number; captio
   )
 }
 
+/** A number from an event, or '?' when the event doesn't carry it (never "NaN"). */
+const num = (x: unknown) => (typeof x === 'number' || (typeof x === 'string' && x.trim()) ? (Number.isFinite(Number(x)) ? Number(x).toLocaleString() : '?') : '?')
+
 function Compacted({ e }: { e: RunEvent }) {
   const [open, setOpen] = useState(false)
   const why = compactReason(e.reason)
   return (
     <div className="auto-note muted">
-      🗜 {t('Contexto compactado ({u} de {l} tokens): el agente sigue con un resumen de lo hecho.', { u: Number(e.used).toLocaleString(), l: Number(e.limit).toLocaleString() })}{' '}
+      🗜 {t('Contexto compactado ({u} de {l} tokens): el agente sigue con un resumen de lo hecho.', { u: num(e.used), l: num(e.limit) })}{' '}
       {why && <span className="small">({why}) </span>}
+      {e.fallback && <span className="small">({t('resumen de respaldo: falló el resumen del modelo')}) </span>}
       {e.path && <code className="small">{e.path}</code>}{' '}
       <button className="link small" onClick={() => setOpen((v) => !v)}>{open ? t('Ocultar resumen') : t('Ver resumen')}</button>
       {open && <pre className="wrap notes">{e.summary}</pre>}
@@ -240,13 +246,94 @@ function Thinking({ text }: { text: string }) {
   )
 }
 
-/** Renders one agent run's events like a chat answer (text, tool calls, thinking). Unknown event types are skipped. */
+/** One event that can't be drawn (an odd or newer payload) becomes a short note instead of a blank chat. */
+class EventBoundary extends Component<{ type: string; children: ReactNode }, { failed: boolean }> {
+  state = { failed: false }
+  static getDerivedStateFromError() {
+    return { failed: true }
+  }
+  render() {
+    if (!this.state.failed) return this.props.children
+    return <div className="auto-note muted small">{t('No se pudo mostrar un evento ({type}).', { type: this.props.type || '?' })}</div>
+  }
+}
+
+type RowProps = { e: RunEvent; result?: RunEvent; decision?: string; retries?: number; current: boolean; runId?: number; status: string }
+
+/** One event of the run, or nothing (events drawn with another one, live-only or bookkeeping). */
+function EventRow({ e, result, decision, retries, current, runId, status }: RowProps) {
+  const sub = e.depth ? <span className="sub-tag">{e.agent}</span> : null
+  switch (e.type) {
+    case 'llm_retry': // one line per retried model call (the latest attempt); while it is still retrying it reads as live status
+      return (
+        <div className={`retry-note ${current ? 'now' : 'muted'} ${e.depth ? 'nested' : ''}`}>
+          {sub}↻ {retryText(e, retries ?? 1, current)}
+        </div>
+      )
+    case 'assistant':
+      return (
+        <div className={`answer ${e.depth ? 'nested' : ''} ${e.interrupted ? 'interrupted' : ''}`}>
+          {sub}
+          <Markdown text={e.text} />
+          {e.interrupted && <div className="muted small">{t('Respuesta interrumpida: se detuvo antes de terminar.')}</div>}
+        </div>
+      )
+    case 'tool_call':
+      return (
+        <div className={e.depth ? 'nested' : ''}>
+          {sub}
+          <ToolBlock call={e} result={result} />
+        </div>
+      )
+    case 'thinking':
+      return <Thinking text={e.text} />
+    case 'error':
+      return <div className="error-box">{translateError(e.text)}</div>
+    case 'context_learned':
+      return <div className="auto-note muted">📏 {t('El modelo indicó su límite real: {n} tokens. Guardado; compacto y sigo.', { n: num(e.limit) })}</div>
+    case 'masked':
+      return <div className="auto-note muted">🧹 {t('Contexto aligerado: {n} tokens de salidas antiguas apartados (siguen guardados en disco).', { n: num(e.freed) })}</div>
+    case 'compacted':
+      return <Compacted e={e} />
+    case 'compaction_error': // live-only today (Chat shows it as a notice); drawn the same way if a server keeps it
+      return <div className="retry-note muted">⚠ {compactionErrorText(e.text)}</div>
+    case 'notify':
+      return <div className="auto-note">📣 {e.sent ? t('Aviso enviado por Telegram') : t('Aviso')}: {e.text}</div>
+    case 'bot_created':
+      return <div className="auto-note">🤖 {t('Bot creado')}: <Link to={`/bots/${e.bot_id}`}><b>{e.name}</b></Link> — {t('gestiónalo en la página Bots')}</div>
+    case 'connector_error':
+      return <div className="auto-note muted">{t('El conector {c} no arrancó', { c: e.connector })}: {e.text}</div>
+    case 'file':
+      return <FileCard path={e.path} size={e.size} caption={e.caption} />
+    case 'image':
+      return <ChatImage path={e.path} caption={e.caption} />
+    case 'auto_harness':
+      return <AutoNote runId={e.run_id} reason={e.reason} />
+    case 'auto_harness_skipped':
+      return <div className="auto-note muted">{t('Auto-harnessing no lanzado ({reason}): {why}.', { reason: translateError(e.reason), why: translateError(e.why) })}</div>
+    case 'auto_harness_error':
+      return <div className="auto-note muted">⚠ {t('No se pudo lanzar el auto-harnessing')}: {e.text}</div>
+    case 'approval_request':
+      return <ApprovalCard req={e} runId={runId} decision={decision} live={status === 'running'} />
+    case 'cancelled':
+      return <div className="muted small">{t('Cancelado.')}</div>
+  }
+  // a type this version doesn't know (a newer server): one compact line with its own words, if it has any
+  const note = unknownEventNote(e)
+  return note ? <div className="auto-note muted small">{note}</div> : null
+}
+
+/**
+ * Renders one agent run's events like a chat answer (text, tool calls, thinking). Event types it doesn't know are a
+ * compact line (or nothing when they say nothing), and an event that fails to draw never blanks the rest.
+ */
 export default function Transcript({
   events,
   live,
   status,
   runId,
   interrupted,
+  notice,
 }: {
   events: RunEvent[]
   live?: string
@@ -254,13 +341,17 @@ export default function Transcript({
   runId?: number
   /** Text that was streaming when the reply was stopped or failed (the server doesn't keep it). */
   interrupted?: string
+  /** A live-only problem of the step in progress (the context summary failed: 'compaction_error'). */
+  notice?: string
 }) {
   useLang()
+  events = events.filter((e) => e && typeof e === 'object')
   const results = new Map<string, RunEvent>()
   for (const e of events) if (e.type === 'tool_result') results.set(`${e.depth ?? 0}:${e.id}`, e)
   const done = events.find((e) => e.type === 'done' && !e.depth)
-  const out: React.ReactNode[] = []
-  const shownImages = new Set<string>()
+  const out: ReactNode[] = []
+  const firstImage = new Map<string, number>() // the same picture is shown once
+  events.forEach((e, i) => e.type === 'image' && !firstImage.has(e.path) && firstImage.set(e.path, i))
   const decided = new Map<string, string>()
   for (const e of events) if (e.type === 'approval_result') decided.set(e.id, e.decision)
   const running = status === 'running' || status === 'queued'
@@ -275,69 +366,22 @@ export default function Transcript({
     </div>
   ) : null
   events.forEach((e, i) => {
-    const sub = e.depth ? <span className="sub-tag">{e.agent}</span> : null
     if (i === cutAt) out.push(cutNode)
-    if (e.type === 'llm_retry') {
-      // one line per retried model call (the latest attempt); while it is still retrying it reads as live status
-      const count = retries.get(i)
-      if (!count) return
-      const current = running && !live && i === events.length - 1
-      out.push(
-        <div key={i} className={`retry-note ${current ? 'now' : 'muted'} ${e.depth ? 'nested' : ''}`}>
-          {sub}↻ {retryText(e, count, current)}
-        </div>,
-      )
-    } else if (e.type === 'assistant') {
-      out.push(
-        <div key={i} className={`answer ${e.depth ? 'nested' : ''} ${e.interrupted ? 'interrupted' : ''}`}>
-          {sub}
-          <Markdown text={e.text} />
-          {e.interrupted && <div className="muted small">{t('Respuesta interrumpida: se detuvo antes de terminar.')}</div>}
-        </div>,
-      )
-    } else if (e.type === 'tool_call') {
-      out.push(
-        <div key={i} className={e.depth ? 'nested' : ''}>
-          {sub}
-          <ToolBlock call={e} result={results.get(`${e.depth ?? 0}:${e.id}`)} />
-        </div>,
-      )
-    } else if (e.type === 'thinking') {
-      out.push(<Thinking key={i} text={e.text} />)
-    } else if (e.type === 'error') {
-      out.push(<div key={i} className="error-box">{translateError(e.text)}</div>)
-    } else if (e.type === 'context_learned') {
-      out.push(<div key={i} className="auto-note muted">📏 {t('El modelo indicó su límite real: {n} tokens. Guardado; compacto y sigo.', { n: Number(e.limit).toLocaleString() })}</div>)
-    } else if (e.type === 'masked') {
-      out.push(<div key={i} className="auto-note muted">🧹 {t('Contexto aligerado: {n} tokens de salidas antiguas apartados (siguen guardados en disco).', { n: Number(e.freed).toLocaleString() })}</div>)
-    } else if (e.type === 'compacted') {
-      out.push(<Compacted key={i} e={e} />)
-    } else if (e.type === 'notify') {
-      out.push(<div key={i} className="auto-note">📣 {e.sent ? t('Aviso enviado por Telegram') : t('Aviso')}: {e.text}</div>)
-    } else if (e.type === 'bot_created') {
-      out.push(<div key={i} className="auto-note">🤖 {t('Bot creado')}: <Link to={`/bots/${e.bot_id}`}><b>{e.name}</b></Link> — {t('gestiónalo en la página Bots')}</div>)
-    } else if (e.type === 'connector_error') {
-      out.push(<div key={i} className="auto-note muted">{t('El conector {c} no arrancó', { c: e.connector })}: {e.text}</div>)
-    } else if (e.type === 'file') {
-      out.push(<FileCard key={i} path={e.path} size={e.size} caption={e.caption} />)
-    } else if (e.type === 'image') {
-      if (shownImages.has(e.path)) return
-      shownImages.add(e.path)
-      out.push(<ChatImage key={i} path={e.path} caption={e.caption} />)
-    } else if (e.type === 'auto_harness') {
-      out.push(<AutoNote key={i} runId={e.run_id} reason={e.reason} />)
-    } else if (e.type === 'approval_request') {
-      out.push(<ApprovalCard key={i} req={e} runId={runId} decision={decided.get(e.id)} live={status === 'running'} />)
-    } else if (e.type === 'auto_harness_skipped') {
-      out.push(<div key={i} className="auto-note muted">{t('Auto-harnessing no lanzado ({reason}): {why}.', { reason: translateError(e.reason), why: translateError(e.why) })}</div>)
-    } else if (e.type === 'cancelled') {
-      out.push(<div key={i} className="muted small">{t('Cancelado.')}</div>)
-    }
+    if (e.type === 'llm_retry' && !retries.get(i)) return // folded into the run's last retry
+    if (e.type === 'image' && firstImage.get(e.path) !== i) return
+    out.push(
+      <EventBoundary key={i} type={String(e.type ?? '')}>
+        <EventRow e={e} result={e.type === 'tool_call' ? results.get(`${e.depth ?? 0}:${e.id}`) : undefined}
+          decision={e.type === 'approval_request' ? decided.get(e.id) : undefined} retries={retries.get(i)}
+          current={e.type === 'llm_retry' && running && !live && i === events.length - 1} runId={runId} status={status} />
+      </EventBoundary>,
+    )
   })
   if (cut && cutAt < 0) out.push(cutNode)
   return (
     <div className="transcript">
       {out}
+      {notice && running && <div className="retry-note now">⚠ {compactionErrorText(notice)}</div>}
       {live && (
         <div className="answer streaming">
           <Markdown text={live} />

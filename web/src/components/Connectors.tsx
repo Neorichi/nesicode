@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
 import { t, useLang } from '../i18n'
+import { triggerWords } from '../logic'
 import { downloadFile } from './ImageViewer'
 import { fileManager } from '../api'
 
@@ -30,6 +31,8 @@ type Connector = {
   usage?: string
   tools: string[]
   status: string
+  /** The words that switch it on in «Solo cuando lo pida» mode (normalised: lower case, no accents). */
+  trigger_words?: string[]
 }
 type Resp = { catalog: CatalogItem[]; connectors: Connector[]; local_allowed: boolean }
 
@@ -387,6 +390,7 @@ export default function ConnectorsSection() {
                   <span className="muted small">· {t('{n} herramientas', { n: c.tools.length })}</span>
                 </div>
                 <div className="small muted clamp1">{c.kind === 'stdio' ? c.command : c.url}</div>
+                <TriggerWords c={c} />
               </div>
               <div className="row">
                 <select className="usage-select small" value={c.usage ?? 'mention'} title={t('Cuándo puede usarlo el agente')}
@@ -458,6 +462,19 @@ export default function ConnectorsSection() {
         </div>
       </div>
       {custom && <CustomForm localAllowed={data.local_allowed} onAdded={done} onCancel={() => setCustom(false)} />}
+    </div>
+  )
+}
+
+/** «Solo cuando lo pida»: which words in the user's message switch the connector on (or that none can). */
+function TriggerWords({ c }: { c: Connector }) {
+  const words = triggerWords(c)
+  if (!words) return null
+  if (!words.length)
+    return <div className="small warn">{t('Ninguna palabra lo activa: elige «Cuando le sea útil» o «Preguntarme siempre» para que el agente pueda usarlo.')}</div>
+  return (
+    <div className="small muted trigger-words" title={t('El agente solo lo usa si tu mensaje nombra una de estas palabras (sin importar mayúsculas ni tildes).')}>
+      {t('Se activa si tu mensaje dice:')} {words.map((w) => <code key={w}>{w}</code>)}
     </div>
   )
 }

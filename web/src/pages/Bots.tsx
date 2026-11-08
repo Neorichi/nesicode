@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { api, OS } from '../api'
+import { api, ApiError, OS } from '../api'
 import { useApp } from '../App'
 import { useVisibleInterval } from '../hooks'
 import { t, useLang } from '../i18n'
@@ -413,6 +413,18 @@ export function BotDetail() {
   }
   const enableHook = async () => setHook(await api.post(`/api/bots/${b.id}/webhook`))
   const disableHook = async () => { await api.del(`/api/bots/${b.id}/webhook`); setHook(null); load() }
+  // a follow-up the bot scheduled itself (bot_schedule_once) that the user doesn't want any more
+  const removeFollowUp = async (tr: Trigger) => {
+    if (!window.confirm(t('¿Quitar el seguimiento pendiente ({when})? El bot no lo hará.', { when: describeTrigger(tr) }))) return
+    setError('')
+    try {
+      await api.del(`/api/bots/${b.id}/triggers/${tr.id}`)
+    } catch (e) {
+      // 404: it already ran (a follow-up fires once and goes) or was removed elsewhere: the reload shows that
+      if (!(e instanceof ApiError && e.status === 404)) setError((e as Error).message)
+    }
+    load()
+  }
 
   return (
     <div className="page narrow">
@@ -438,7 +450,14 @@ export function BotDetail() {
           <span>{t('Próxima')}: <b>{when(b.next_at)}</b></span>
           {b.thread_id && <Link to={`/p/${b.project_id}/c/${b.thread_id}`}>{t('Ver su conversación')} →</Link>}
         </div>
-        <div className="bot-meta small">{b.triggers.length ? b.triggers.map((tr, i) => <span key={i}>⏰ {describeTrigger(tr)}</span>) : <span className="muted">{t('Sin horario: solo a mano, Telegram o webhook')}</span>}</div>
+        <div className="bot-meta small">
+          {b.triggers.length ? b.triggers.map((tr, i) => tr.kind === 'once' && tr.id ? (
+            <span key={tr.id} className="follow-up" title={tr.prompt || undefined}>
+              ⏰ {describeTrigger(tr)}
+              <button className="queued-x" title={t('Quitar este seguimiento')} aria-label={t('Quitar este seguimiento')} onClick={() => removeFollowUp(tr)}>×</button>
+            </span>
+          ) : <span key={tr.id ?? i}>⏰ {describeTrigger(tr)}</span>) : <span className="muted">{t('Sin horario: solo a mano, Telegram o webhook')}</span>}
+        </div>
         <div className="row wrap" style={{ marginTop: 10 }}>
           <input value={runText} onChange={(e) => setRunText(e.target.value)} placeholder={t('Instrucción para esta vez (opcional)')} style={{ flex: 1, minWidth: 220 }}
             onKeyDown={(e) => e.key === 'Enter' && run()} />

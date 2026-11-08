@@ -630,3 +630,20 @@ label.inline { display: flex; align-items: center; gap: 8px; flex-direction: row
 .answer.interrupted > .muted { margin-top: 4px; }
 .ctx-reason { font-size: 10.5px; color: var(--accent); }
 .threads-more { display: block; width: 100%; text-align: left; padding: 6px 10px; }
+
+/* apply results, connector trigger words, learned limits, import preview */
+.apply-report { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; padding: 9px 12px; border: 1px solid var(--line); border-left: 3px solid var(--warn); border-radius: 8px; background: var(--panel); }
+.apply-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 2px; color: var(--ink-2); }
+.apply-list code { word-break: break-all; }
+.trigger-words { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-top: 3px; }
+.trigger-words code { background: var(--code-bg); border: 1px solid var(--line); border-radius: 5px; padding: 0 5px; font-size: 11.5px; }
+.limits-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px; }
+.limits-line .link { padding: 0 2px; }
+.follow-up { display: inline-flex; align-items: center; gap: 2px; }
+.follow-up .queued-x { width: 22px; height: 22px; font-size: 16px; }
+.import-preview { display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--line); border-radius: 10px; padding: 12px; background: var(--panel); }
+.import-preview h5 { margin: 4px 0 2px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-3); }
+.import-preview ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 3px; font-size: 13px; }
+.import-preview code { word-break: break-all; }
+.warn-list { color: var(--warn); margin: 2px 0 0; padding-left: 18px; }
+.import-preview li.warn b { color: var(--warn); }

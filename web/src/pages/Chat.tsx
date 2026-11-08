@@ -2,11 +2,12 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { ACTIVE, api, isAbort, STREAM_LOST, streamRun, transcribeAudio, type Attachment, type Run, type RunEvent, type Thread } from '../api'
 import { useApp, useProject } from '../App'
+import ApplyReport from '../components/ApplyReport'
 import Composer, { AttachmentChip } from '../components/Composer'
 import Diff from '../components/Diff'
 import Transcript from '../components/Transcript'
 import { t, useLang } from '../i18n'
-import { compactReason, followAgainIn, mergeLoaded, queueStalled, runKey, withEvent, withRun } from '../logic'
+import { applySummary, compactReason, followAgainIn, mergeLoaded, queueStalled, runKey, withEvent, withRun, type ApplyResult } from '../logic'
 
 type Ctx = { used: number; limit: number; reason?: string }
 
@@ -26,6 +27,8 @@ export default function Chat() {
   const [live, setLive] = useState('')
   const liveRef = useRef('')
   const [ctxLive, setCtxLive] = useState<Ctx | null>(null)
+  // a live-only 'compaction_error' (the summarizer failed): shown until the run's next event
+  const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
   const [, setFrozen] = useState(0)
   const bottom = useRef<HTMLDivElement>(null)
@@ -109,7 +112,7 @@ export default function Chat() {
     return () => clearTimeout(id)
   }, [stalled, load])
 
-  useEffect(() => { setCtxLive(null) }, [activeId]) // a new message rebuilds the context: never show the previous run's value
+  useEffect(() => { setCtxLive(null); setNotice('') }, [activeId]) // a new message rebuilds the context: never show the previous run's value
   useEffect(() => {
     if (!activeId) return
     const run = runs.find((r) => r.id === activeId)!
@@ -124,16 +127,22 @@ export default function Chat() {
     }
     const close = streamRun(activeId, after, {
       // every (re)connection replays the reply's live text from its start: drop ours so it isn't shown twice
-      onOpen: resetLive,
+      onOpen: () => {
+        resetLive()
+        setNotice('')
+      },
       onEvent: (e: RunEvent) => {
         setRuns((rs) => withEvent(rs, activeId, e))
         if (!e.depth && (e.type === 'cancelled' || e.type === 'error')) freeze()
         // a retried model call starts its reply again from the beginning
         if (e.type === 'assistant' || e.type === 'done' || e.type === 'error' || e.type === 'cancelled' || (e.type === 'llm_retry' && !e.depth)) resetLive()
+        if (!e.depth) setNotice('') // the run moved on (e.g. 'compacted', with a fallback summary)
       },
       onLive: (items) => {
         const c = [...items].reverse().find((i) => i.type === 'context' && !i.depth)
         if (c) setCtxLive({ used: c.used, limit: c.limit, reason: c.reason })
+        const failed = [...items].reverse().find((i) => i.type === 'compaction_error' && !i.depth)
+        if (failed) setNotice(String(failed.text ?? '') || '?')
         const txt = items.filter((i) => i.type === 'text_delta' && !i.depth).map((i) => i.text).join('')
         if (txt) appendLive(txt)
       },
@@ -316,6 +325,7 @@ export default function Chat() {
                 events={r.events ?? []}
                 status={r.status}
                 live={r.id === activeId ? live : undefined}
+                notice={r.id === activeId ? notice : undefined}
                 interrupted={r.id === activeId ? undefined : interruptedText.get(runKey(r))}
                 runId={r.id}
               />
@@ -347,13 +357,17 @@ export default function Chat() {
   )
 }
 
-type Changes = { added: string[]; modified: string[]; removed: string[]; diff: string }
+// (skipped: paths an earlier Apply could not copy, when the server keeps listing them until they are resolved)
+type Changes = { added: string[]; modified: string[]; removed: string[]; diff: string; skipped?: string[] }
 
 function ChangesButton({ tid, busy }: { tid: number; busy: boolean }) {
   const { refreshProjects } = useApp()
   const [open, setOpen] = useState(false)
   const [ch, setCh] = useState<Changes | null>(null)
   const [msg, setMsg] = useState('')
+  const [err, setErr] = useState('') // e.g. 409 «El proyecto está ocupado…»: shown, and Apply stays usable
+  const [applied, setApplied] = useState<ApplyResult | null>(null) // the last Apply's answer: what it left out and why
+  const [applying, setApplying] = useState(false)
   const [tab, setTab] = useState<'changes' | 'files'>('changes')
   const [tree, setTree] = useState<{ path: string; dir: boolean; size: number }[]>([])
   const [file, setFile] = useState<{ path: string; content: string; binary: boolean; image?: boolean } | null>(null)
@@ -369,17 +383,26 @@ function ChangesButton({ tid, busy }: { tid: number; busy: boolean }) {
   const n = ch ? ch.added.length + ch.modified.length + ch.removed.length : 0
   const apply = async () => {
     if (!confirm(t('¿Copiar {n} cambio(s) de esta conversación a la carpeta del proyecto?', { n }))) return
+    setTab('changes') // where the result is shown
+    setMsg('')
+    setErr('')
+    setApplied(null)
+    setApplying(true)
     try {
-      const r = await api.post<Changes>(`/api/threads/${tid}/apply`)
-      setMsg(t('Aplicados: +{a} ~{m} −{r}', { a: r.added.length, m: r.modified.length, r: r.removed.length }))
-      await Promise.all([load(), refreshProjects()])
+      const r = await api.post<ApplyResult>(`/api/threads/${tid}/apply`)
+      setApplied(r)
+      setMsg(applySummary(r)) // what it skipped (and why) is listed below, path by path
     } catch (e) {
-      setMsg((e as Error).message)
+      setErr((e as Error).message)
+    } finally {
+      setApplying(false)
     }
+    await Promise.all([load(), refreshProjects()]).catch(() => {})
   }
+  const earlier = !applied && ch?.skipped?.length ? ch : null // left out by an earlier Apply and still pending
   return (
     <>
-      <button className={`btn small ${n ? 'primary' : ''}`} onClick={() => { setOpen(true); setMsg(''); load() }}>
+      <button className={`btn small ${n ? 'primary' : ''}`} onClick={() => { setOpen(true); setMsg(''); setErr(''); setApplied(null); load() }}>
         {t('Archivos')}{n ? ` · ${t('{n} cambios', { n })}` : ''}
       </button>
       {open && (
@@ -423,12 +446,15 @@ function ChangesButton({ tid, busy }: { tid: number; busy: boolean }) {
                   <span className="add">+{ch.added.length}</span> <span className="mod">~{ch.modified.length}</span> <span className="del">−{ch.removed.length}</span>
                 </div>
               )}
-              <Diff text={ch?.diff ?? ''} empty={t('Sin cambios todavía')} />
               {msg && <div className="ok-box">{msg}</div>}
+              {err && <div className="error-box">{err}</div>}
+              <ApplyReport result={applied} />
+              <ApplyReport result={earlier} title={t('No se pudieron aplicar la última vez:')} />
+              <Diff text={ch?.diff ?? ''} empty={t('Sin cambios todavía')} />
             </div>
             )}
             <div className="editor-foot">
-              <button className="btn primary" disabled={!n || busy} onClick={apply}>{t('Aplicar al proyecto')}</button>
+              <button className="btn primary" disabled={!n || busy || applying} onClick={apply}>{applying ? t('Aplicando…') : t('Aplicar al proyecto')}</button>
             </div>
           </div>
         </div>

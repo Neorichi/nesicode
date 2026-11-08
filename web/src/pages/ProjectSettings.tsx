@@ -16,6 +16,8 @@ export default function ProjectSettings() {
   const [msg, setMsg] = useState('')
   const [error, setError] = useState('')
   const [upMsg, setUpMsg] = useState('')
+  const [delError, setDelError] = useState('') // e.g. 409: a reply of this project hasn't stopped yet
+  const [deleting, setDeleting] = useState(false)
   useLang()
 
   useEffect(() => {
@@ -56,11 +58,20 @@ export default function ProjectSettings() {
 
   const remove = async () => {
     if (!confirm(t('¿Eliminar "{name}" con su carpeta, harness y conversaciones? No se puede deshacer.', { name: project.name }))) return
-    // its conversations go too: forget their unsent drafts (a new conversation may get one of their ids)
-    const gone = await api.get<Thread[]>(`/api/projects/${project.id}/threads`).catch(() => [] as Thread[])
-    await api.del(`/api/projects/${project.id}`)
-    gone.forEach((th) => forgetDraft(`chat:${th.id}`))
-    await Promise.all([refreshProjects(), refreshThreads()])
+    setDelError('')
+    setDeleting(true)
+    try {
+      // its conversations go too: forget their unsent drafts (a new conversation may get one of their ids)
+      const gone = await api.get<Thread[]>(`/api/projects/${project.id}/threads`).catch(() => [] as Thread[])
+      await api.del(`/api/projects/${project.id}`)
+      gone.forEach((th) => forgetDraft(`chat:${th.id}`))
+    } catch (e) {
+      // the server said why (a reply still stopping, …): the project is still there and the page stays usable
+      setDelError((e as Error).message)
+      setDeleting(false)
+      return
+    }
+    await Promise.all([refreshProjects(), refreshThreads()]).catch(() => {})
     navigate('/')
   }
 
@@ -126,7 +137,8 @@ export default function ProjectSettings() {
 
       <div className="card danger">
         <h3>{t('Zona peligrosa')}</h3>
-        <button className="btn danger" onClick={remove}>{t('Eliminar proyecto')}</button>
+        {delError && <div className="error-box">{delError}</div>}
+        <button className="btn danger" disabled={deleting} onClick={remove}>{deleting ? t('Eliminando…') : t('Eliminar proyecto')}</button>
       </div>
     </div>
   )
