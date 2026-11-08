@@ -100,9 +100,8 @@ def burp_scan_status(args: dict, ws, cfg):
     text = "\n".join(lines)
     if issues and args.get("save_json"):
         rel = f"burp/scan-{task}.json"
-        p = ws.resolve(rel)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
+        # through the workspace: never into a link or a FIFO planted under that (predictable) name
+        ws.write_bytes(ws.resolve(rel), json.dumps(data, indent=1, ensure_ascii=False).encode("utf-8"))
         return text + f"\nFull JSON saved to {rel}.", rel
     return text[:30000], None
 

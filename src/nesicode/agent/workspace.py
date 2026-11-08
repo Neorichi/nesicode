@@ -633,9 +633,11 @@ def _clear_at(dfd: int, name: str) -> None:
         os.unlink(name, dir_fd=dfd)
 
 
-def _copy_entry(src_root: Path, dst_root: Path, rel: str) -> None:
-    """Copy src_root/rel (a regular file or a link) to dst_root/rel without following any link on either side."""
-    src = Path(src_root, rel)
+def _copy_entry(src_root: Path, dst_root: Path, rel: str, dst_rel: str | None = None) -> None:
+    """Copy src_root/rel (a regular file or a link) to dst_root/<dst_rel or rel> without following any link on either
+    side; a link that would point out of dst_root is refused (EPERM)."""
+    src_rel, rel = rel, dst_rel or rel
+    src = Path(src_root, src_rel)
     st = os.lstat(src)
     parts = _parts(dst_root, rel)
     if stat.S_ISLNK(st.st_mode):
@@ -658,7 +660,7 @@ def _copy_entry(src_root: Path, dst_root: Path, rel: str) -> None:
         return
     if not stat.S_ISREG(st.st_mode):
         raise OSError(errno.EINVAL, "not a regular file")
-    sfd = _open_beneath(src_root, rel)
+    sfd = _open_beneath(src_root, src_rel)
     try:
         if _FD_WALK:
             dfd = _parent_fd(dst_root, parts, mkdirs=True)
@@ -911,35 +913,43 @@ class Workspace:
             )
         except OSError as exc:
             raise ToolError(f"could not start command: {exc}") from exc
-        if container:
-            _CONTAINERS.add(container)
-        out = _Capture(proc.stdout)
-        # Wait in short slices so the user's Stop kills the command at once (not when it ends).
-        cancel = getattr(self, "cancel", None)
-        deadline = time.monotonic() + timeout
-        why = ""
-        while True:
-            try:
-                proc.wait(timeout=0.2)
-                break
-            except subprocess.TimeoutExpired:
-                pass
-            if cancel is not None and cancel.is_set():
-                why = "stopped"
-            elif out.over.is_set():
-                why = "overflow"
-            elif time.monotonic() >= deadline:
-                why = "timeout"
-            if why:
-                _kill_tree(proc, container)
+        try:
+            if container:
+                _CONTAINERS.add(container)
+            out = _Capture(proc.stdout)
+            # Wait in short slices so the user's Stop kills the command at once (not when it ends).
+            cancel = getattr(self, "cancel", None)
+            deadline = time.monotonic() + timeout
+            why = ""
+            while True:
                 try:
-                    proc.wait(timeout=5)
+                    proc.wait(timeout=0.2)
+                    break
                 except subprocess.TimeoutExpired:
                     pass
-                break
-        # The command is over, but processes it left (`server &`, a setsid'd helper) may still hold the output
-        # pipe: wait a little for the last bytes, never for them to exit.
-        out.eof.wait(min(0.5, EOF_GRACE) if why else EOF_GRACE)
+                if cancel is not None and cancel.is_set():
+                    why = "stopped"
+                elif out.over.is_set():
+                    why = "overflow"
+                elif time.monotonic() >= deadline:
+                    why = "timeout"
+                if why:
+                    _kill_tree(proc, container)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    break
+            # The command is over, but processes it left (`server &`, a setsid'd helper) may still hold the output
+            # pipe: wait a little for the last bytes, never for them to exit.
+            out.eof.wait(min(0.5, EOF_GRACE) if why else EOF_GRACE)
+        except BaseException:
+            # A raw KeyboardInterrupt (a second Ctrl+C, library use without the CLI's handler) or anything else that
+            # aborts the wait: the command and whatever it started must not outlive us as orphans.
+            _kill_tree(proc, container)
+            if container:
+                _CONTAINERS.discard(container)
+            raise
         if container:
             _CONTAINERS.discard(container)
         if not why:
@@ -1124,9 +1134,62 @@ class Cancelled(Exception):
     """The user pressed Stop."""
 
 
+def _copy_data(fsrc, fdst) -> None:
+    """A file's contents, the fast way where the OS has one (macOS fcopyfile, Linux sendfile: what shutil.copyfile
+    does), else in chunks."""
+    try:
+        if getattr(shutil, "_HAS_FCOPYFILE", False) and hasattr(shutil, "_fastcopy_fcopyfile"):
+            import posix
+
+            shutil._fastcopy_fcopyfile(fsrc, fdst, posix._COPYFILE_DATA)
+            return
+        if getattr(shutil, "_USE_CP_SENDFILE", False) and hasattr(shutil, "_fastcopy_sendfile"):
+            shutil._fastcopy_sendfile(fsrc, fdst)
+            return
+    except getattr(shutil, "_GiveupOnFastCopy", ()):  # raised before anything was copied: the plain way below
+        pass
+    shutil.copyfileobj(fsrc, fdst, 1 << 20)
+
+
+def _copy_regular(src: str, dst: str) -> str:
+    """copytree's copy_function: a regular file with its mode and times. Whatever else is found there by the time it is
+    copied — a FIFO swapped in after the listing (opening one for reading waits for a writer: the copy would hang), a
+    socket, a device, a link, a file that vanished — is skipped, never opened as a file."""
+    try:
+        fd = os.open(src, os.O_RDONLY | _NOFOLLOW | _NONBLOCK | _CLOEXEC | _BINARY)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK, errno.ENXIO, errno.EOPNOTSUPP, errno.ENOENT):
+            return dst
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return dst
+        with os.fdopen(fd, "rb") as fsrc:
+            fd = -1
+            out = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _NOFOLLOW | _CLOEXEC | _BINARY, 0o666)
+            with os.fdopen(out, "wb") as fdst:
+                _copy_data(fsrc, fdst)
+                fdst.flush()
+                try:
+                    if os.chmod in os.supports_fd:
+                        os.chmod(fdst.fileno(), stat.S_IMODE(st.st_mode))
+                    if os.utime in os.supports_fd:
+                        os.utime(fdst.fileno(), ns=(st.st_atime_ns, st.st_mtime_ns))
+                except OSError:
+                    pass
+        if os.utime not in os.supports_fd:  # (Windows)
+            shutil.copystat(src, dst)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return dst
+
+
 def copy_workspace(src: Path, dst: Path) -> None:
     """Copy a project into a fresh cage. Sockets, FIFOs and devices (git's fsmonitor socket, a dev database's
-    socket...) can't be copied and made copytree fail after copying everything else: they are skipped."""
+    socket...) can't be copied and made copytree fail after copying everything else: they are skipped — also one
+    that appears while the copy runs (nothing but a regular file is ever opened, see _copy_regular)."""
     if dst.exists():
         shutil.rmtree(dst)
 
@@ -1142,7 +1205,26 @@ def copy_workspace(src: Path, dst: Path) -> None:
                 skip.add(n)
         return skip
 
-    shutil.copytree(src, dst, symlinks=True, ignore=ignore)
+    shutil.copytree(src, dst, symlinks=True, ignore=ignore, copy_function=_copy_regular)
+
+
+def copy_files_into(src: Path, dst_root: Path, prefix: str) -> list[str]:
+    """Merge the files and links under the folder `src` into dst_root/<prefix> (a conversation's attachments into a
+    harnessing snapshot…) without following a link on either side: a `src` that is itself a link, a link that would
+    point out of dst_root and anything that is not a regular file are skipped. Returns what was skipped, and why."""
+    src = Path(src)
+    if src.is_symlink() or not src.is_dir():
+        return [f"{prefix}: not a folder"]
+    skipped = []
+    for p, _e in _scan(src):
+        rel = p.relative_to(src).as_posix()
+        try:
+            _copy_entry(src, Path(dst_root), rel, dst_rel=f"{prefix}/{rel}")
+        except OSError as exc:
+            skipped.append(f"{prefix}/{rel}: {_why(exc)}")
+        except ValueError as exc:
+            skipped.append(f"{prefix}/{rel}: {exc}")
+    return skipped
 
 
 def _tree(root: Path) -> dict[str, os.stat_result]:

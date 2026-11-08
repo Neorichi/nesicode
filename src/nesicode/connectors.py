@@ -8,6 +8,7 @@ goes through the same approval modes as bash.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import base64
 import collections
 import concurrent.futures
@@ -237,6 +238,43 @@ class McpResult:
     is_error: bool
 
 
+# What a local MCP server inherits from Nesicode's own environment. Its launch environment is readable by any process
+# of the same user — the agent's commands in their cage included (macOS: sysctl KERN_PROCARGS2, which the sandbox cannot
+# block) — so it only gets what toolchains (npx, uvx, node, python…) need to start, never Nesicode's settings
+# (NESICODE_*, the desktop token) nor anything named like a secret (the provider keys loaded from .env…). What the
+# connector itself configures (cfg.env: its own token…) goes on top.
+_ENV_KEEP = frozenset("""
+    PATH HOME USER LOGNAME SHELL LANG LANGUAGE TZ TERM TMPDIR TMP TEMP __CF_USER_TEXT_ENCODING
+    DISPLAY WAYLAND_DISPLAY
+    HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy
+    SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE NODE_EXTRA_CA_CERTS
+    NVM_DIR NVM_BIN NVM_INC VOLTA_HOME PYENV_ROOT PYENV_VERSION JAVA_HOME GOPATH GOROOT CARGO_HOME RUSTUP_HOME
+    BUN_INSTALL PNPM_HOME DENO_DIR DENO_INSTALL ASDF_DIR ASDF_DATA_DIR MISE_DATA_DIR SDKMAN_DIR
+    HOMEBREW_PREFIX HOMEBREW_CELLAR HOMEBREW_REPOSITORY
+    UV_CACHE_DIR UV_TOOL_DIR UV_TOOL_BIN_DIR UV_PYTHON_INSTALL_DIR NPM_CONFIG_PREFIX NPM_CONFIG_CACHE
+    SYSTEMROOT SYSTEMDRIVE WINDIR COMSPEC PATHEXT APPDATA LOCALAPPDATA PROGRAMDATA PROGRAMFILES PROGRAMFILES(X86)
+    PROGRAMW6432 COMMONPROGRAMFILES COMMONPROGRAMFILES(X86) COMMONPROGRAMW6432 USERPROFILE HOMEDRIVE HOMEPATH
+    USERNAME PUBLIC ALLUSERSPROFILE OS NUMBER_OF_PROCESSORS PROCESSOR_ARCHITECTURE PROCESSOR_IDENTIFIER
+""".split())
+_ENV_KEEP_PREFIXES = ("LC_", "XDG_")
+_SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|COOKIE|SESSION", re.I)
+
+
+def server_env(own: dict[str, str] | None = None, base: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment a local (stdio) MCP server starts with: the toolchain part of `base` (os.environ) plus `own`
+    (the connector's cfg.env), which may set anything."""
+    base = os.environ if base is None else base
+    nt = os.name == "nt"  # Windows names are case-insensitive (SystemRoot, ProgramFiles(x86)…)
+    keep = {}
+    for k, v in base.items():
+        n = k.upper() if nt else k
+        if k.upper().startswith("NESICODE_") or _SECRET_NAME.search(k) or (v or "").startswith("()"):  # (bash functions)
+            continue
+        if n in _ENV_KEEP or n.startswith(_ENV_KEEP_PREFIXES):
+            keep[k] = v
+    return {**keep, **(own or {})}
+
+
 def _describe(exc: BaseException) -> str:
     """The innermost real error (anyio wraps failures in ExceptionGroups)."""
     while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
@@ -319,6 +357,7 @@ class _Connection:
     def __init__(self, cfg: ConnectorConfig, user_id: int = 0):
         self.cfg = cfg
         self.user_id = user_id
+        self.born = time.monotonic()  # its start began: everyone waiting for it shares one startup deadline
         self.session = None
         self.ready = asyncio.Event()
         self.stop = asyncio.Event()  # set by stop()/_drop(): shuts the server down, even while it is starting
@@ -338,8 +377,7 @@ class _Connection:
                 tg.start_soon(self._stop_when_asked, tg.cancel_scope)
                 if self.cfg.kind == "stdio":
                     self.stderr = _StderrTail(self.cfg.name)
-                    env = {**os.environ, **self.cfg.env}
-                    params = StdioServerParameters(command=self.cfg.command, args=self.cfg.args, env=env)
+                    params = StdioServerParameters(command=self.cfg.command, args=self.cfg.args, env=server_env(self.cfg.env))
                     async with stdio_client(params, errlog=self.stderr.file) as (read, write):
                         self.stderr.close_writer()
                         await self._serve(read, write, watch=True)
@@ -409,13 +447,17 @@ def _relay_until_eof(tg, src, closed):
     return recv
 
 
+BACKOFF = 300.0  # s: a server that did not answer at startup is not waited for again by messages for this long
+
+
 class McpManager:
     """Owns an asyncio loop in a background thread; sync callers (agent threads) use it safely.
 
     A connection is keyed by (user, full config). tools() starts it and records it as started for that user's
     connector; stop() (Probar, Desactivar, Eliminar) shuts down only that user's connections and revokes that, so
     a conversation already running can't bring a disabled connector back. A crashed server, or one that restarted
-    and forgot our session, is reconnected on its next use."""
+    and forgot our session, is reconnected on its next use. A server that never answered at startup is stopped and
+    remembered for BACKOFF s (a new config, or Probar / Desactivar → stop(), forgets it): messages skip it meanwhile."""
 
     def __init__(self):
         self.loop = asyncio.new_event_loop()
@@ -424,6 +466,8 @@ class McpManager:
         self.conns: dict[str, _Connection] = {}
         self.started: dict[tuple[int, str], str] = {}  # (user, connector name) -> key of the config tools() started
         self.dying: set[_Connection] = set()  # dropped, their server still shutting down (stop() waits for them too)
+        self.failed: dict[str, tuple[float, str, int, str]] = {}  # key -> (retry after, why, user, name): startups that hung
+        self.closed = False  # shutdown(): the app is closing, nothing starts any more
         self.lock = threading.Lock()
 
     def _run(self, coro, timeout: float, cancel: threading.Event | None = None):
@@ -450,7 +494,22 @@ class McpManager:
             self.dying.add(conn)
             conn.task.add_done_callback(lambda _task: self.dying.discard(conn))
 
-    async def _ensure(self, key: str, cfg: ConnectorConfig, user_id: int, timeout: float) -> _Connection:
+    def _hung_lately(self, key: str) -> str:
+        """Why this config is not waited for now ('' = go ahead): it did not answer at startup a moment ago."""
+        until, why, *_ = self.failed.get(key) or (0.0, "")
+        left = until - time.monotonic()
+        if left <= 0:
+            self.failed.pop(key, None)
+            return ""
+        return (f"{why} hace un momento; no se vuelve a esperar hasta dentro de {max(1, round(left / 60))} min "
+                "(«Probar» en Integraciones lo reintenta ya)")
+
+    async def _ensure(self, key: str, cfg: ConnectorConfig, user_id: int, timeout: float,
+                      backoff: bool = False) -> _Connection:
+        if self.closed:
+            raise RuntimeError("Nesicode se está cerrando: no se arrancan conectores")
+        if backoff and (why := self._hung_lately(key)):
+            raise RuntimeError(why)
         conn = self.conns.get(key)
         if conn is not None and conn.ready.is_set() and conn.session is None:
             self._drop(key, conn)  # it died (crashed, closed, failed to start): start a new one
@@ -459,17 +518,23 @@ class McpManager:
             conn = _Connection(cfg, user_id)
             self.conns[key] = conn
             conn.task = asyncio.ensure_future(conn.run())
-        try:
-            await asyncio.wait_for(conn.ready.wait(), timeout)
+        try:  # the deadline counts from its start: a message that gave up waiting (Stop) does not reset it
+            if not conn.ready.is_set():  # (wait_for with no time left fails even when the event is already set)
+                await asyncio.wait_for(conn.ready.wait(), max(0.0, conn.born + timeout - time.monotonic()))
         except TimeoutError:
             self._drop(key, conn)  # it never answered: don't leave its process running
+            why = f"el servidor MCP no respondió en {timeout:.0f} s al arrancar"
+            self.failed[key] = (time.monotonic() + BACKOFF, why, user_id, cfg.name)
             tail = await conn.stderr.tail() if conn.stderr is not None else ""
-            raise RuntimeError(f"el servidor MCP no respondió en {timeout:.0f} s" + (f"\n{tail}" if tail else "")) from None
+            raise RuntimeError(why + (f"\n{tail}" if tail else "")) from None
         if conn.session is None or conn.stop.is_set():  # also a stop() that came in while it was starting
             raise RuntimeError(conn.error or "el servidor MCP se detuvo")
+        self.failed.pop(key, None)
         return conn
 
-    def tools(self, user_id: int, cfg: ConnectorConfig, timeout: float = 120) -> list[McpTool]:
+    def tools(self, user_id: int, cfg: ConnectorConfig, timeout: float = 120,
+              cancel: threading.Event | None = None) -> list[McpTool]:
+        """Start a connector (or reuse it) and list its tools — also one that hung lately (Probar, adding it)."""
         if cfg.kind == "builtin":
             return builtin_tools(cfg.command, cfg)
         key = cfg.key(user_id)
@@ -479,7 +544,28 @@ class McpManager:
             self.started[(user_id, cfg.name)] = key
             return conn.tools
 
-        return self._run(go(), timeout + 5)
+        return self._run(go(), timeout + 5, cancel)
+
+    def tools_many(self, user_id: int, cfgs: list[ConnectorConfig], timeout: float = 90,
+                   cancel: threading.Event | None = None) -> list:
+        """Start the MCP servers (stdio / http) a message is offered, all at once; returns, in order, each one's tools
+        or the exception that keeps it out. One that did not answer at startup a moment ago is not waited for again
+        (BACKOFF): a hung server costs one timeout per few minutes, not one per message. `cancel` (Stop) ends the
+        wait within a quarter of a second (the servers go on starting, for the next message)."""
+
+        async def one(cfg):
+            key = cfg.key(user_id)
+            try:
+                conn = await self._ensure(key, cfg, user_id, timeout, backoff=True)
+            except Exception as exc:  # noqa: BLE001 - reported per connector
+                return exc
+            self.started[(user_id, cfg.name)] = key
+            return conn.tools
+
+        async def go():
+            return list(await asyncio.gather(*(one(c) for c in cfgs)))
+
+        return self._run(go(), timeout + 5, cancel) if cfgs else []
 
     def call(self, user_id: int, cfg: ConnectorConfig, tool: str, args: dict, timeout: float = 180,
              cancel: threading.Event | None = None) -> McpResult:
@@ -491,7 +577,7 @@ class McpManager:
                 if self.started.get((user_id, cfg.name)) != key:
                     raise RuntimeError("the user stopped, turned off or removed this connector in Nesicode: it is not "
                                        "started again during this message")
-                conn = await self._ensure(key, cfg, user_id, 120)
+                conn = await self._ensure(key, cfg, user_id, 120, backoff=True)
                 try:
                     res = await conn.session.call_tool(tool, args or {}, read_timeout_seconds=timeout)
                 except Exception as exc:
@@ -517,6 +603,9 @@ class McpManager:
         Until tools() starts it again, conversations already running can't restart it."""
         async def go():
             self.started.pop((user_id, name), None)
+            for key, f in list(self.failed.items()):  # Probar / Desactivar: the next start waits for it again
+                if f[2:] == (user_id, name):
+                    self.failed.pop(key, None)
             for key, conn in list(self.conns.items()):
                 if conn.user_id == user_id and conn.cfg.name == name:
                     self._drop(key, conn)
@@ -526,6 +615,26 @@ class McpManager:
                 await asyncio.wait(tasks, timeout=8)
 
         self._run(go(), 10)
+
+    def shutdown(self, timeout: float = 8.0) -> None:
+        """Stop every server (the app is closing) all at once, waiting at most `timeout` s for them to exit; nothing
+        starts on this manager afterwards. Safe to call again."""
+        self.closed = True
+        if self.loop.is_closed() or not self.thread.is_alive():
+            return
+
+        async def go():
+            self.started.clear()
+            for key, conn in list(self.conns.items()):
+                self._drop(key, conn)
+            tasks = [c.task for c in list(self.dying) if c.task is not None and not c.task.done()]
+            if tasks:
+                await asyncio.wait(tasks, timeout=timeout)
+
+        try:
+            self._run(go(), timeout + 1)
+        except Exception as exc:  # noqa: BLE001 - never block the exit
+            print("nesicode: could not stop every MCP server:", exc)
 
     def status(self, user_id: int, cfg: ConnectorConfig) -> str:
         if cfg.kind == "builtin":
@@ -582,13 +691,29 @@ def builtin_tools(which: str, cfg: "ConnectorConfig | None" = None) -> list[McpT
 
 
 _manager: McpManager | None = None
+_manager_lock = threading.Lock()
 
 
 def manager() -> McpManager:
     global _manager
-    if _manager is None:
-        _manager = McpManager()
-    return _manager
+    with _manager_lock:
+        if _manager is None:
+            _manager = McpManager()
+        return _manager
+
+
+def shutdown_all(timeout: float = 8.0) -> None:
+    """Stop every MCP server process this app started (the desktop window closed, `serve` stopped), in parallel and
+    in at most ~`timeout` s; a server that ignores its stdin closing is killed. Safe to call more than once. A later
+    manager() starts afresh — and whatever it starts is stopped at exit too (atexit below)."""
+    global _manager
+    with _manager_lock:
+        m, _manager = _manager, None
+    if m is not None:
+        m.shutdown(timeout)
+
+
+atexit.register(shutdown_all)  # (after the jobs' own exit hook has stopped the runs that use them)
 
 
 def tool_name(connector: str, tool: str) -> str:

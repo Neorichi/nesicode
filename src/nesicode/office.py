@@ -7,6 +7,7 @@ Each tool is `fn(args, ws) -> (text_for_the_model, written_relpath | None)`.
 
 from __future__ import annotations
 
+import io
 import re
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from .agent.workspace import ToolError, Workspace
 from .llm import ToolSpec
 
 MAX_TEXT = 40_000
+MAX_FILE = 200 * 1024 * 1024  # documents (and images put in them) larger than this are refused
 
 
 # ------------------------------------------------------------------ helpers
@@ -26,8 +28,26 @@ def _path(ws: Workspace, args: dict, exts: tuple[str, ...], must_exist: bool = F
         raise ToolError(f"`path` must end in {' / '.join(exts)}")
     if must_exist and not p.is_file():
         raise ToolError(f"file not found: {rel}")
+    if p.exists() and not p.is_file():  # a folder, a FIFO, a socket… with that name
+        raise ToolError(f"{rel} exists and is not a regular file")
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
+
+
+# Every file is read and written through the workspace, in memory: never through a link (even one swapped in after
+# the checks above) and never a FIFO, which a library's own open() would wait on forever (this runs in-process and
+# Stop can't interrupt it).
+def _src(ws: Workspace, p: Path) -> io.BytesIO:
+    data = ws.read_bytes(p, MAX_FILE + 1)
+    if len(data) > MAX_FILE:
+        raise ToolError(f"{ws.rel(p)} is too large (over {MAX_FILE // 2**20} MB)")
+    return io.BytesIO(data)
+
+
+def _store(ws: Workspace, p: Path, save) -> None:
+    buf = io.BytesIO()
+    save(buf)
+    ws.write_bytes(p, buf.getvalue())
 
 
 def _clip(text: str) -> str:
@@ -67,7 +87,7 @@ def office_read(args: dict, ws: Workspace):
     if ext == ".docx":
         from docx import Document
 
-        d = Document(str(p))
+        d = Document(_src(ws, p))
         for para in d.paragraphs:
             if para.text.strip():
                 style = para.style.name if para.style is not None else ""
@@ -78,11 +98,11 @@ def office_read(args: dict, ws: Workspace):
             for row in table.rows:
                 out.append(" | ".join(c.text.strip() for c in row.cells))
     elif ext in (".xlsx", ".xlsm"):
-        out += _read_workbook(p, args)
+        out += _read_workbook(_src(ws, p).getvalue(), args)
     else:
         from pptx import Presentation
 
-        prs = Presentation(str(p))
+        prs = Presentation(_src(ws, p))
         for i, slide in enumerate(prs.slides, 1):
             out.append(f"## Slide {i}")
             for shape in slide.shapes:
@@ -104,7 +124,7 @@ def _formula(value) -> str:
     return text if isinstance(text, str) and text.startswith("=") else ""
 
 
-def _saved_values(wb, p: Path, name: str, n_rows: int) -> dict:
+def _saved_values(wb, data: bytes, name: str, n_rows: int) -> dict:
     """{(row, col): value Excel saved} for the first n_rows of a sheet: the results of its formulas. Read-only
     sheets parse rows on demand, so the same workbook re-reads them with data_only on (no second load, which
     would parse the shared strings again, and the whole sheet when the file has no <dimension>)."""
@@ -114,7 +134,7 @@ def _saved_values(wb, p: Path, name: str, n_rows: int) -> dict:
     wb._data_only = True  # what load_workbook(data_only=True) sets
     try:
         if not wb.data_only:  # openpyxl changed: load the values separately
-            src = other = load_workbook(str(p), read_only=True, data_only=True)
+            src = other = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
         sv = src[name]
         sv.reset_dimensions()
         return {(r, c): v for r, row in enumerate(sv.iter_rows(max_row=n_rows, values_only=True), 1)
@@ -125,7 +145,7 @@ def _saved_values(wb, p: Path, name: str, n_rows: int) -> dict:
             other.close()
 
 
-def _read_workbook(p: Path, args: dict) -> list[str]:
+def _read_workbook(data: bytes, args: dict) -> list[str]:
     """Excel as text. Read-only mode streams rows from the file, so a big workbook only costs the rows shown (a
     full load took ~1.5 GB and 20 s for an 8 MB export); the saved formula results are read only when the rows
     shown have formulas."""
@@ -133,7 +153,7 @@ def _read_workbook(p: Path, args: dict) -> list[str]:
 
     max_rows = max(1, int(args.get("max_rows") or 200))
     out: list[str] = []
-    wb = load_workbook(str(p), read_only=True, data_only=False)
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=False)
     try:
         sheets = {s.title: s for s in wb.worksheets}
         charts = [c.title for c in wb.chartsheets]  # a chart moved to its own sheet: no cells to show
@@ -159,7 +179,7 @@ def _read_workbook(p: Path, args: dict) -> list[str]:
                     break
                 rows.append(row)
                 budget -= sum(len(str(v)) + 3 for v in row if v is not None)
-            cached = _saved_values(wb, p, name, len(rows)) if any(_formula(v) for row in rows for v in row) else {}
+            cached = _saved_values(wb, data, name, len(rows)) if any(_formula(v) for row in rows for v in row) else {}
             for r, row in enumerate(rows, 1):
                 cells = []
                 for c, v in enumerate(row):
@@ -187,7 +207,7 @@ def word_write(args: dict, ws: Workspace):
 
     p = _path(ws, args, (".docx",))
     append = bool(args.get("append")) and p.is_file()
-    d = Document(str(p)) if append else Document()
+    d = Document(_src(ws, p)) if append else Document()
     if args.get("title") and not append:
         d.add_heading(str(args["title"]), level=0)
     blocks = args.get("blocks") or []
@@ -232,14 +252,14 @@ def word_write(args: dict, ws: Workspace):
             img = ws.resolve(str(b.get("path", "")))
             if not img.is_file():
                 raise ToolError(f"image not found: {b.get('path')}")
-            d.add_picture(str(img), width=Cm(float(b.get("width_cm", 15))))
+            d.add_picture(_src(ws, img), width=Cm(float(b.get("width_cm", 15))))
             if b.get("caption"):
                 d.add_paragraph().add_run(str(b["caption"])).italic = True
         elif kind == "page_break":
             d.add_page_break()
         else:
             raise ToolError(f"unknown block type {kind!r}")
-    d.save(str(p))
+    _store(ws, p, d.save)
     return f"{'Appended to' if append else 'Wrote'} {ws.rel(p)} ({len(blocks)} blocks).", ws.rel(p)
 
 
@@ -388,7 +408,7 @@ def word_replace(args: dict, ws: Workspace):
     pairs = args.get("replacements") or []
     if not pairs:
         raise ToolError("`replacements` is required: [{find, replace}]")
-    d = Document(str(p))
+    d = Document(_src(ws, p))
     # every paragraph once, straight from the XML: body, tables (a merged cell is one cell, not one per grid
     # column), nested tables, text boxes, plus headers and footers
     roots, seen = [d.element.body], set()
@@ -408,7 +428,7 @@ def word_replace(args: dict, ws: Workspace):
             hits = _replace_in_paragraph(para, find, repl)
             n += hits if counted else 0  # a text box's legacy copy (mc:Fallback) is updated but not counted twice
         counts[find] = n
-    d.save(str(p))
+    _store(ws, p, d.save)
     return f"Replacements in {ws.rel(p)}: " + ", ".join(f"{k!r}×{v}" for k, v in counts.items()), ws.rel(p)
 
 
@@ -417,16 +437,16 @@ _BAD_SHEET = re.compile(r"[\\/*?:\[\]]")
 MAX_FORMAT_CELLS = 100_000
 
 
-def _load_xlsx(p: Path):
+def _load_xlsx(ws: Workspace, p: Path):
     """Open a workbook to edit it. An .xlsm keeps its macros (vbaProject.bin) and its macro-enabled type: without
     keep_vba, saving dropped the VBA and Excel refused to open the file."""
     from openpyxl import load_workbook
 
-    return load_workbook(str(p), keep_vba=p.suffix.lower() == ".xlsm")
+    return load_workbook(_src(ws, p), keep_vba=p.suffix.lower() == ".xlsm")
 
 
-def _save_xlsx(wb, p: Path) -> None:
-    wb.save(str(p))
+def _save_xlsx(ws: Workspace, wb, p: Path) -> None:
+    _store(ws, p, wb.save)
     if wb.vba_archive is not None:  # the in-memory copy keep_vba made: close it now, not at garbage collection
         wb.vba_archive.close()
 
@@ -504,7 +524,7 @@ def excel_write(args: dict, ws: Workspace):
     fmt = args.get("number_format") or {}
     if not isinstance(fmt, dict):
         raise ToolError("`number_format` must be an object like {'B2:B20': '#,##0.00 €', 'C5': '0%'}")
-    wb = _load_xlsx(p) if exists else Workbook()
+    wb = _load_xlsx(ws, p) if exists else Workbook()
     sheet = str(args.get("sheet") or "").strip()
     sh = _find_sheet(wb, sheet) if sheet else _first_sheet(wb)
     if sh is None:
@@ -537,7 +557,7 @@ def excel_write(args: dict, ws: Workspace):
                 widths[col_i] = max(widths.get(col_i, 0), len(str(c.value)))
         for col_i in cols:
             sh.column_dimensions[get_column_letter(col_i)].width = min(60, max(8, widths.get(col_i, 8) + 2))
-    _save_xlsx(wb, p)
+    _save_xlsx(ws, wb, p)
     return f"Wrote {len(rows)} rows to {ws.rel(p)} › {sh.title} (formulas are computed when the file is opened).", ws.rel(p)
 
 
@@ -546,7 +566,7 @@ def excel_chart(args: dict, ws: Workspace):
     from openpyxl.utils.cell import range_boundaries
 
     p = _path(ws, args, (".xlsx", ".xlsm"), must_exist=True)
-    wb = _load_xlsx(p)
+    wb = _load_xlsx(ws, p)
     sh = _find_sheet(wb, str(args["sheet"])) if args.get("sheet") else _first_sheet(wb)
     if sh is None:
         raise ToolError(f"no sheet {args['sheet']!r}; sheets: {', '.join(wb.sheetnames)}")
@@ -584,7 +604,7 @@ def excel_chart(args: dict, ws: Workspace):
         chart.y_axis.title = args["y_title"]
     chart.width, chart.height = 18, 9
     sh.add_chart(chart, str(args.get("anchor", "H2")))
-    _save_xlsx(wb, p)
+    _save_xlsx(ws, wb, p)
     return f"Added a {kind} chart to {ws.rel(p)} › {sh.title} at {args.get('anchor', 'H2')}.", ws.rel(p)
 
 
@@ -619,7 +639,7 @@ def pptx_write(args: dict, ws: Workspace):
     for i, s in enumerate(slides, 1):  # check all first: an unknown layout used to drop its bullets silently
         if not isinstance(s, dict) or s.get("layout", "content") not in layouts:
             raise ToolError(f"slide {i}: `layout` must be one of {', '.join(layouts)}")
-    prs = Presentation(str(p)) if append else Presentation()
+    prs = Presentation(_src(ws, p)) if append else Presentation()
     if not append:
         old_w, old_h = prs.slide_width, prs.slide_height
         prs.slide_width, prs.slide_height = Cm(33.867), Cm(19.05)  # 16:9
@@ -649,7 +669,7 @@ def pptx_write(args: dict, ws: Workspace):
             if not img.is_file():
                 raise ToolError(f"image not found: {s.get('image')}")
             top = Cm(4)
-            pic = slide.shapes.add_picture(str(img), 0, top, height=H - top - Cm(1))
+            pic = slide.shapes.add_picture(_src(ws, img), 0, top, height=H - top - Cm(1))
             if pic.width > W - Cm(2):
                 ratio = (W - Cm(2)) / pic.width
                 pic.width, pic.height = int(pic.width * ratio), int(pic.height * ratio)
@@ -666,7 +686,7 @@ def pptx_write(args: dict, ws: Workspace):
                             r.font.size = Pt(14)
         if s.get("notes"):
             slide.notes_slide.notes_text_frame.text = str(s["notes"])
-    prs.save(str(p))
+    _store(ws, p, prs.save)
     return f"{'Appended' if append else 'Wrote'} {len(slides)} slides to {ws.rel(p)} ({len(prs.slides)} in total).", ws.rel(p)
 
 
