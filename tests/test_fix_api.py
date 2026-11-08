@@ -631,16 +631,20 @@ def test_a_queued_reply_of_a_deleted_conversation_keeps_its_id_until_its_job_run
     r1 = a.post(f"/api/threads/{t1['id']}/messages", json={"text": "hola"}).json()
     assert _status(r1["id"]) == "queued" and backlog
     assert a.delete(f"/api/threads/{t1['id']}").json()["ok"]
-    assert db.one("SELECT thread_id FROM runs WHERE id=?", (r1["id"],))["thread_id"] is None  # id still taken
+    row = db.one("SELECT thread_id FROM runs WHERE id=?", (r1["id"],))
+    # kept, detached, so its id stays taken until its job ends — or withdrawn at once by a job queue whose stale
+    # jobs check that they still own their run (then the id may be reused safely)
+    assert row is None or row["thread_id"] is None
     monkeypatch.undo()
     t2, _ = _thread(a, pa)
     r2 = a.post(f"/api/threads/{t2['id']}/messages", json={"text": "hola"}).json()
-    assert r2["id"] != r1["id"]
+    assert row is None or r2["id"] != r1["id"]
     fn, args = backlog[0]
-    fn(*args)  # the stale job finally gets a worker: it ends on its own (detached) run, never on r2
-    _wait(lambda: db.one("SELECT id FROM runs WHERE id=?", (r1["id"],)) is None, timeout=3)
+    fn(*args)  # the stale job finally gets a worker: it must never run, stop or end r2
     _wait(lambda: _status(r2["id"]) in FINAL)
-    assert _status(r2["id"]) == "done"
+    run2 = a.get(f"/api/runs/{r2['id']}").json()
+    assert run2["status"] == "done" and [e["type"] for e in run2["events"]].count("start") == 1
+    _wait(lambda: db.one("SELECT id FROM runs WHERE id=? AND thread_id IS NULL", (r1["id"],)) is None, timeout=3)
 
 
 def test_deleting_a_project_waits_for_replies_that_ignore_stop(stuck_step, monkeypatch):
