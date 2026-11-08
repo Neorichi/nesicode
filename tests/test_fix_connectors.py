@@ -156,12 +156,16 @@ def test_chrome_call_can_be_cancelled(hub_loop):
     alice.close()
 
 
-def test_chrome_bridge_cross_user_through_the_real_endpoint():
+def test_chrome_bridge_cross_user_through_the_real_endpoint(monkeypatch):
     """End to end: two users paired through /api/browser/ws in multi-user mode, one event loop (as uvicorn)."""
     from fastapi.testclient import TestClient
 
     from nesicode.browser import hub
+    from nesicode.server import app as appmod
     from nesicode.server.app import app
+
+    # leaving the app's lifespan stops its runtime (runs, MCP servers): not the one the rest of the session shares
+    monkeypatch.setattr(appmod, "stop_runtime", lambda *a, **k: None)
 
     def token_of(c):
         code = c.post("/api/browser/pairing").json()["code"]

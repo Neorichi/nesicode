@@ -67,6 +67,11 @@ skills, sub-agents, scripts and hooks).
 
 **Parallel** mode (explores breadth) or **sequential** mode (refines depth). Both use 4k agent runs and 3k improvement stages.
 
+Applying and adopting never undo your own work: when a run's file changes are applied (automatically or with
+"Apply"), a file you changed after the run started is left as it is and the proposed version is written next to it
+as `<file>.nesicode-new`; when its harness is adopted (automatically or with "Adopt"), edits made to the harness
+meanwhile are merged in, and if both changed the same file nothing is adopted and you are told what to do.
+
 ## Quick start
 
 ```bash
@@ -99,6 +104,9 @@ WebView2 on Windows). No login, but a random token per launch so other programs 
 its API. Data lives in `~/Library/Application Support/nesicode` (Mac) or `%APPDATA%\nesicode` (Windows);
 optional configuration goes in a `.env` inside that folder.
 
+Closing the window stops the replies in progress (they are kept as interrupted; queued messages wait for the next
+launch) and every MCP server the app started.
+
 - **macOS**: `packaging/build_macos.sh` → `dist/Nesicode.app` and `dist/Nesicode-<version>-macos-<arch>.dmg`.
   Ad-hoc signed (no Apple Developer ID): the first time, right-click → Open.
 - **Windows**: `packaging/windows/build.ps1` (on Windows, with Inno Setup 6) → `dist\Nesicode-<version>-windows-x64-setup.exe`,
@@ -128,9 +136,13 @@ Downloads are on the [Releases](../../releases) page.
 - **Telegram**: drive your conversations from a Telegram bot (attach/detach chats, approvals, files).
 - **Context management** for long tasks: large outputs saved to disk, old tool results masked, structured
   summaries, and a per-conversation archive searchable with `search_history`. Context limits are discovered
-  per model.
-- **Export / import configuration**: providers with their keys, connectors, preferences and a project template,
-  in a password-encrypted file, to move everything to another computer.
+  per model; a limit learned from a provider's error is kept until you forget it (e.g. after giving a local
+  server a bigger window).
+- **Export / import configuration**: providers with their keys, connectors, preferences, bots and a project
+  template, in a password-encrypted file, to move everything to another computer. The import shows what it will
+  change first, and a file never switches anything on behind your back: local MCP servers (commands) and bots with
+  a schedule arrive switched off until you review them, approvals are never loosened (execution mode, connector
+  usage, a bot's `auto` policy), and a stored API key is never sent to an endpoint the file changed.
 - **English and Spanish** UI.
 
 ## Models
@@ -143,6 +155,12 @@ Downloads are on the [Releases](../../releases) page.
 Each user can store their own keys from the web UI (encrypted). Without them, the server's keys (`.env`) are used.
 Claude is called through the official SDK, with adaptive thinking and `fallbacks: "default"` on models that support it.
 
+Replies are streamed. A request that fails on the way (rate limit, overloaded server, dropped connection) is retried
+up to 5 times with backoff (honouring `Retry-After`); the chat shows each retry. A stream that stays silent too long
+is retried as well: `NESICODE_LLM_FIRST_BYTE_TIMEOUT` (default 300 s) is how long an OpenAI-compatible model may take
+before its first token, `NESICODE_LLM_IDLE_TIMEOUT` (default 180 s) the longest pause in the middle of a reply. Raise
+them for very slow local models or long hidden reasoning.
+
 ## Providers, per-role models and vault
 
 - In **Project settings → Providers** each user adds their own: name, type (OpenAI-compatible or Anthropic), endpoint, API key and models. There are templates, "Test connection" and "Discover models".
@@ -153,18 +171,23 @@ Claude is called through the official SDK, with adaptive thinking and `fallbacks
 
 1. **User**: everything lives under `data/workspaces/<user>/`; the API checks ownership on every request.
 2. **Project**: `…/<project>/project/` is the base folder (or a folder of your choice).
-3. **Conversation**: each conversation works in its own cage `…/threads/<id>/ws/` (a copy of the project). Its changes only reach the project when you press "Apply". In Account you can share the project folder between conversations.
+3. **Conversation**: each conversation works in its own cage `…/threads/<id>/ws/` (a copy of the project). Its changes only reach the project when you press "Apply". In Account you can share the project folder between conversations (their replies then take turns in that folder, and "Apply" from another conversation answers "busy" instead of waiting while one of them works).
 
-Every bash command runs under the OS sandbox (macOS `sandbox-exec`; on Linux use `NESICODE_SANDBOX=docker`): only its cage is readable/writable; the home folder, `data/`, the repo (`.env`) and other processes stay out of reach.
+"Apply" and uploads never write through a symbolic link in the project: a link at a path being written is replaced by the file, and a path whose folders go through a link is refused. A change that cannot be applied (for example a link in the conversation pointing outside the project) is reported and stays listed as pending. ZIP uploads are unpacked into the project (at most 20,000 entries and 1 GB unpacked); links inside a ZIP are not extracted.
+
+Every bash command runs under the OS sandbox (macOS `sandbox-exec`; on Linux use `NESICODE_SANDBOX=docker`). It can write only inside its cage and read only its cage, the system and the toolchains it needs (Python, Node, Rust… under your home); your home folder, `data/`, the repo (`.env`), other disks, other programs' Unix sockets (use TCP `127.0.0.1` for a local database) and Nesicode's own API port stay out of reach, and it cannot signal other processes, open apps or send Apple Events. The network stays open. What the sandbox cannot hide: on macOS the launch environment of every process of the same user (its command line and environment variables, `KERN_PROCARGS2`) stays readable, so keep secrets out of other processes' environment — put API keys in `.env` or the vault instead of exporting them in the shell that starts `nesicode serve` or other programs. Caged commands and MCP servers get a minimal environment without them.
 
 ## Security (read before opening it to other users)
 
 - `NESICODE_SANDBOX=auto` (default) uses the macOS sandbox; on Linux without Docker there is no OS cage.
-- On multi-user servers set `NESICODE_ALLOW_PRIVATE_PROVIDERS=0` so provider endpoints cannot point at the internal network.
+- On multi-user servers set `NESICODE_ALLOW_PRIVATE_PROVIDERS=0`: every address built from user input (provider endpoints, custom and catalog MCP connectors, git clones, imported configurations) must then be public. User endpoints are checked when saved and again on every connection (chat, model lists, context limits, transcription), so a name that later resolves to an internal address is refused before anything is sent. The operator's own providers in `.env` are never restricted.
 - For several users use `NESICODE_SANDBOX=docker`: each command runs in a throwaway container, with no network and CPU, memory and process limits.
 - Harness hooks are declarative data, not code, so a proposed harness cannot run programs on the server through them. Harness scripts do run, but inside the sandbox.
 - **Login**: `NESICODE_AUTH=false` (default) logs in directly as the local user (`NESICODE_LOCAL_USER`, or the first account). Set `NESICODE_AUTH=true` for a login screen and multiple accounts; required if the server is reachable from outside your machine.
-- Behind HTTPS, set `NESICODE_COOKIE_SECURE=1` and `NESICODE_SECRET_KEY`. With `NESICODE_ALLOW_SIGNUP=0` only the first user can sign up.
+- Behind HTTPS, set `NESICODE_COOKIE_SECURE=1` and `NESICODE_SECRET_KEY`. With `NESICODE_ALLOW_SIGNUP=0` only the first user can sign up. If the server ran without login before, that first sign-up takes over the local account and everything in it (projects, keys, settings): create your account right after switching to `NESICODE_AUTH=true`.
+- **Other websites**: requests that change something are refused when a browser says they come from another site (CSRF), with or without login. To use your own frontend or proxy on another origin, list its full origins in `NESICODE_ALLOWED_ORIGINS` (comma-separated, e.g. `https://nesi.example.com`).
+- **Host names** (DNS rebinding): without login the server only answers to IP addresses, `localhost`, single-label and `.local` names. To open it under a domain, list it in `NESICODE_ALLOWED_HOSTS` (comma-separated; `.example.com` also allows its subdomains, `*` allows any); setting it with login on enables the same check. Behind a proxy that rewrites the Host header, old browsers without fetch metadata (Safari before 16.4) also need `X-Forwarded-Host` or `NESICODE_ALLOWED_ORIGINS`.
+- The app's page sends a Content-Security-Policy (only its own scripts, no inline code, no framing by other sites) and `Referrer-Policy: no-referrer`. Images from other sites inside an answer are never loaded automatically: they show a placeholder you click to load. Generated HTML previews run in a sandbox with no access to the app, its cookies or its API, and cannot make requests of their own (they may only load libraries from three public CDNs, and images).
 
 ## Layout
 

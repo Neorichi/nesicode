@@ -827,10 +827,10 @@ def test_auto_improve_never_reruns_a_gated_conversation(alice):
         assert not any(x["type"] == "auto_harness" for x in done["events"])
         skipped = [x for x in done["events"] if x["type"] == "auto_harness_skipped"]
         assert skipped and "permiso" in skipped[0]["why"]
-        # «Mejorar harness con esta tarea» on that conversation: refused before any rollout runs a command
-        hr = _wait_run(alice, alice.post(f"/api/runs/{run['id']}/improve").json()["id"])
-        assert hr["status"] == "error" and "permiso" in hr["error"]
-        assert not any(x["type"] == "rollout" for x in hr["events"])
+        # «Mejorar harness con esta tarea» on that conversation: refused (409) before any harnessing run exists
+        r = alice.post(f"/api/runs/{run['id']}/improve")
+        assert r.status_code == 409 and "permiso" in r.json()["detail"]
+        assert not db.one("SELECT id FROM runs WHERE project_id=? AND kind='harness'", (p["id"],))
         # auto mode, but this turn needed the user's approval for something: not re-run on its own either
         t2 = alice.post(f"/api/projects/{p['id']}/threads", json={}).json()
         row = db.one("SELECT * FROM runs WHERE id=?", (run["id"],))

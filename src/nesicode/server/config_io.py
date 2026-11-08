@@ -157,6 +157,7 @@ FIELD_KEY_RX = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
 HEADER_RX = re.compile(r"^[A-Za-z0-9-]{1,60}$")
 ENV_RX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,60}$")
 TELEGRAM_RX = re.compile(r"^\d+:[A-Za-z0-9_-]{20,}$")
+KEY_RX = re.compile(r"[\x21-\x7e]+")  # = the API's: an API key is visible ASCII, no spaces
 BAD_HEADERS = {"host", "content-length", "transfer-encoding", "connection", "cookie", "upgrade"}
 # Preferences an import may make stricter but never looser (strictest first).
 STRICTER: dict[str, list] = {"exec_mode": ["ask_all", "ask_bash", "auto"], "browser_usage": ["ask", "mention", "auto"],
@@ -198,8 +199,12 @@ def validate_import(doc: dict, *, auth_enabled: bool, check_url: Callable[[str],
         if (base := url_or_none(p.get("base_url"), f"proveedor «{name}»")) is None:
             continue
         models = sorted({m.strip() for m in _items(p.get("models")) if isinstance(m, str) and 0 < len(m.strip()) <= 200})
+        key = (_text(p.get("api_key"), 500) or "").strip()
+        if key and not KEY_RX.fullmatch(key):  # (the API's rule: no HTTP header could carry it)
+            skipped.append(f"proveedor «{name}»: su API key no es válida (espacios, saltos de línea o acentos); se importa sin ella")
+            key = ""
         providers.append({"name": name, "label": (_text(p.get("label"), 60) or "").strip() or name, "kind": p["kind"],
-                          "base_url": base, "models": models[:500], "api_key": (_text(p.get("api_key"), 500) or "").strip()})
+                          "base_url": base, "models": models[:500], "api_key": key})
     out["providers"] = providers
 
     connectors = []
