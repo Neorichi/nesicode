@@ -855,3 +855,44 @@ def test_window_scaled_budgets():
     # the "no room" trigger no longer fires before the 67% summary threshold on small windows
     for w in (16_384, 24_576, 32_768):
         assert w - ctxm.safety_tokens(w) - ctxm.min_output(w) > ctxm.SUMMARY_AT * w
+
+
+# ------------------------------------------------------------------ review fixes
+def test_huge_message_stays_whole_in_the_archive_after_a_learned_limit(tmp_path, fake):
+    # configured for 128k, the real window is 32k: the message is cut twice (128k, then 32k), but the archived copy
+    # must always be the ORIGINAL message, and the context must point to it
+    prov = fake(lambda conv, rec: Turn("visto", [], "end_turn", Usage(0, 10)), window=32_768)
+    ws = Workspace(tmp_path / "ws")
+    huge = "INICIO\n" + "\n".join(f"linea {i} " + "x" * 60 for i in range(3_000)) + "\nMEDIO-UNICO-42\n" + \
+           "\n".join(f"linea b{i} " + "y" * 60 for i in range(3_000)) + "\nFIN"
+    res = _agent(ws, [], context_limit=128_000).run(huge)
+    assert res.status == "done" and len([r for r in prov.log if r["rejected"]]) == 1
+    sent = prov.executor()[0]["messages"][-1]["content"]
+    rel = re.search(r"saved in (\S+request\.md)", sent).group(1)
+    assert (ws.root / rel).read_text() == huge and "MEDIO-UNICO-42" not in sent
+
+
+def test_denser_text_than_estimated_recovers_after_a_context_error(tmp_path, fake):
+    # 3.2 chars/token (code, Spanish...) on a window smaller than configured: the re-fit must learn the density
+    # instead of re-sending the same oversized request until the run fails
+    prov = fake(lambda conv, rec: Turn("ok", [], "end_turn", Usage(0, 10)), window=16_917, cpt=3.2)
+    history = [(f"turno {i} " + "u" * 2_000, "resp " + "a" * 15_000) for i in range(4)]
+    res = _agent(Workspace(tmp_path / "ws"), [], context_limit=32_768, output_limit=4_096).run("tarea " + "t" * 30_000, history)
+    assert res.status == "done", res.error
+    assert len([r for r in prov.log if r["rejected"]]) <= 2
+    assert ctxm.prompt_tokens("However, you requested 17857 tokens (14946 in the messages, 2911 in the completion).") == 14_946
+    assert ctxm.prompt_tokens("prompt is too long: 1,050,000 tokens > 1000000 maximum") == 1_050_000
+    assert ctxm.prompt_tokens("rate limited") is None
+
+
+def test_summary_that_quotes_reasoning_tags_is_kept_intact():
+    ok = "## Goal\nFix the parser: an unclosed <think> tag and the regex `<think>.*?</think>`.\n## Next Step\nRun tests."
+    assert ctxm.clean_summary(ok) == (ok, "")
+    assert ctxm.clean_summary("<think>\nplan\n</think>\n" + ok) == (ok, "")  # a leading reasoning block still goes
+    assert ctxm.clean_summary("Let me write it.</think>\n" + ok) == (ok, "")  # opening tag eaten by a reasoning parser
+    assert ctxm.clean_summary("  <think>\ncut while thinking", "max_tokens")[1] == "unclosed reasoning block"
+
+
+def test_subagents_can_search_the_conversation_archive(tmp_path):
+    sub = Agent(model="mock/demo", harness=base_harness(), workspace=Workspace(tmp_path), depth=1, archive=".nesicode/chats/7")
+    assert "search_history" in [s.name for s in sub.tool_specs()]  # its checkpoints tell it to use it

@@ -188,6 +188,8 @@ class Agent:
         self._conv_chars = 0
         self._anchor: tuple[int, int] | None = None  # (real prompt tokens of the last request, conversation chars then)
         self._cpt = ctxm.CHARS_PER_TOKEN  # chars per token seen in the provider's real counts (≤ the default)
+        self._cpt_min = 3.0  # floor for that ratio; lowered when the provider proves the text is denser (_denser)
+        self._request_rel = ""  # where the user's full message was saved when it did not fit (written once per run)
         self._pending: list[tuple[ToolCall, ToolResult]] = []  # the tool round the model has not answered yet
         self._round_sizes: list[int] = []
         self._touched: dict[str, str] = {}  # files read/edited in this run (insertion order = recency)
@@ -231,8 +233,8 @@ class Agent:
             specs.append(GENERATE_IMAGE)
         specs.append(SHOW_IMAGE)
         specs.append(SHARE_FILE)
-        if self.depth == 0:
-            specs.append(SEARCH_HISTORY)
+        # sub-agents too: they work in the conversation's own archive, and their checkpoints point to search_history
+        specs.append(SEARCH_HISTORY)
         specs.extend(spec for spec, _ in self.extra_tools.values())
         return specs
 
@@ -304,14 +306,23 @@ class Agent:
             tokens, chars = self._anchor
             delta = self._conv_chars - chars
             return max(0, int(tokens + (delta / ratio if delta > 0 else delta / ctxm.CHARS_PER_TOKEN)))
-        return int((self._fixed_chars + self._conv_chars) / ratio)
+        return int((self._fixed_chars + self._conv_chars) / min(ratio, self._cpt))
 
     def _calibrate(self, input_tokens: int) -> None:
         """The provider counted `input_tokens` for what we sent: anchor the next estimates on it, and remember how dense
         the prompt was (code is ~3.3 chars/token) so the fit check right after a rebuild does not undercount."""
         if input_tokens > 500:
-            self._cpt = max(3.0, min(ctxm.CHARS_PER_TOKEN, (self._fixed_chars + self._conv_chars) / input_tokens))
+            self._cpt = max(self._cpt_min, min(ctxm.CHARS_PER_TOKEN, (self._fixed_chars + self._conv_chars) / input_tokens))
         self._anchor = (input_tokens, self._conv_chars)
+
+    def _denser(self, error: str) -> None:
+        """The provider rejected a request that our estimate said would fit, so this text is denser than assumed: take
+        the prompt size the error reports (else assume 15% denser) for every estimate from now on — otherwise the
+        re-fit after a context error repeats the same oversized request until the run fails."""
+        chars = self._fixed_chars + self._conv_chars
+        sent = ctxm.prompt_tokens(error)
+        cpt = chars / sent * 0.95 if sent and chars else self._cpt * 0.85
+        self._cpt = self._cpt_min = max(1.5, min(self._cpt, cpt))
 
     def _room(self) -> int:
         lim = self.context_limit
@@ -372,15 +383,19 @@ class Agent:
         return conv, task  # nothing more to cut (system + tools fill the window): the provider decides
 
     def _shrink_task(self, task: str, budget: int) -> str:
-        try:
-            rel = ctxm.write_context_file(self.ws, f"{self._archive_tag()}-request.md", task, self.archive)
-        except Exception:
-            return ctxm.clip(task, budget, "message")
-        note = (f"\n[... the middle of this message ({len(task):,} chars in total) does not fit in the context window; "
-                f"the FULL message is saved in {rel} — read the missing part with read_file (offset/limit) ...]\n")
+        # Always cut from (and archive) the ORIGINAL message: a re-fit after a smaller limit is learned must not
+        # overwrite the saved copy with an already-shortened one.
+        full = self._task_full or task
+        if not self._request_rel:
+            try:
+                self._request_rel = ctxm.write_context_file(self.ws, f"{self._archive_tag()}-request.md", full, self.archive)
+            except Exception:
+                return ctxm.clip(full, budget, "message")
+        note = (f"\n[... the middle of this message ({len(full):,} chars in total) does not fit in the context window; "
+                f"the FULL message is saved in {self._request_rel} — read the missing part with read_file (offset/limit) ...]\n")
         keep = max(0, budget - len(note))
         head = keep * 2 // 3
-        return task[:head] + note + task[len(task) - (keep - head):]
+        return full[:head] + note + full[len(full) - (keep - head):]
 
     def _archive_tag(self) -> str:
         """Per-run prefix of the archive files, so later runs never overwrite earlier ones."""
@@ -472,8 +487,8 @@ class Agent:
                                                 "que quepa en la ventana de contexto.)\n"), self.archive)
         if work or summary:
             conv = self._rebuild(provider, model, system, options, task, summary, anchors, new_events, tr_rel)
-        else:  # nothing done yet in this run: the start of the conversation, re-fitted to the window
-            conv, task = self._first_conversation(provider, model, system, options, task)
+        else:  # nothing done yet in this run: the start of the conversation, re-fitted to the window (from the original)
+            conv, task = self._first_conversation(provider, model, system, options, self._task_full or task)
             self._task = task
             if self._nudged:
                 self._add_user(conv, FINAL_NUDGE)
@@ -614,7 +629,11 @@ class Agent:
         if self._history:
             lines.append("(The user/assistant messages before this one are earlier turns of this conversation; rules the "
                          "user stated there still apply.)")
-        lines.append("## The user's latest message (verbatim)\n" + ctxm.clip(task, max(600, b["task"]), "message"))
+        shown = ctxm.clip(task, max(600, b["task"]), "message")
+        where = self._request_rel or (tr_rel if shown != task else "")  # the transcript starts with the full message
+        if where and where not in shown:
+            shown += f"\n[The user's full message is saved in {where} — read what is not shown here with read_file.]"
+        lines.append("## The user's latest message (verbatim)\n" + shown)
         if summary:
             lines.append(self._clip_summary(summary, max(1_200, b["summary"])))
         if anchors and b["anchors"] >= 300:
@@ -876,6 +895,7 @@ class Agent:
         self._history = list(history or [])
         self._task = self._task_full = task
         self._tag, self._tag_ok = "", False  # archive files of this run get their own prefix (created on first use)
+        self._request_rel = ""
         try:
             provider, model = get_provider(self.model_spec, self.user_keys)
             if self.depth == 0:
@@ -930,6 +950,7 @@ class Agent:
                         raise
                     # The model told us its real limit: remember it, re-fit everything to it and try again.
                     self._limit_errors += 1
+                    self._denser(str(exc))
                     if self.context_limit != learned:
                         self.context_limit = learned
                         if self.on_limit:

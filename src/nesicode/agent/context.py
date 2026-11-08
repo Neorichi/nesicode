@@ -67,6 +67,23 @@ def summary_target(limit: int) -> int:
     return max(600, min(4_000, int(limit * 0.04)))
 
 
+_PROMPT_TOKENS_RX = (
+    r"\(([0-9][0-9,]*) in the messages",            # vLLM / OpenAI: "you requested N tokens (M in the messages, ...)"
+    r"messages resulted in ([0-9][0-9,]*) tokens",  # OpenAI
+    r"request has ([0-9][0-9,]*) input tokens",     # vLLM (newer wording)
+    r"prompt is too long: ([0-9][0-9,]*) tokens",   # Anthropic
+    r"request \(([0-9][0-9,]*) tokens\) exceeds",   # llama.cpp
+)
+
+
+def prompt_tokens(error: str) -> int | None:
+    """Size of the rejected prompt as the provider reports it in a context-window error (None if it does not say)."""
+    for rx in _PROMPT_TOKENS_RX:
+        if m := re.search(rx, error or "", re.I):
+            return int(m.group(1).replace(",", "")) or None
+    return None
+
+
 def tools_chars(specs) -> int:
     """Size of the tool schemas sent with every request."""
     return len(json.dumps([{"name": s.name, "description": s.description, "parameters": s.parameters}
@@ -472,12 +489,16 @@ def clean_summary(text: str, stop_reason: str = "end_turn", thinking: str = "") 
     s = text or ""
     if not s.strip() and thinking and "## Next Step" in thinking:  # some servers put the whole answer in reasoning
         s = thinking[thinking.find("## Goal"):] if "## Goal" in thinking else thinking
-    s = re.sub(r"<think>.*?</think>|<analysis>.*?</analysis>", "", s, flags=re.S)
-    if "</think>" in s and "<think>" not in s:  # the opening tag was eaten by a reasoning parser
-        s = s.split("</think>")[-1]
-    s = s.strip()
-    if re.search(r"<(?:think|analysis)>", s):
+    # Reasoning blocks only count at the very START of the reply: the summary itself may quote the tags (work on a
+    # parser for them, a regex...) and that text must stay intact and must not get the summary rejected.
+    while m := re.match(r"\s*<(think|analysis)>.*?</\1>", s, re.S):
+        s = s[m.end():]
+    if re.match(r"\s*<(?:think|analysis)>", s):
         return "", "unclosed reasoning block"
+    head, sep, rest = s.partition("</think>")
+    if sep and not re.match(r"\s*#", s) and "## Next Step" not in head:  # the opening tag was eaten by a reasoning parser
+        s = rest
+    s = s.strip()
     if not s:
         return "", "empty"
     if stop_reason == "max_tokens" and "## Next Step" not in s:
