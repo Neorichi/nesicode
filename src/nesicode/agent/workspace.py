@@ -48,6 +48,40 @@ class ToolError(Exception):
     """A tool failed in a way the model should see and recover from."""
 
 
+class Stopped(ToolError):
+    """The user pressed Stop while a call that cannot be interrupted was in flight (it is abandoned, not waited for)."""
+
+
+def interruptible(cancel: threading.Event | None, fn, name: str = "nesi-call"):
+    """Run a blocking call (an MCP request, a Chrome command, a vision model…) in a helper thread and wait for it in
+    short slices, so Stop returns at once instead of when the call ends (up to minutes): Stopped. The abandoned call
+    finishes, or times out, in the background and its result is dropped. No `cancel`: a plain call."""
+    if cancel is None:
+        return fn()
+    if cancel.is_set():
+        raise Stopped("stopped by the user")
+    box: dict = {}
+    done = threading.Event()
+
+    def target() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the caller's thread
+            box["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=target, daemon=True, name=name).start()
+    while not done.wait(0.2):
+        if cancel.is_set():
+            raise Stopped("stopped by the user")
+    if "error" in box:
+        if cancel.is_set():  # a call that honours Stop itself ended because of it: the same answer either way
+            raise Stopped("stopped by the user") from box["error"]
+        raise box["error"]
+    return box["value"]
+
+
 REPO_DIR = Path(__file__).resolve().parents[3]
 # Toolchains under $HOME that caged commands may READ (never write): only the parts that hold programs,
 # so other apps' data under ~/.local/share stays out of reach.
@@ -399,6 +433,73 @@ def _real_dir_at(dfd: int, name: str) -> int:
     return os.open(name, os.O_RDONLY | _DIRECTORY | _NOFOLLOW | _CLOEXEC, dir_fd=dfd)
 
 
+def store_new_file(root: Path, folder: str, name: str, data: bytes) -> str:
+    """Save `data` as a NEW file in root/<folder> (made if missing) named `name`, or name-2, name-3… when that is taken;
+    returns the name used. Nothing is followed: a link at the folder (the agent can plant one, `ln -s ~/x .attachments`)
+    is replaced by a real folder, never written through, and every name is created with O_EXCL, which refuses an
+    existing entry — a dangling link too (writing through it would create a file wherever it points). A file where the
+    folder should be is not touched: OSError (ToolError for a path out of root)."""
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    names = (name if n == 1 else f"{stem}-{n}.{ext}" if ext else f"{stem}-{n}" for n in range(1, 100_000))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _CLOEXEC | _BINARY
+    try:
+        parts = _parts(root, folder)
+    except (OSError, ValueError):
+        raise ToolError(f"{folder!r} is not a folder inside the workspace") from None
+
+    def _real_folder(dfd: int, part: str) -> int:
+        try:  # a link there goes (only the link); a file there stays and makes the open below fail
+            if stat.S_ISLNK(os.stat(part, dir_fd=dfd, follow_symlinks=False).st_mode):
+                os.unlink(part, dir_fd=dfd)
+        except FileNotFoundError:
+            pass
+        try:
+            os.mkdir(part, 0o777, dir_fd=dfd)
+        except FileExistsError:
+            pass
+        return os.open(part, os.O_RDONLY | _DIRECTORY | _NOFOLLOW | _CLOEXEC, dir_fd=dfd)
+
+    if _FD_WALK:
+        dfd = os.open(root, os.O_RDONLY | _DIRECTORY | _CLOEXEC)
+        try:
+            for part in parts:
+                nfd = _real_folder(dfd, part)
+                os.close(dfd)
+                dfd = nfd
+            for candidate in names:
+                try:
+                    fd = os.open(candidate, flags | _NOFOLLOW, 0o666, dir_fd=dfd)
+                    break
+                except FileExistsError:
+                    continue
+            else:
+                raise OSError(errno.EEXIST, "no free name", name)
+        finally:
+            os.close(dfd)
+    else:  # Windows (links need admin rights there): check each folder instead
+        d = Path(root)
+        for part in parts:
+            d = d / part
+            if d.is_symlink():
+                d.unlink()
+            d.mkdir(exist_ok=True)
+            if d.is_symlink() or not d.is_dir():
+                raise OSError(errno.ENOTDIR, "not a folder", str(d))
+        for candidate in names:
+            try:
+                fd = os.open(d / candidate, flags)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise OSError(errno.EEXIST, "no free name", name)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return candidate
+
+
 # ---------------------------------------------------------------- text files
 _UTF8_BOM = b"\xef\xbb\xbf"
 _SURROGATES = re.compile("[\udc80-\udcff]")
@@ -616,9 +717,38 @@ def changes_since(base: dict[str, str], root: Path, compare_to: Path, max_chars:
     return {"added": added, "modified": modified, "removed": removed, "diff": _diff_text(chunks, max_chars)}
 
 
+def _real(p: Path | str) -> str:
+    # (realpath leaves the rest of the path as written past a link loop — maybe '..' — so it is normalised too: a path
+    # through a loop is judged by its letters, which never makes it look inside when it is not)
+    return os.path.normpath(os.path.realpath(p))
+
+
 def _link_stays_inside(target_root: Path, rel: str, link: str) -> bool:
     root = os.path.realpath(target_root)
-    return _within(os.path.realpath(os.path.join(root, os.path.dirname(rel), link)), root)
+    return _within(_real(os.path.join(root, os.path.dirname(rel), link)), root)
+
+
+def _escaping_links(target: Path, rels: list[str]) -> dict[str, str]:
+    """Of the entries `rels` an apply just wrote into `target`, the links that point out of it now that all of them
+    exist — each was checked when written, against the folder as it was then and where it was made, but a link the user
+    made in the folder meanwhile can still complete a chain (`a -> y/z/../x`, `y -> .` from the apply, `z -> .` the
+    user's). They are removed again (until none is left: removing one changes where others lead). {rel: link text}."""
+    links = {}
+    for rel in rels:
+        try:
+            if stat.S_ISLNK(os.lstat(Path(target, rel)).st_mode):
+                links[rel] = os.readlink(Path(target, rel))
+        except OSError:
+            continue
+    root, out = os.path.realpath(target), {}
+    while bad := [rel for rel in links if rel not in out and not _within(_real(Path(target, rel)), root)]:
+        for rel in bad:
+            try:
+                _unlink_entry(Path(target), rel)  # the link itself, never what it points to
+            except OSError:
+                pass
+            out[rel] = links[rel]
+    return out
 
 
 def _clear_at(dfd: int, name: str) -> None:
@@ -642,7 +772,10 @@ def _copy_entry(src_root: Path, dst_root: Path, rel: str, dst_rel: str | None = 
     parts = _parts(dst_root, rel)
     if stat.S_ISLNK(st.st_mode):
         link = os.readlink(src)
-        if not _link_stays_inside(dst_root, rel, link):
+        # Judged in dst_root as it is now, and — copied to the same place — also in src_root, where every link of the
+        # change already exists: one at a time, `a -> y/z/../../x` looks inside until `y -> .` and `z -> .` are there.
+        if not _link_stays_inside(dst_root, rel, link) or (
+                rel == src_rel and not _within(_real(src), os.path.realpath(src_root))):
             raise OSError(errno.EPERM, f"symlink to {link} would point outside the project")
         if _FD_WALK:
             dfd = _parent_fd(dst_root, parts, mkdirs=True)
@@ -739,6 +872,9 @@ def _apply(src_root: Path, target: Path, added: list[str], modified: list[str], 
                 out[key].append(rel)
             except OSError as exc:
                 out["skipped"].append(f"{rel}: {_why(exc)}")
+    for rel, link in _escaping_links(Path(target), out["added"] + out["modified"]).items():
+        out["added" if rel in out["added"] else "modified"].remove(rel)
+        out["skipped"].append(f"{rel}: symlink to {link} would point outside the project")
     return out
 
 

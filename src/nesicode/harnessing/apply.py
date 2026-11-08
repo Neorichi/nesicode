@@ -17,7 +17,7 @@ from pathlib import Path
 from ..agent import diff_workspaces
 # fd-based helpers: every folder on the way is opened without following a link (a link swapped in after a check is
 # refused, never written through) and nothing but a regular file is opened (a FIFO would block the apply)
-from ..agent.workspace import _copy_entry, _open_beneath, _unlink_entry
+from ..agent.workspace import _copy_entry, _escaping_links, _open_beneath, _unlink_entry
 
 SIDE_SUFFIX = ".nesicode-new"
 CHUNK = 1 << 20
@@ -107,6 +107,7 @@ def apply_rollout(before: Path, after: Path, target: Path) -> dict:
                 pass
         done["conflicts"].append({"path": rel, "reason": reason, "side_file": side_file})
 
+    written: list[str] = []
     # Removals first: a case-only rename (button.tsx -> Button.tsx) on a case-insensitive disk is one file,
     # and removing after copying would delete the renamed file.
     for rel in d["removed"]:
@@ -141,7 +142,12 @@ def apply_rollout(before: Path, after: Path, target: Path) -> dict:
             try:
                 _copy_entry(after, target, rel)
                 done[kind].append(rel)
+                written.append(rel)
             except (OSError, ValueError) as exc:  # a link on the way or out of the project; a full folder in the way…
                 why = _reason(target, rel, exc, link=os.path.islink(after / rel))
                 conflict(rel, why, side=why != UNSAFE)
+    # every link written was inside when it was written; one that leaves the project now that all exist goes again
+    for rel in _escaping_links(target, written):
+        done["added" if rel in done["added"] else "modified"].remove(rel)
+        conflict(rel, UNSAFE, side=False)
     return done

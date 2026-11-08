@@ -17,7 +17,9 @@ import tempfile
 import threading
 from pathlib import Path
 
-from .config import settings
+# The settings (nesicode.config) are loaded by the commands that use them, never when this module is imported:
+# `nesicode desktop` has to say it is the desktop app first (desktop.main sets NESICODE_DESKTOP), or its data would go
+# to ./data and the app folder's .env would never be read — while its log and WebKit storage still go to the app folder.
 
 CONFLICT_WHY = {
     "changed": "cambió en el proyecto después de empezar la ejecución",
@@ -81,6 +83,12 @@ def _ctrl_c_stops(cancel: threading.Event):
         signal.signal(signal.SIGINT, previous if previous is not None else signal.default_int_handler)
 
 
+def _default_model() -> str:
+    from .config import settings
+
+    return settings.default_executor_model
+
+
 def _limits(spec: str) -> tuple[int, int]:
     """(context, output) tokens of `provider/model`: the known table, else the defaults (as the server does)."""
     from .llm import DEFAULT_LIMITS, known_limits
@@ -105,6 +113,8 @@ def _print_applied(ch: dict) -> None:
 def cmd_serve(a) -> None:
     import uvicorn
 
+    from .config import settings
+
     if settings.sandbox == "local":
         print("Aviso: NESICODE_SANDBOX=local ejecuta bash en este host. Para varios usuarios usa NESICODE_SANDBOX=docker.")
     if not settings.auth_enabled and a.host not in ("127.0.0.1", "localhost", "::1"):
@@ -116,8 +126,9 @@ def cmd_run(a) -> None:
     from .agent import Agent, Workspace
 
     cancel = threading.Event()
-    context, output = _limits(a.model)
-    agent = Agent(model=a.model, harness=_load_harness(a.harness), workspace=Workspace(a.workspace),
+    model = a.model or _default_model()
+    context, output = _limits(model)
+    agent = Agent(model=model, harness=_load_harness(a.harness), workspace=Workspace(a.workspace),
                   emit=lambda e: e.get("_persist", True) and _print_event(e), max_steps=a.max_steps, cancel=cancel,
                   context_limit=context, output_limit=output)
     with _ctrl_c_stops(cancel):
@@ -135,9 +146,10 @@ def cmd_harness(a) -> None:
         print(f"Error: --out ({out}) tiene que quedar fuera de --workspace ({ws}): guarda copias del proyecto "
               "y dentro de él se copiaría a sí mismo.", file=sys.stderr)
         sys.exit(2)
-    improver = a.improver or a.model
-    (context, output), (i_context, i_output) = _limits(a.model), _limits(improver)
-    cfg = HarnessingConfig(task=a.task, executor_model=a.model, improver_model=improver, k=a.k, mode=a.mode,
+    model = a.model or _default_model()
+    improver = a.improver or model
+    (context, output), (i_context, i_output) = _limits(model), _limits(improver)
+    cfg = HarnessingConfig(task=a.task, executor_model=model, improver_model=improver, k=a.k, mode=a.mode,
                            check_command=a.check or "", domain=a.domain, context_limit=context, output_limit=output,
                            improver_context=i_context, improver_output=i_output)
     cancel = threading.Event()
@@ -193,7 +205,7 @@ def main(argv: list[str] | None = None) -> None:
     r = sub.add_parser("run", help="ejecuta el agente una vez")
     r.add_argument("task")
     r.add_argument("--workspace", default=".")
-    r.add_argument("--model", default=settings.default_executor_model)
+    r.add_argument("--model", help="proveedor/modelo (por defecto NESICODE_EXECUTOR_MODEL)")
     r.add_argument("--harness", help="JSON {path: content}")
     r.add_argument("--max-steps", type=int, default=60)
     r.set_defaults(fn=cmd_run)
@@ -201,7 +213,7 @@ def main(argv: list[str] | None = None) -> None:
     h = sub.add_parser("harness", help="Harness² sobre una tarea")
     h.add_argument("task")
     h.add_argument("--workspace", default=".")
-    h.add_argument("--model", default=settings.default_executor_model)
+    h.add_argument("--model", help="proveedor/modelo (por defecto NESICODE_EXECUTOR_MODEL)")
     h.add_argument("--improver")
     h.add_argument("--k", type=int, default=1)
     h.add_argument("--mode", choices=["parallel", "sequential"], default="parallel")
