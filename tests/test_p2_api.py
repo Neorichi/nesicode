@@ -71,6 +71,24 @@ def test_leaving_blank_after_its_opening_line_was_rewritten():
     assert not new["system_prompt.md"].startswith("You are a careful agent")
 
 
+def test_a_version_restored_after_switching_to_blank_is_judged_by_its_own_text():
+    """Security → Blank → «Restaurar» the security version (projects.profile still says blank) → Web: the result is the
+    restored harness switched to Web, never the security text grafted onto the base harness."""
+    from nesicode.harness.profiles import PROFILES, apply_profile
+
+    c = _user("r1b")
+    p = _project(c, profile="security")
+    v1 = _row("projects", p["id"])["harness_version"]
+    assert c.post(f"/api/projects/{p['id']}/profile", json={"profile": "blank"}).status_code == 200
+    assert c.post(f"/api/projects/{p['id']}/harness/restore/{v1}").status_code == 200
+    restored = _harness(c, p)
+    assert _row("projects", p["id"])["profile"] == "blank"
+    assert c.post(f"/api/projects/{p['id']}/profile", json={"profile": "webdev"}).status_code == 200
+    new = _harness(c, p)
+    assert new == apply_profile(restored, "webdev")
+    assert PROFILES["security"]["intro"] not in new["system_prompt.md"]
+
+
 # ------------------------------------------------------------------ R2: old profile texts upgraded once at startup
 def test_startup_upgrades_old_profile_texts_once_and_keeps_what_was_learned():
     from nesicode.harness import profiles

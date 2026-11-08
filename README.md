@@ -155,8 +155,8 @@ Downloads are on the [Releases](../../releases) page.
 Each user can store their own keys from the web UI (encrypted). Without them, the server's keys (`.env`) are used.
 Claude is called through the official SDK, with adaptive thinking and `fallbacks: "default"` on models that support it.
 
-Replies are streamed. A request that fails on the way (rate limit, overloaded server, dropped connection) is retried
-up to 5 times with backoff (honouring `Retry-After`); the chat shows each retry. A stream that stays silent too long
+Replies are streamed. A request that fails on the way (rate limit, overloaded server, dropped connection) is tried
+up to 5 times in all, with backoff (honouring `Retry-After`); the chat shows each retry. A stream that stays silent too long
 is retried as well: `NESICODE_LLM_FIRST_BYTE_TIMEOUT` (default 300 s) is how long an OpenAI-compatible model may take
 before its first token, `NESICODE_LLM_IDLE_TIMEOUT` (default 180 s) the longest pause in the middle of a reply. Raise
 them for very slow local models or long hidden reasoning.
@@ -180,7 +180,7 @@ Every bash command runs under the OS sandbox (macOS `sandbox-exec`; on Linux use
 ## Security (read before opening it to other users)
 
 - `NESICODE_SANDBOX=auto` (default) uses the macOS sandbox; on Linux without Docker there is no OS cage.
-- On multi-user servers set `NESICODE_ALLOW_PRIVATE_PROVIDERS=0`: every address built from user input (provider endpoints, custom and catalog MCP connectors, git clones, imported configurations) must then be public. User endpoints are checked when saved and again on every connection (chat, model lists, context limits, transcription), so a name that later resolves to an internal address is refused before anything is sent. The operator's own providers in `.env` are never restricted.
+- On multi-user servers set `NESICODE_ALLOW_PRIVATE_PROVIDERS=0`: every address built from user input (provider endpoints, custom and catalog MCP connectors, git clones, imported configurations) must then be public. Provider endpoints are checked when saved and again on every connection the app makes to them (chat, model lists, context limits, transcription in the app), so a name that later resolves to an internal address is refused before anything is sent; HTTP MCP connectors and the transcription of Telegram voice notes are only checked when saved. The operator's own providers in `.env` are never restricted.
 - For several users use `NESICODE_SANDBOX=docker`: each command runs in a throwaway container, with no network and CPU, memory and process limits.
 - Harness hooks are declarative data, not code, so a proposed harness cannot run programs on the server through them. Harness scripts do run, but inside the sandbox.
 - **Login**: `NESICODE_AUTH=false` (default) logs in directly as the local user (`NESICODE_LOCAL_USER`, or the first account). Set `NESICODE_AUTH=true` for a login screen and multiple accounts; required if the server is reachable from outside your machine.

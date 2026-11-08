@@ -1965,6 +1965,22 @@ class ProfileChange(BaseModel):
     profile: str = Field(pattern="^[a-z0-9_-]{1,30}$")
 
 
+def _profile_now(files: dict[str, str], stored: str | None) -> str | None:
+    """The profile a switch starts from. The stored one decides leaving Blank, even after an improvement rewrote Blank's
+    opening line — unless the harness plainly carries another profile (its markers, or a non-Blank opening line): a
+    version restored from the history after switching to Blank (the restore leaves projects.profile alone). Taking that
+    one for Blank would graft its text onto the base harness ('senior ethical hacker' kept in a web project)."""
+    from ..harness.profiles import BASE_INTRO, MARK_RX, OVERLAY_FILES, PROFILES, is_blank
+
+    if stored != "blank" or is_blank(files):
+        return stored
+    sp = files.get("system_prompt.md", "").lstrip()
+    intros = [BASE_INTRO] + [q["intro"] for q in PROFILES.values() if q.get("intro")]
+    if any(sp.startswith(i) for i in intros) or any(MARK_RX.search(files.get(n) or "") for n in OVERLAY_FILES):
+        return None  # judged by its own text (apply_profile)
+    return stored
+
+
 @app.post("/api/projects/{project_id}/profile")
 def change_profile(project_id: int, body: ProfileChange, user: dict = Depends(current_user)):
     """Switch the project's profile: a new harness version with the new profile's blocks and skills
@@ -1975,7 +1991,8 @@ def change_profile(project_id: int, body: ProfileChange, user: dict = Depends(cu
     if body.profile not in PROFILES:
         raise HTTPException(422, "Perfil desconocido")
     # leaving Blank is decided by the stored profile, even after an improvement rewrote Blank's opening line
-    files = apply_profile(current_harness(db, p), body.profile, current=p.get("profile"))
+    files = current_harness(db, p)
+    files = apply_profile(files, body.profile, current=_profile_now(files, p.get("profile")))
     errors = validate(files)
     if errors:
         raise HTTPException(422, "; ".join(errors))
@@ -3169,9 +3186,10 @@ def apply_run(run_id: int, user: dict = Depends(current_user)):
             prepare_targets(project_ws(p), d["added"] + d["modified"], d["removed"])
     try:
         return {"changes": jobs.apply_later(run_id, p)}  # (a lock still taken by then: ProjectBusy -> 409)
-    except FileNotFoundError as exc:
-        raise HTTPException(410, "Ya no se puede aplicar: las copias del proyecto de esta ejecución se han borrado (solo se "
-                                 "guardan las de las últimas ejecuciones). Vuelve a lanzarla si quieres sus cambios.") from exc
+    except FileNotFoundError as exc:  # (copies dropped once applied, or pruned: never "run it again" for applied ones)
+        raise HTTPException(410, "Ya no se puede aplicar: las copias del proyecto de esta ejecución ya no existen (sus "
+                                 "cambios ya se aplicaron, o se borraron para liberar espacio: solo se guardan las de las "
+                                 "últimas ejecuciones sin aplicar).") from exc
 
 
 @app.get("/api/runs/{run_id}/stream")
