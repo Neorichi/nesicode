@@ -344,6 +344,14 @@ def conversation_history(db, run: dict, window: int | None = None) -> tuple[list
         if stopped:
             if not n and not answer and not said[r["id"]]:
                 answer = f"[this turn was {r['status']} before doing any work]"
+                # stopped while still reasoning: the end of that reasoning comes along (it never takes the trail slot
+                # of a turn that did work before it)
+                thought = next((str(e.get("text") or "").strip() for e in reversed(ev) if e.get("type") == "thinking"
+                                and not e.get("depth") and str(e.get("text") or "").strip()), "")
+                if thought:
+                    answer = (f"[this turn was {r['status']} while still reasoning, before doing any work; the end of "
+                              "its reasoning (private notes, unverified):]\n"
+                              + redact(("…" if len(thought) > 1_500 else "") + thought[-1_500:]))
             else:
                 digest = run_digest(ev, actions=not trail, last_words=not trail)  # the trail ends with them
                 partial = (f"\n[Partial answer] {answer[:800]}" if answer and answer[:200] not in digest + trail

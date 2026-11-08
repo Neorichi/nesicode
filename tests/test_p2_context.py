@@ -1121,3 +1121,22 @@ def test_archive_listing_without_dir_fds_refuses_a_link_pointing_out_of_the_work
     monkeypatch.setattr(Workspace, "open_dir", lambda self, p: None)  # the Windows path: no directory fds
     files = [ws.rel(p) for p in ctxm._archive_files(ws, ".nesicode/chats/1")]
     assert files == [".nesicode/chats/1/outputs/propio.txt"]
+
+
+def test_a_turn_stopped_while_still_reasoning_brings_the_end_of_its_reasoning():
+    from nesicode.server.app import db
+    from nesicode.server.jobs import conversation_history
+
+    _, p, t = _client()
+    now = time.time()
+    _run(p, t, "revisa el monorepo", "cancelled", "", _long_turn(steps=8) + [{"type": "cancelled"}], at=now - 10)
+    _run(p, t, "continúa", "cancelled", "", [
+        {"type": "start"},
+        {"type": "thinking", "text": "x" * 5_000 + " el bug está en queue.ts:413 (BUG-413)", "interrupted": True},
+        {"type": "cancelled"}], at=now - 5)
+    history, interrupted = conversation_history(db, _run(p, t, "sigue", "waiting", at=now), window=32_768)
+    worked, thinking = history[0][1], history[1][1]
+    assert loopmod.TRAIL_MARK in worked and interrupted["steps"] == 8  # the turn that worked keeps the trail slot
+    assert interrupted.get("later_empty") == 1
+    assert thinking.startswith("[this turn was cancelled while still reasoning, before doing any work")
+    assert thinking.endswith("(BUG-413)") and len(thinking) < 1_800 and "unverified" in thinking
