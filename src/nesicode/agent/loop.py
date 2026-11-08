@@ -718,8 +718,9 @@ class Agent:
         return "\n\n".join(parts)
 
     def _rebuild(self, provider, model, system, options, task, summary, anchors, new_events, tr_rel):
-        """New conversation: system + earlier turns (re-fitted) + checkpoint, aiming at ~35% of the window so the next
-        compaction is far away even on 16k-32k windows: above it the parts shrink in order (tail, files, skills,
+        """New conversation: system + earlier turns (re-fitted) + checkpoint, aiming at ~35% of a small window and ~32k
+        tokens of a 128k one (ctxm.post_compact_target), so the next compaction is far away and Layer 1 has room to work
+        in between: above it the parts shrink in order (tail, files, skills,
         identifiers, history); the essentials (unanswered results, summary, the user's message) only while the rebuild
         is still over half the window."""
         lim = self.context_limit
@@ -741,7 +742,7 @@ class Agent:
             msg = self._checkpoint(task, summary, anchors, tail_events, b, cache, git, saved, tr_rel)
             chars = sum(len(u) + len(a) + 32 for u, a in hist) + len(msg) + 16
             est = int((self._fixed_chars + chars) / self._cpt)
-            if est <= lim * ctxm.POST_COMPACT_TARGET:
+            if est <= ctxm.post_compact_target(lim):
                 break
             k = next((k for k in order if scale[k] > 0.125 and k not in essential), None)
             if k is None and est > lim * ctxm.POST_COMPACT_MAX:
@@ -1160,8 +1161,14 @@ class Agent:
                         self._add_user(conv, note)
                         conv = self._after_step(conv, provider, model, system, options, turn, [])
                         continue
-                    msg = (f"La respuesta del modelo se cortó en el límite de salida ({options.max_tokens:,} tokens) "
-                           f"{self._continuations + 1} veces seguidas.")
+                    out, cap = turn.usage.output_tokens, options.max_tokens or 0
+                    if out and out * 4 < cap:  # stopped far below the cap: not the model running out of room
+                        msg = (f"El proveedor cortó la respuesta del modelo {self._continuations + 1} veces seguidas "
+                               f"(finish_reason=length) tras solo {out:,} tokens de {cap:,} permitidos: fallo temporal "
+                               "del servidor o un límite de salida menor en el proveedor. Escribe «continúa» para reintentar.")
+                    else:
+                        msg = (f"La respuesta del modelo se cortó en el límite de salida ({cap:,} tokens) "
+                               f"{self._continuations + 1} veces seguidas.")
                     self.emit({"type": "error", "text": msg})
                     return AgentResult(final_text, "error", steps, usage, self.events, error=msg)
                 if turn.text:
@@ -1233,7 +1240,9 @@ class Agent:
             if freed:
                 reason = "masked"
                 self.emit({"type": "masked", "freed": freed // 4, "used": used, "limit": lim})
-            self._masked_at = used
+                # Hysteresis only after a real masking: a dry run that found too little to clear must not postpone the
+                # next try by min_freed tokens (it then came after the compaction threshold: Layer 1 never ran there).
+                self._masked_at = used
         # Small windows, past MASK_AT: only the newest reply keeps its replayed reasoning, whatever tool results are kept
         # (each reply's reasoning piled up next to them: a 16k-32k reasoning model compacted every 3-4 calls). After the
         # first time each step only changes the reply before the newest, near the end: the prompt cache stays valid.

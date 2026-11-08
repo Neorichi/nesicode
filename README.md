@@ -155,8 +155,9 @@ Downloads are on the [Releases](../../releases) page.
 Each user can store their own keys from the web UI (encrypted). Without them, the server's keys (`.env`) are used.
 Claude is called through the official SDK, with adaptive thinking and `fallbacks: "default"` on models that support it.
 
-Replies are streamed. A request that fails on the way (rate limit, overloaded server, dropped connection) is tried
-up to 5 times in all, with backoff (honouring `Retry-After`); the chat shows each retry. A stream that stays silent too long
+Replies are streamed. A request that fails on the way (rate limit, overloaded server, dropped connection, a reply the
+server stops as `length` after a handful of tokens) is tried up to 8 times in all, with backoff (honouring
+`Retry-After`; about 3 minutes of waiting, and no new attempt after 15 minutes); the chat shows each retry. A stream that stays silent too long
 is retried as well: `NESICODE_LLM_FIRST_BYTE_TIMEOUT` (default 300 s) is how long an OpenAI-compatible model may take
 before its first token, `NESICODE_LLM_IDLE_TIMEOUT` (default 180 s) the longest pause in the middle of a reply. Raise
 them for very slow local models or long hidden reasoning.
