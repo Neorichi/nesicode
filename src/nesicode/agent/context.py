@@ -675,8 +675,8 @@ def _archive_files(ws: Workspace, archive: str) -> list:
             continue
         if fd is not None:
             os.close(fd)
-        elif any(os.path.islink(p) for p in [d, *d.parents] if ws.contains(p) and p != ws.root):
-            continue  # (no dir fds, e.g. Windows) a link on the way
+        elif any(os.path.islink(p) for p in [d, *d.parents] if ws.root in p.parents):
+            continue  # (no dir fds, e.g. Windows) a link on the way — wherever it points (inside or out)
         for p in _walk(d):
             try:
                 found.append((os.stat(p, follow_symlinks=False).st_mtime, p))
@@ -715,6 +715,7 @@ _LINE_KIND = (("[ASSISTANT]", "said"), ("[THINKING]", "said"), ("[REASONING", "s
               ("## The user's request", "user"), ("### Respuesta final", "said"), ("[ACTION]", "action"),
               ("[OBSERVATION]", "output"), ("[ERROR]", "output"), ("### Pasos", "other"), ("## Steps", "other"))
 _KIND_RANK = {"said": 0, "user": 0, "summary": 1, "action": 2, "other": 2, "output": 3}
+_NO_WORDS: frozenset = frozenset()
 
 
 def _ranked(ws, files, words: list[str]) -> str:
@@ -724,10 +725,11 @@ def _ranked(ws, files, words: list[str]) -> str:
     for order, (rel, lines) in enumerate(_read_all(ws, files)):
         kind = "output" if "/outputs/" in f"/{rel}" else ("summary" if "compact-" in rel.rsplit("/", 1)[-1] else "other")
         base = kind
-        found = []
+        found = []  # the query words on each line (one shared empty set for the many lines without any)
         for ln in lines:
             low = ln.lower()
-            found.append({w for w in words if w in low})
+            hit = [w for w in words if w in low]
+            found.append(frozenset(hit) if hit else _NO_WORDS)
         for i, line in enumerate(lines):
             if base != "output":
                 kind = next((k for prefix, k in _LINE_KIND if line.startswith(prefix)), kind)
@@ -780,9 +782,11 @@ _CLI_PASS_RX = re.compile(
 # HTTP statuses come only from status lines (curl -i / -v, raw responses of MCP and browser tools), and only in the
 # outputs of network tools: never a source line such as `response.status === 401` or a JSON field of a file read.
 _HTTP_STATUS_RX = re.compile(r"(?m)^(?:< )?HTTP/\d(?:\.\d)?\s+([1-5]\d\d)\b")
-# A command that talks HTTP: curl/wget/httpie/xh as a command word (first word of the line, or after ; & | ( $( `)
-_NET_CMD = re.compile(r"(?:^|[;&|(`]|\$\()\s*(?:(?:sudo|time|command|exec|nohup)\s+|[A-Za-z_]\w*=\S*\s+)*"
-                      r"(?:[\w./-]*/)?(?:curl|wget|https?|xh)(?=\s|$)", re.M)
+# A command that talks HTTP: curl/wget/httpie/xh as a command word (first word of the line, or after ; & | ( $( ` { !
+# or do/then/else/if/while/until), maybe behind wrappers (`timeout 20 curl`, `xargs -n1 curl`, `env A=1 curl`)
+_NET_CMD = re.compile(r"(?:^|[;&|(`{!]|\$\(|\b(?:do|then|else|if|while|until)\b)\s*"
+                      r"(?:(?:sudo|time|command|exec|nohup|env|nice|xargs|timeout)(?:\s+-\S+)*\s+|\d+(?:\.\d+)?[smhd]?\s+|"
+                      r"[A-Za-z_]\w*=\S*\s+)*(?:[\w./-]*/)?(?:curl|wget|https?|xh)(?=\s|$)", re.M)
 
 
 def _cookie(m: re.Match) -> str:

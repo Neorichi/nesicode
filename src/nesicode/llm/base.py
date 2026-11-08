@@ -109,6 +109,13 @@ class Conversation(ABC):
     def step(self, on_event: EventSink | None = None) -> Turn:
         """Call the model on the current history and append its reply."""
 
+    def add_note(self, text: str) -> None:
+        """A harness line the model reads before its next reply (e.g. that old outputs were cleared). Default: a user
+        message. Implementations may append it to the newest tool results instead (the model has not seen them yet):
+        a new user turn makes chat templates that keep reasoning only after the last user message (Qwen3, GLM…) drop
+        the reasoning replayed with this tool loop."""
+        self.add_user(text)
+
     @property
     def replays_reasoning(self) -> bool:
         """True when the reasoning of the model's replies (Turn.thinking) goes back to it with the history of this

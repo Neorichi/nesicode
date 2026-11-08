@@ -359,6 +359,13 @@ class Agent:
         conv.add_user(text)
         self._conv_chars += len(text) + 16
 
+    def _add_note(self, conv, text: str) -> None:
+        """A harness line for the model inside the tool loop: with the newest tool results when the provider can (a
+        new user turn would make interleaved-thinking templates drop the reasoning replayed so far), else a user turn."""
+        add = getattr(conv, "add_note", None)
+        (add if callable(add) else conv.add_user)(text)
+        self._conv_chars += len(text) + 16
+
     def _add_assistant(self, conv, text: str) -> None:
         conv.add_assistant_text(text)
         self._conv_chars += len(text or "(no answer)") + 16
@@ -511,7 +518,7 @@ class Agent:
             n = cleared[0]
             what = (f"{n} earlier tool output{'s' if n != 1 else ''}"
                     + (" and your reasoning from those steps were" if freed > cleared[1] else (" were" if n != 1 else " was")))
-            self._add_user(conv, MASK_NOTE.format(what=what) if n else MASK_NOTE_REASONING)
+            self._add_note(conv, MASK_NOTE.format(what=what) if n else MASK_NOTE_REASONING)
             self._ro_reminded = False
         return freed
 
@@ -1261,8 +1268,9 @@ def _shorten(out: str, n: int, dump: bool = False) -> str:
         kept_tail.insert(0, ln)
         size += len(ln) + 1
     hidden = len(lines) - len(kept_head) - len(kept_tail)
-    if not kept_head and not kept_tail:  # one huge line: cut by chars
-        return out[: room * 3 // 5] + f" [... {len(out) - room:,} chars of this output omitted here ...] " + out[-(room * 2 // 5):]
+    if size < room // 2:  # huge lines (one-line JSON, minified code): whole lines would hide almost all of it
+        h = room * 3 // 5
+        return out[:h] + f" [... {len(out) - room:,} chars of this output omitted here ...] " + out[len(out) - (room - h):]
     hidden_chars = len(out) - size
     return "\n".join(kept_head + [f"[... {hidden:,} lines ({hidden_chars:,} chars) of this output omitted here ...]"]
                      + kept_tail)

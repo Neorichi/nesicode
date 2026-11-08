@@ -1029,3 +1029,95 @@ def test_stop_during_a_claude_stall_returns_at_once(server, monkeypatch):
     with pytest.raises(LLMError, match="cancelled"):
         claude(s, cancel=cancel).step(on_event=lambda kind, text: None)
     assert time.monotonic() - t0 < 2
+
+
+# ====================================================================== review fixes
+class _Scripted(OpenAICompatProvider):
+    """The real OpenAI-compatible conversation, its server scripted: every reply reasons and reads a file."""
+
+    def __init__(self, replies: int):
+        super().__init__("nesilabs", "http://127.0.0.1:9", "k")
+        self.replies, self.bodies = replies, []
+
+    def chat(self, body, options, on_event=None):
+        self.bodies.append(json.loads(json.dumps(body["messages"])))
+        n = len(self.bodies)
+        usage = {"prompt_tokens": sum(len(json.dumps(m)) for m in body["messages"]) // 3 + 3_000, "completion_tokens": 50}
+        if n > self.replies:
+            return {"choices": [{"message": {"role": "assistant", "content": "fin"}, "finish_reason": "stop"}],
+                    "usage": usage}, False
+        call = {"id": f"c{n}", "type": "function",
+                "function": {"name": "read_file", "arguments": json.dumps({"path": f"f{n % 5}.txt"})}}
+        msg = {"role": "assistant", "content": "", "reasoning_content": f"RAZONAMIENTO-{n} " + "pienso " * 300,
+               "tool_calls": [call]}
+        return {"choices": [{"message": msg, "finish_reason": "tool_calls"}], "usage": usage}, False
+
+
+def test_masking_notice_rides_with_the_newest_results_so_replayed_reasoning_survives(tmp_path, monkeypatch):
+    # Qwen3/GLM-style chat templates keep the reasoning of the assistant messages after the LAST user message only: a
+    # notice sent as a new user turn would make the server drop every reasoning replayed so far, at each masking.
+    prov = _Scripted(12)
+    monkeypatch.setattr(loopmod, "get_provider", lambda spec, keys=None: (prov, "nesi3"))
+    ws = Workspace(tmp_path / "ws")
+    for i in range(5):
+        (ws.root / f"f{i}.txt").write_text("\n".join(f"line {i}-{j} " + "data " * 10 for j in range(300)))
+    events = []
+    agent(ws, events, context_limit=40_000, output_limit=8_000).run("lee los ficheros", [("reglas", "vale")])
+    assert any(e["type"] == "masked" for e in events)
+    noticed = [b for b in prov.bodies if any("to free context" in str(m.get("content")) for m in b)]
+    assert noticed
+    for body in noticed:
+        last_user = max(i for i, m in enumerate(body) if m["role"] == "user")
+        assert "to free context" not in str(body[last_user]["content"])  # never a user turn of its own
+        assert body[last_user]["content"] == "lee los ficheros"
+        kept = [m for m in body[last_user + 1:] if m["role"] == "assistant" and m.get("reasoning_content")]
+        assert len(kept) >= 2  # what an interleaved-thinking template still renders
+    first = noticed[0]
+    assert first[-1]["role"] == "tool" and "[harness]" in first[-1]["content"]  # with the newest (unseen) results
+    conv = OpenAICompatConversation(OpenAICompatProvider("x", "http://127.0.0.1:9"), "m", "s", [], ModelOptions())
+    conv.add_user("hola")
+    conv.add_note("[harness] nota")  # no tool results to ride with: a user message
+    assert conv.messages[-1] == {"role": "user", "content": "[harness] nota"}
+
+
+def test_a_long_single_line_output_keeps_its_head_and_tail_in_trajectories():
+    data = json.dumps({"items": [{"id": i, "name": f"item-{i}"} for i in range(500)]})
+    for out in (data + "\n", "exit code: 0\n" + data + "\n", data):
+        cut = loopmod._shorten(out, 2_500)
+        assert len(cut) <= 2_600 and "item-0" in cut and "item-499" in cut and "omitted here" in cut
+    events = [{"type": "tool_call", "id": "1", "name": "bash", "args": {"command": "curl -s https://api.x/items"}},
+              {"type": "tool_result", "id": "1", "name": "bash", "output": "exit code: 0\n" + data + "\n"}]
+    for text in (trajectory_text(events), trajectory_text(events, 10_000, fit="tail"),
+                 trajectory_text(events, 10_000, fit="shrink")):
+        assert "item-0" in text and "item-499" in text  # (harnessing rollouts, the trail, history.md)
+    lines = "\n".join(f"{n:>6}\tlinea {n}" for n in range(1, 2_000))
+    assert re.search(r"\[\.\.\. [\d,]+ lines \([\d,]+ chars\) of this output omitted here \.\.\.\]", loopmod._shorten(lines, 2_500))
+
+
+def test_digest_sees_curl_behind_timeout_loops_and_wrappers():
+    from nesicode.agent.context import run_digest
+
+    commands = ["timeout 20 curl -sI https://a.org", "for h in a b; do curl -sI https://$h.org; done",
+                "if curl -sI https://c.org; then echo up; fi", "xargs -n1 curl -sI < urls.txt", "env A=1 curl -I https://d.org"]
+    for i, cmd in enumerate(commands):
+        d = run_digest([{"type": "tool_call", "id": "1", "name": "bash", "args": {"command": cmd}},
+                        {"type": "tool_result", "id": "1", "name": "bash", "output": f"exit code: 0\nHTTP/2 20{i}\nserver: x"}])
+        assert f"HTTP 20{i}" in d, cmd
+    d = run_digest([{"type": "tool_call", "id": "1", "name": "bash", "args": {"command": "cat fixtures/raw.txt"}},
+                    {"type": "tool_result", "id": "1", "name": "bash", "output": "exit code: 0\nHTTP/1.1 500 Oops"}])
+    assert "HTTP 500" not in d  # a file that holds a raw response is not a network call
+
+
+@posix_only
+def test_archive_listing_without_dir_fds_refuses_a_link_pointing_out_of_the_workspace(tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("SECRETO-FUERA\n")
+    ws = Workspace(tmp_path / "ws")
+    mine = ws.root / ".nesicode/chats/1"
+    (mine / "outputs").mkdir(parents=True)
+    (mine / "outputs" / "propio.txt").write_text("propio\n")
+    (mine / "context").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(Workspace, "open_dir", lambda self, p: None)  # the Windows path: no directory fds
+    files = [ws.rel(p) for p in ctxm._archive_files(ws, ".nesicode/chats/1")]
+    assert files == [".nesicode/chats/1/outputs/propio.txt"]

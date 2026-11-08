@@ -84,6 +84,13 @@ class OpenAICompatConversation(Conversation):
             content = ("ERROR: " if r.is_error else "") + (r.content or "(empty)")
             self.messages.append({"role": "tool", "tool_call_id": r.call_id, "content": content})
 
+    def add_note(self, text: str) -> None:
+        last = self.messages[-1] if self.messages else {}
+        if last.get("role") == "tool" and isinstance(last.get("content"), str):
+            last["content"] += "\n\n" + text  # not a new user turn: the replayed reasoning stays (see Conversation.add_note)
+        else:
+            self.add_user(text)
+
     @property
     def replays_reasoning(self) -> bool:
         return self.provider.needs_reasoning or not self.provider.reasoning_refused
