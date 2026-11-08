@@ -109,13 +109,32 @@ class Conversation(ABC):
     def step(self, on_event: EventSink | None = None) -> Turn:
         """Call the model on the current history and append its reply."""
 
+    def add_note(self, text: str) -> None:
+        """A harness line the model reads before its next reply (e.g. that old outputs were cleared). Default: a user
+        message. Implementations may append it to the newest tool results instead (the model has not seen them yet):
+        a new user turn makes chat templates that keep reasoning only after the last user message (Qwen3, GLM…) drop
+        the reasoning replayed with this tool loop."""
+        self.add_user(text)
+
+    @property
+    def replays_reasoning(self) -> bool:
+        """True when the reasoning of the model's replies (Turn.thinking) goes back to it with the history of this
+        conversation, so the caller counts it in its context estimate. Default: not replayed."""
+        return False
+
+    def take_dropped(self) -> int:
+        """Characters the provider removed from this history on its own since the last call (e.g. replayed reasoning
+        a server rejected): the caller's size estimate subtracts them. Default: none."""
+        return 0
+
     def mask_tool_results(self, keep_last: int, marker: Callable[[str, str], str | None], *,
                           keep_chars: int = 0, apply: bool = True) -> int:
         """Replace the content of older tool results with `marker(call_id, old)` (None = keep) and return the number
         of characters freed. Never touched: the newest `keep_last` results, any newer result while the cumulative size
         of the newer results is <= `keep_chars`, and the results of the latest assistant turn (the round the model has
-        not answered yet). apply=False only computes what would be freed (masking breaks the prompt cache, so callers
-        dry-run first). Default: not supported (0)."""
+        not answered yet). Implementations that replay reasoning also drop it, in the same pass, from the replies older
+        than the kept window (counted in the chars freed). apply=False only computes what would be freed (masking breaks
+        the prompt cache, so callers dry-run first). Default: not supported (0)."""
         return 0
 
     @staticmethod

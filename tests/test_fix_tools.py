@@ -832,7 +832,6 @@ def test_hooks_apply_to_error_results():
     assert out.startswith("[hook] PRE-WARN\nError:") and out.endswith("[hint] re-read the file")
 
 
-@pytest.mark.xfail(reason="needs loop.py (group A) to pass error results through Hooks.finish", strict=False)
 def test_hooks_apply_to_error_results_in_the_loop(tmp_path):
     from nesicode.agent import Agent
     from nesicode.llm import ToolCall, Usage

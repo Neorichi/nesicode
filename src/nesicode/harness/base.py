@@ -33,6 +33,7 @@ TOOL_GUIDANCE = """\
 - `edit_file` needs an exact, unique `old` string: read the file first and copy the text exactly.
 - Use `search` to find code before reading whole directories.
 - `bash` runs from the workspace root with a timeout; avoid interactive or long-running servers.
+- Your private reasoning and old tool outputs may be dropped to save context: write each conclusion to the deliverable or a notes file as soon as you reach it.
 """
 
 HOOKS = {

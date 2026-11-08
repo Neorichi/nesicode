@@ -17,11 +17,11 @@ in the archive, searchable with `search_history`.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
-from pathlib import Path
 
-from .workspace import ToolError, Workspace
+from .workspace import ToolError, Workspace, _walk
 
 MASK_AT = 0.49          # layer 1 trigger (share of the context window)
 SUMMARY_AT = 0.67       # layer 2 trigger
@@ -32,10 +32,12 @@ OUTPUT_PER_TURN = 16_384
 MIN_OUTPUT = 8_192      # (cap; see min_output)
 MAX_COMPACTIONS = 40    # cost guard; thrash is prevented by hysteresis and the no-progress check
 COMPACT_GROWTH = 0.15   # after a compaction, the next one needs this much growth (share of the window)
-POST_COMPACT_TARGET = 0.35  # a rebuilt conversation aims at this share of the window...
-POST_COMPACT_MAX = 0.50     # ...and is shrunk (tail → files → history → summary) when it is above this one
-INLINE_LIMIT = 8_000    # chars of a tool output kept in context (floor; see inline_limit)
+POST_COMPACT_TARGET = 0.35  # a rebuilt conversation is shrunk (tail → files → skills → history) above this share...
+POST_COMPACT_MAX = 0.50     # ...and its essentials (unanswered results, summary, message) only above this one
+INLINE_LIMIT = 8_000    # chars of a tool output kept in context when the window is unknown (see inline_limit)
+INLINE_MIN = 4_000      # floor for small windows: 16k-32k models get ~5% of their window per output, not 8k chars
 INLINE_MAX = 24_000
+THINKING_CHARS = 3_000  # chars of one reasoning event in transcripts (its END: the conclusions sit there)
 SAVE_OVER = 400         # outputs longer than this are saved to disk (only saved outputs are ever masked)
 CHARS_PER_TOKEN = 4.0
 CONSERVATIVE_CPT = 3.6  # code is denser than prose: used when deciding whether a reply still fits
@@ -53,8 +55,9 @@ def min_output(limit: int) -> int:
 
 
 def inline_limit(limit: int | None) -> int:
-    """Chars of one tool output kept in context: ~5% of the window, between 8k and 24k."""
-    return max(INLINE_LIMIT, min(INLINE_MAX, int(limit * 4 * 0.05))) if limit else INLINE_LIMIT
+    """Chars of one tool output kept in context: ~5% of the window, between 4k and 24k (8k when it is unknown). On a
+    16k window an 8k-char read was ~14% of the context per call: it compacted every 2-3 steps."""
+    return max(INLINE_MIN, min(INLINE_MAX, int(limit * 4 * 0.05))) if limit else INLINE_LIMIT
 
 
 def min_freed_tokens(limit: int) -> int:
@@ -108,10 +111,14 @@ def save_output(ws: Workspace, call_id: str, tool: str, text: str, archive: str 
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", label.strip().split("/")[-1])[:40].strip("_.")
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{int(time.time() * 1000)}-{tool}-{slug + '-' if slug else ''}{call_id}")[:110]
     rel = f"{archive}/outputs/{safe}.txt"
-    p = ws.resolve(rel)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(text, encoding="utf-8")
+    _write_archive(ws, rel, text)
     return rel
+
+
+def _write_archive(ws: Workspace, rel: str, text: str) -> None:
+    """Write a file of the conversation's archive without following any link (the agent can plant links there:
+    nothing is ever written through one, inside the workspace or out of it). ToolError if it cannot be written."""
+    ws.write_bytes(ws.root / rel, text.encode("utf-8", "replace"))
 
 
 _NUM_LINE = re.compile(r"^\s*(\d+)\t")
@@ -309,10 +316,11 @@ def anchors_block(a: dict[str, list[str]], title: str = "## Identifiers seen in 
 def transcript(events: list[dict], budget: int | None = None, saved: dict | None = None, thinking: bool = False,
                subagents: bool = False, args_cap: int | None = 4_000, for_agent: bool = False) -> str:
     """The run in the [ACTION]/[OBSERVATION]/[ERROR] grammar, faithful to what the agent saw: tool outputs appear as
-    they were in its context. Over `budget` chars, OLDER outputs are elided first (each elision says so, with the
-    saved copy), the newest stay whole; then reasoning notes, then long arguments; as a last resort the middle of
-    the run, marked. Sub-agent internals are left out (their delegate call and result stay). `for_agent`: the notes
-    speak to the agent itself (the default speaks to the summarizer)."""
+    they were in its context; with `thinking`, its reasoning as [THINKING] lines (the end of each, where conclusions
+    sit). Over `budget` chars: reasoning is shortened first, then OLDER outputs are elided (each elision says so, with
+    the saved copy; the newest stay whole), then long arguments, then the older reasoning goes (the newest stays); as
+    a last resort the middle of the run, marked. Sub-agent internals are left out (their delegate call and result
+    stay). `for_agent`: the notes speak to the agent itself (the default speaks to the summarizer)."""
     saved = saved or {}
     items: list[list] = []  # [kind, prefix, body, call_id]
     for e in events:
@@ -321,9 +329,13 @@ def transcript(events: list[dict], budget: int | None = None, saved: dict | None
         who = f"({e['agent']}) " if e.get("agent") else ""
         t = e.get("type")
         if t == "assistant" and e.get("text"):
-            items.append(["say", f"[ASSISTANT] {who}", e["text"], None])
+            cut = "(interrupted mid-reply) " if e.get("interrupted") else ""
+            items.append(["say", f"[ASSISTANT] {cut}{who}", e["text"], None])
         elif t == "thinking" and thinking and e.get("text"):
-            items.append(["think", f"[REASONING — private notes of the agent, unverified] {who}", e["text"][-1_200:], None])
+            text = str(e["text"])
+            if len(text) > THINKING_CHARS:
+                text = f"[… {len(text) - THINKING_CHARS:,} earlier chars omitted …] " + text[-THINKING_CHARS:]
+            items.append(["think", f"[THINKING] {who}", text, None])
         elif t == "tool_call":
             args = json.dumps(e.get("args", {}), ensure_ascii=False)
             if args_cap and len(args) > args_cap:
@@ -348,9 +360,17 @@ def transcript(events: list[dict], budget: int | None = None, saved: dict | None
                 "or that it was fully read]")
 
     if budget is not None and size() > budget:
-        for it in items:  # 1) reasoning notes go first
-            if it[0] == "think":
-                it[2] = "[omitted]"
+        # 1) reasoning keeps only its end (the conclusions) and at most a quarter of the budget (oldest go first)
+        thoughts = [it for it in items if it[0] == "think"]
+        for it in thoughts:
+            if len(it[2]) > 1_000:
+                it[2] = "[…] " + it[2][-1_000:]
+        spent = sum(len(it[2]) for it in thoughts)
+        for it in thoughts[:-1]:
+            if spent <= budget // 4:
+                break
+            spent -= len(it[2]) - len("[omitted]")
+            it[2] = "[omitted]"
         older = [it for it in items if it[0] == "out"][:-2]  # the newest two outputs stay whole
         room = budget - (size() - sum(len(it[2]) for it in older))
         cap = _fair_share([len(it[2]) for it in older], room) if older and room > 0 else 0
@@ -377,6 +397,12 @@ def transcript(events: list[dict], budget: int | None = None, saved: dict | None
                 n = len(it[2])
                 it[2] = note(it, n, True) if kind == "out" else it[2][:200] + f"… [{n - 200:,} chars of arguments not included]"
                 total -= n - len(it[2])
+        for it in thoughts[:-1]:  # 4) the rest of the older reasoning, oldest first (the newest stays)
+            if total <= budget:
+                break
+            if it[2] != "[omitted]":
+                total -= len(it[2]) - len("[omitted]")
+                it[2] = "[omitted]"
         if total > budget and len(items) > 4:
             text = "\n".join(i[1] + i[2] for i in items)
             head = budget // 3
@@ -434,7 +460,9 @@ At most 15: path — one line on what it is or what changed.
 The immediate next action, quoting the point where work stopped.
 Preserve exact paths, identifiers, commands, URLs, numbers and values seen in outputs. Separate facts from
 assumptions. Never state that a file exists unless a tool listed, read or wrote it, and never claim an output was
-fully observed when the transcript marks it as cut or not included."""
+fully observed when the transcript marks it as cut or not included. [THINKING] lines are the agent's private
+reasoning: keep the conclusions it reached there (findings, bugs identified, decisions, values worked out) in the
+relevant sections, marked "(from reasoning, unverified)" unless a tool output confirms them."""
 
 
 def summary_prompt(task: str, transcript: str, previous: str | None, anchors: dict, *, earlier: str = "",
@@ -523,26 +551,10 @@ def recovery_footer(archive: str, transcript_rel: str = "") -> str:
 
 
 # ------------------------------------------------------------------ re-read from disk
-def _safe_file(ws: Workspace, rel: str):
-    """The file at `rel` if it is a regular file inside the workspace reached without any symlink."""
-    try:
-        p = ws.resolve(rel)
-    except (ToolError, OSError, ValueError):
-        return None
-    cur = ws.root
-    for part in Path(rel).parts:
-        cur = cur / part
-        try:
-            if cur.is_symlink():
-                return None
-        except OSError:
-            return None
-    return p if p.is_file() else None
-
-
 def files_block(ws: Workspace, touched: list[tuple[str, str]], budget: int, cache: dict | None = None) -> str:
     """The files the agent read or edited in this run, most recent first, fresh from disk (over the per-file cap, or
-    past the budget: path only). Never the archive or attachments, never through a symlink."""
+    past the budget: path only). Never the archive or attachments, never through a symlink (each one is opened without
+    following any link on its way, so a link swapped in meanwhile is refused too)."""
     if budget <= 0 or not touched:
         return ""
     cache = cache if cache is not None else {}
@@ -552,11 +564,11 @@ def files_block(ws: Workspace, touched: list[tuple[str, str]], budget: int, cach
         if rel.startswith((".nesicode", ".attachments")) or rel in ("", "."):
             continue
         if rel not in cache:
-            p = _safe_file(ws, rel)
             try:  # size first: a huge file (a log read with offset/limit) is never loaded just to be listed
-                size = p.stat().st_size if p is not None else -1
-                cache[rel] = (size, p.read_bytes() if 0 <= size <= per_file else None)
-            except OSError:
+                with ws.open_file(ws.root / rel) as f:
+                    size = os.fstat(f.fileno()).st_size
+                    cache[rel] = (size, f.read(per_file + 1) if size <= per_file else None)
+            except (ToolError, OSError, ValueError):
                 cache[rel] = (-1, None)
         size, data = cache[rel]
         if size < 0:
@@ -607,10 +619,12 @@ def git_state(ws: Workspace, budget: int = 4_000) -> str:
 # ------------------------------------------------------------------ files on disk
 def write_context_file(ws: Workspace, name: str, text: str, archive: str = ".nesicode") -> str:
     rel = f"{archive}/context/{name}"
-    p = ws.resolve(rel)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(text, encoding="utf-8")
+    _write_archive(ws, rel, text)
     return rel
+
+
+ARCHIVE_READ_MAX = 50_000_000  # bytes of one archive file searched (history.md, transcripts, saved outputs)
+RANKED_HITS = 20
 
 
 def search_history(ws: Workspace, args: dict, archive: str = ".nesicode") -> str:
@@ -622,57 +636,118 @@ def search_history(ws: Workspace, args: dict, archive: str = ".nesicode") -> str
         rx = re.compile(query, re.I)
     except re.error:
         rx = re.compile(re.escape(query), re.I)
-    base = ws.resolve(archive)  # only THIS conversation's archive
-    hits = _search(ws, base, rx)
+    files = _archive_files(ws, archive)  # only THIS conversation's archive, regular files, never through a link
+    hits = _search(ws, files, rx)
     if hits:
         return hits
-    # nothing verbatim: any of the words (4+ letters), then close spellings ("ckeifor" → "ckeditor")
-    words = [w for w in re.findall(r"[\w./-]{4,}", query.lower())]
+    # nothing verbatim: the lines with the most of the words (4+ letters), then close spellings ("ckeifor" → "ckeditor")
+    words = list(dict.fromkeys(w for w in re.findall(r"[\w./-]{4,}", query.lower())))
     if not words:
         return "no matches in this conversation's history"
-    hits = _search(ws, base, re.compile("|".join(re.escape(w) for w in words), re.I))
+    hits = _ranked(ws, files, words)
     if hits:
-        return "(no exact match; lines with any of the words)\n" + hits
+        return (f"(no exact match; up to {RANKED_HITS} lines ranked by how many of the words they contain — the agent's "
+                "and the user's own words before tool outputs)\n" + hits)
     import difflib
 
     vocab = set()
-    for f in _archive_files(base):
-        try:
-            text = f.read_text(encoding="utf-8", errors="replace").lower()
-            vocab.update(re.findall(r"[a-z]{4,}|[a-z0-9_]{4,}", text)[:300_000])
-        except OSError:
-            continue
+    for _, lines in _read_all(ws, files):
+        vocab.update(re.findall(r"[a-z]{4,}|[a-z0-9_]{4,}", "\n".join(lines).lower())[:300_000])
     terms = {t for w in words for t in re.findall(r"[a-z]{4,}|[a-z0-9_]{4,}", w)}
     close = {m for w in terms for m in difflib.get_close_matches(w, vocab, n=3, cutoff=0.75)}
     if close:
-        hits = _search(ws, base, re.compile("|".join(re.escape(w) for w in sorted(close)), re.I))
+        hits = _search(ws, files, re.compile("|".join(re.escape(w) for w in sorted(close)), re.I))
         if hits:
             return f"(no exact match; similar words: {', '.join(sorted(close))})\n" + hits
     return "no matches in this conversation's history"
 
 
-def _archive_files(base):
+def _archive_files(ws: Workspace, archive: str) -> list:
+    """The archive's regular files (context/, outputs/), newest first. The agent can plant links in the archive: no
+    directory is entered through one and no file is read through one (see _read_all), so nothing outside it — or from
+    another conversation — is ever returned."""
+    found = []
     for sub in ("context", "outputs"):
-        d = base / sub
-        if d.is_dir():
-            yield from sorted((f for f in d.rglob("*") if f.is_file()), key=lambda p: p.stat().st_mtime, reverse=True)
+        d = ws.root / archive / sub
+        try:
+            fd = ws.open_dir(d)  # every component reached without a link (POSIX)
+        except ToolError:
+            continue
+        if fd is not None:
+            os.close(fd)
+        elif any(os.path.islink(p) for p in [d, *d.parents] if ws.root in p.parents):
+            continue  # (no dir fds, e.g. Windows) a link on the way — wherever it points (inside or out)
+        for p in _walk(d):
+            try:
+                found.append((os.stat(p, follow_symlinks=False).st_mtime, p))
+            except OSError:
+                continue
+    return [p for _, p in sorted(found, key=lambda x: x[0], reverse=True)]
 
 
-def _search(ws, base, rx) -> str:
+def _read_all(ws: Workspace, files: list):
+    """(relative path, lines) of each file, read one at a time, each opened without following any link on its way
+    (a link swapped in after the listing is refused too)."""
+    for p in files:
+        try:
+            data = ws.read_bytes(p, ARCHIVE_READ_MAX)
+        except (ToolError, OSError):
+            continue
+        yield ws.rel(p), data.decode("utf-8", "replace").splitlines()
+
+
+def _search(ws, files, rx) -> str:
     hits = []
     hidden = False
-    for f in _archive_files(base):
-        try:
-            lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            continue
+    for rel, lines in _read_all(ws, files):
         for i, line in enumerate(lines, 1):
             if rx.search(line):
                 shown = redact(line.strip()[:240])
                 hidden = hidden or "<redacted" in shown
-                hits.append(f"{ws.rel(f)}:{i}: {shown}")
+                hits.append(f"{rel}:{i}: {shown}")
                 if len(hits) >= 80:
                     return "\n".join(hits) + "\n... (more matches; refine the query)" + (_REDACTED_HINT if hidden else "")
+    return "\n".join(hits) + (_REDACTED_HINT if hidden and hits else "")
+
+
+# What an archive line is (history.md / transcripts use these prefixes; a line without one continues the item above)
+_LINE_KIND = (("[ASSISTANT]", "said"), ("[THINKING]", "said"), ("[REASONING", "said"), ("### Usuario", "user"),
+              ("## The user's request", "user"), ("### Respuesta final", "said"), ("[ACTION]", "action"),
+              ("[OBSERVATION]", "output"), ("[ERROR]", "output"), ("### Pasos", "other"), ("## Steps", "other"))
+_KIND_RANK = {"said": 0, "user": 0, "summary": 1, "action": 2, "other": 2, "output": 3}
+_NO_WORDS: frozenset = frozenset()
+
+
+def _ranked(ws, files, words: list[str]) -> str:
+    """Lines (or 3-line windows) with the most distinct query words; on a tie the agent's own words, the user's
+    messages and checkpoints come before tool-output dumps, then newer files first. The best RANKED_HITS, file:line."""
+    scored = []
+    for order, (rel, lines) in enumerate(_read_all(ws, files)):
+        kind = "output" if "/outputs/" in f"/{rel}" else ("summary" if "compact-" in rel.rsplit("/", 1)[-1] else "other")
+        base = kind
+        found = []  # the query words on each line (one shared empty set for the many lines without any)
+        for ln in lines:
+            low = ln.lower()
+            hit = [w for w in words if w in low]
+            found.append(frozenset(hit) if hit else _NO_WORDS)
+        for i, line in enumerate(lines):
+            if base != "output":
+                kind = next((k for prefix, k in _LINE_KIND if line.startswith(prefix)), kind)
+            if not found[i]:
+                continue
+            near = set().union(*found[max(0, i - 1): i + 2])
+            scored.append((-len(near), -len(found[i]), _KIND_RANK[kind], order, i, rel, line))
+    scored.sort()
+    hits, taken, hidden = [], set(), False
+    for *_, i, rel, line in scored:
+        if (rel, i - 1) in taken or (rel, i + 1) in taken:
+            continue  # the same spot again
+        taken.add((rel, i))
+        shown = redact(line.strip()[:240])
+        hidden = hidden or "<redacted" in shown
+        hits.append(f"{rel}:{i + 1}: {shown}")
+        if len(hits) >= RANKED_HITS:
+            break
     return "\n".join(hits) + (_REDACTED_HINT if hidden and hits else "")
 
 
@@ -704,7 +779,15 @@ _CLI_PASS_RX = re.compile(
     r"|(\b(?:mysql|mysqldump|mysqladmin|mariadb)\b[^\n]*?\s-p)([^\s\"']+)"
     r"|(\bsshpass\s+-p\s*)([^\s\"']+)"
     r"|(\bPGPASSWORD=)([^\s\"']+)")
-_HTTP_STATUS_RX = re.compile(r"(?m)^\s*HTTP/\d(?:\.\d)?\s+([1-5]\d\d)\b|\"(?:status|status_code|statusCode)\"\s*:\s*([1-5]\d\d)\b")
+# HTTP statuses come only from status lines (curl -i / -v, raw responses of MCP and browser tools), and only in the
+# outputs of network tools: never a source line such as `response.status === 401` or a JSON field of a file read.
+# (indented status lines too: `wget -S` prints "  HTTP/1.1 200 OK")
+_HTTP_STATUS_RX = re.compile(r"(?m)^[ \t]*(?:< )?HTTP/\d(?:\.\d)?\s+([1-5]\d\d)\b")
+# A command that talks HTTP: curl/wget/httpie/xh as a command word (first word of the line, or after ; & | ( $( ` { !
+# or do/then/else/if/while/until), maybe behind wrappers (`timeout 20 curl`, `xargs -n1 curl`, `env A=1 curl`)
+_NET_CMD = re.compile(r"(?:^|[;&|(`{!]|\$\(|\b(?:do|then|else|if|while|until)\b)\s*"
+                      r"(?:(?:sudo|time|command|exec|nohup|env|nice|xargs|timeout)(?:\s+-\S+)*\s+|\d+(?:\.\d+)?[smhd]?\s+|"
+                      r"[A-Za-z_]\w*=\S*\s+)*(?:[\w./-]*/)?(?:curl|wget|https?|xh)(?=\s|$)", re.M)
 
 
 def _cookie(m: re.Match) -> str:
@@ -749,14 +832,15 @@ def _first_last(body: str) -> str:
     return first if len(lines) == 1 or last == first else f"{first} … {last}"
 
 
-def run_digest(events: list[dict], max_chars: int = 4_000) -> str:
+def run_digest(events: list[dict], max_chars: int = 4_000, *, actions: bool = True, last_words: bool = True) -> str:
     """What a turn did, without an LLM: tool calls and what they returned (exit codes, HTTP statuses of real HTTP
-    calls, first/last meaningful lines), files/URLs/errors seen, what the agent said, and its last words.
-    Used so a stopped or finished turn's discoveries reach the next message."""
+    calls, first/last meaningful lines), files/URLs/errors seen, what the agent said, and its last words (a reply cut
+    by Stop is marked so). Used so a stopped or finished turn's discoveries reach the next message. actions=False /
+    last_words=False leave those parts out (the turn's step trail travels with it and already ends with them)."""
     calls = [e for e in events if e.get("type") == "tool_call" and not e.get("depth")]
     results = {e.get("id"): e for e in events if e.get("type") == "tool_result" and not e.get("depth")}
     lines: list[str] = []
-    for c in calls[-10:]:
+    for c in calls[-10:] if actions else []:
         args = c.get("args") or {}
         name = c.get("name") or ""
         what = args.get("command") or args.get("path") or args.get("url") or json.dumps(args, ensure_ascii=False)
@@ -771,15 +855,16 @@ def run_digest(events: list[dict], max_chars: int = 4_000) -> str:
             if code is not None:
                 tags.append(f"exit code {code}")
         cmd = str(args.get("command", ""))
-        if (name == "bash" and re.search(r"\b(?:curl|wget|https?)\b", cmd)) or name.startswith(("mcp__", "chrome_")) \
+        if (name == "bash" and _NET_CMD.search(cmd)) or name.startswith(("mcp__", "chrome_")) \
                 or "http" in name or "fetch" in name:
-            codes = sorted({m.group(1) or m.group(2) for m in _HTTP_STATUS_RX.finditer(body)})[:3]
+            codes = sorted({m.group(1) for m in _HTTP_STATUS_RX.finditer(body)})[:3]
             if codes:
                 tags.append("HTTP " + " ".join(codes))
         shown = _first_last(body)
         detail = " · ".join(tags + ([shown] if shown else []))
         lines.append(f"- {name}: {str(what)[:300]}" + (f"\n  → {detail}" if detail else ""))
-    said = [e.get("text", "") for e in events if e.get("type") == "assistant" and e.get("text") and not e.get("depth")]
+    own = [e for e in events if e.get("type") == "assistant" and e.get("text") and not e.get("depth")]
+    said = [e.get("text", "") for e in own]
     targets = "\n".join(str(v) for c in calls for k, v in (c.get("args") or {}).items()
                         if k in ("path", "command", "url", "pattern", "query", "file", "target"))
     outputs = "\n".join(str(r.get("output") or "") for r in results.values())
@@ -805,8 +890,9 @@ def run_digest(events: list[dict], max_chars: int = 4_000) -> str:
             used += len(s)
         if along:
             parts.append("What it said along the way (newest last):\n" + "\n".join(along))
-    if said:
-        parts.append("Its last words: " + said[-1].strip()[:600])
+    if said and last_words:
+        cut = " (cut off mid-reply when the turn was stopped)" if own[-1].get("interrupted") else ""
+        parts.append(f"Its last words{cut}: " + said[-1].strip()[:600])
     raw = "\n".join(parts)
     out = redact(raw)
     if out != raw:

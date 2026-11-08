@@ -218,7 +218,8 @@ def test_openai_streams_text_reasoning_split_tool_calls_and_usage(srv):
     assert sent["stream"] is True and sent["stream_options"] == {"include_usage": True}
     assert sent["max_tokens"] == 1000 and "max_completion_tokens" not in sent
     replay = conv.messages[-1]
-    assert replay["role"] == "assistant" and "reasoning_content" not in replay  # not DeepSeek: unchanged history
+    # (phase 2: the reasoning of the current tool loop goes back, under the name the server used)
+    assert replay["role"] == "assistant" and replay["reasoning_content"] == "Thinking hard"
     assert [(tc["id"], tc["function"]["arguments"]) for tc in replay["tool_calls"]] == [
         ("call_a", '{"path": "a.py", "content": "x = 1"}'), ("call_b", '{"path": "b.py"}')]
 

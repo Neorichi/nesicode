@@ -140,9 +140,14 @@ def attachments_note(ws: Workspace, attachments: list[dict], vision: str, keys: 
     return "\n".join(lines)
 
 
+HISTORY_TURN_CHARS = 400_000  # soft budget of one turn in history.md (a disk file: steps are shortened, never dropped)
+TRAIL_MAX_CHARS = 240_000  # the previous turn's trail: ~20-25% of the window, but never more than this (1M windows)
+
+
 def _write_thread_history(db: DB, ws: Workspace, run: dict, archive: str) -> None:
-    """Earlier turns of this conversation (in queue order, only the ones that ran), complete with their steps, so
-    `search_history` can find anything that only survives as a summary in the model's context."""
+    """Earlier turns of this conversation (in queue order, only the ones that ran), complete with their steps and
+    reasoning, so `search_history` can find anything that only survives as a summary in the model's context. A long
+    turn keeps every step: its observations, arguments and reasoning get shorter (head/tail lines), never its middle."""
     from ..agent import trajectory_text
 
     rows = _earlier_turns(db, run, limit=40)
@@ -151,8 +156,10 @@ def _write_thread_history(db: DB, ws: Workspace, run: dict, archive: str) -> Non
     parts = ["# Historial de esta conversación (turnos anteriores)"]
     for r in rows:
         events = _turn_events(db, r["id"], 5_000)
+        steps = trajectory_text(events, HISTORY_TURN_CHARS, obs_chars=6_000, args_chars=3_000, thinking_chars=3_000,
+                                fit="shrink")
         parts.append(f"## Turno #{r['id']} ({r['status']})\n### Usuario\n{r['task']}\n### Pasos\n"
-                     f"{trajectory_text(events, 200_000, obs_chars=6_000)}\n### Respuesta final\n{r['final_text']}")
+                     f"{steps}\n### Respuesta final\n{r['final_text']}")
     try:
         from ..agent.context import write_context_file
 
@@ -275,22 +282,43 @@ def _turn_events(db, run_id: int, limit: int = 4_000) -> list[dict]:
     return head + [json.loads(r["data"]) for r in reversed(tail)]
 
 
-def conversation_history(db, run: dict) -> tuple[list[tuple[str, str]], dict | None]:
+def _context_window(db, run: dict) -> int:
+    """Context window (tokens) of the model that will answer `run`, from the limits already known (no network)."""
+    from ..llm import DEFAULT_LIMITS, known_limits
+
+    try:
+        project = db.one("SELECT user_id, executor_model FROM projects WHERE id=?", (run["project_id"],)) or {}
+        bot = db.one("SELECT model FROM bots WHERE id=?", (run["bot_id"],)) if run.get("bot_id") else None
+        spec = str((bot or {}).get("model") or project.get("executor_model") or "")
+        row = db.one("SELECT context FROM model_limits WHERE user_id=? AND spec=?", (project.get("user_id"), spec))
+        if row and row["context"]:
+            return int(row["context"])
+        return (known_limits(spec.split("/", 1)[-1]) or DEFAULT_LIMITS)[0]
+    except Exception:
+        return DEFAULT_LIMITS[0]
+
+
+def conversation_history(db, run: dict, window: int | None = None) -> tuple[list[tuple[str, str]], dict | None]:
     """Earlier turns of this conversation for the next message, oldest first.
 
     Finished turns bring their answer (+ a digest of their key steps for the last few that used tools); stopped turns
     (Stop, error, app closed) bring a digest of what they did, so "continue" picks up the work; a turn that compacted
-    brings its last checkpoint summary; the last turn that DID WORK brings its full step trail (an empty stopped turn
-    after it never takes that slot). Messages removed from the queue never appear. Returns (history, the last turn
-    that did work if it was stopped)."""
+    brings its last checkpoint summary; the last turn that DID WORK brings its step trail (an empty stopped turn after
+    it never takes that slot): built from its END within ~20% of the model's context window (25% if it was stopped),
+    with its reasoning, each output shortened and listings cut to a few lines. Messages removed from the queue never
+    appear. Returns (history, the last turn that did work if it was stopped)."""
     from ..agent.context import redact, run_digest
-    from ..agent.loop import trajectory_text
+    from ..agent.loop import TRAIL_MARK, trajectory_text
 
     rows = _earlier_turns(db, run)
     detail = max(0, len(rows) - 20)  # the newest 20 turns bring their steps; older ones only their answer
     events = {r["id"]: _turn_events(db, r["id"]) for r in rows[detail:]}
     steps = {rid: sum(1 for e in ev if e.get("type") == "tool_call" and not e.get("depth")) for rid, ev in events.items()}
-    worked = [i for i in range(detail, len(rows)) if steps[rows[i]["id"]] or (rows[i]["final_text"] or "").strip()]
+    # a reply counts as work too, even one cut off by Stop (persisted as interrupted; it is not the turn's final_text)
+    said = {rid: any(e.get("type") == "assistant" and str(e.get("text") or "").strip() and not e.get("depth") for e in ev)
+            for rid, ev in events.items()}
+    worked = [i for i in range(detail, len(rows))
+              if steps[rows[i]["id"]] or (rows[i]["final_text"] or "").strip() or said[rows[i]["id"]]]
     last_work = worked[-1] if worked else None
     history: list[tuple[str, str]] = []
     interrupted = None
@@ -300,38 +328,64 @@ def conversation_history(db, run: dict) -> tuple[list[tuple[str, str]], dict | N
             history.append((r["task"], answer or f"[this turn ended as {r['status']} without an answer]"))
             continue
         ev, n = events[r["id"]], steps[r["id"]]
-        if r["status"] in STOPPED:
-            if not n and not answer:
+        stopped = r["status"] in STOPPED
+        trail = ""
+        if i == last_work and n:  # the last turn that worked travels with its trail, newest steps first
+            share = 0.25 if stopped else 0.20  # of the window, in chars at ~3.5 per token
+            budget = max(4_000, min(TRAIL_MAX_CHARS, int((window or _context_window(db, run)) * share * 3.5)))
+            shown = ev
+            if not stopped and answer:  # a finished turn: its final answer is the answer above, not repeated
+                last = next((k for k in range(len(ev) - 1, -1, -1) if ev[k].get("type") == "assistant"
+                             and not ev[k].get("depth")), None)
+                if last is not None and (ev[last].get("text") or "").strip() == answer:
+                    shown = ev[:last] + ev[last + 1:]
+            trail = redact(trajectory_text(shown, budget, obs_chars=4_000, args_chars=1_500, thinking_chars=2_000,
+                                           fit="tail", dumps=True))
+        if stopped:
+            if not n and not answer and not said[r["id"]]:
                 answer = f"[this turn was {r['status']} before doing any work]"
+                # stopped while still reasoning: the end of that reasoning comes along (it never takes the trail slot
+                # of a turn that did work before it)
+                thought = next((str(e.get("text") or "").strip() for e in reversed(ev) if e.get("type") == "thinking"
+                                and not e.get("depth") and str(e.get("text") or "").strip()), "")
+                if thought:
+                    answer = (f"[this turn was {r['status']} while still reasoning, before doing any work; the end of "
+                              "its reasoning (private notes, unverified):]\n"
+                              + redact(("…" if len(thought) > 1_500 else "") + thought[-1_500:]))
             else:
-                digest = run_digest(ev)
-                partial = f"\n[Partial answer] {answer[:800]}" if answer and answer[:200] not in digest else ""
+                digest = run_digest(ev, actions=not trail, last_words=not trail)  # the trail ends with them
+                partial = (f"\n[Partial answer] {answer[:800]}" if answer and answer[:200] not in digest + trail
+                           else "")
                 answer = (f"[This turn was {r['status']} at step {n} and did NOT finish. What it had done so far:]\n"
                           + digest + partial)
             if i == last_work:
                 interrupted = {"id": r["id"], "status": r["status"], "steps": n}
-        elif n and len(rows) - i <= 3:
-            answer += "\n\n[Key steps of this turn]\n" + run_digest(ev, 2_500)
+        elif n and len(rows) - i <= 3:  # (its last words are the answer itself)
+            answer += "\n\n[Key steps of this turn]\n" + run_digest(ev, 2_500, actions=not trail, last_words=False)
         checkpoint = next((e.get("summary") for e in reversed(ev) if e.get("type") == "compacted" and not e.get("depth")
                            and e.get("summary")), "")
         if checkpoint and (i == last_work or len(rows) - i <= 3):
             answer += ("\n\n[This turn compacted its context; its last checkpoint summary:]\n"
                        + redact(checkpoint[:6_000]))
-        if i == last_work and n:  # the last turn that worked travels with its full trail (bounded)
-            answer += "\n\n[PREVIOUS TURN — STEPS]\n" + redact(trajectory_text(ev, 40_000, obs_chars=4_000))
+        if trail:
+            answer += f"\n\n{TRAIL_MARK}\n" + trail
         history.append((r["task"], answer))
     if interrupted and last_work is not None and last_work < len(rows) - 1:
         interrupted["later_empty"] = len(rows) - 1 - last_work
     return history, interrupted
 
 
+CONNECTOR_TOOL_PREFIXES = ("mcp__", "chrome_", "vt_", "burp_", "office_", "word_", "excel_", "pptx_")
+
+
 def connector_context(db, run: dict, history: list[tuple[str, str]], bot: dict | None = None) -> str:
-    """Text that decides which 'only when I ask' connectors this message gets: the user's message, the last
-    turns (both sides) and the tools already used in this conversation's recent turns (the ones queued before it)."""
-    used = {e.get("name", "") for r in _earlier_turns(db, run)[-5:] for e in _turn_events(db, r["id"])
-            if e.get("type") == "tool_call"}
-    return " ".join([run["task"]] + [h[0] + " " + h[1][:2000] for h in history[-3:]] + sorted(used)
-                    + ([bot["instructions"]] if bot else []))
+    """Text that decides which 'only when I ask' connectors this message gets: the user's own words (this message
+    and the last turns' messages — never the assistant's answers: its own "ask me to use Burp" must not switch Burp
+    on), the connector tools already used in this conversation's recent turns (the ones queued before it; Nesicode's
+    built-in tools are not listed) and the bot's instructions."""
+    used = {name for r in _earlier_turns(db, run)[-5:] for e in _turn_events(db, r["id"])
+            if e.get("type") == "tool_call" and (name := str(e.get("name") or "")).startswith(CONNECTOR_TOOL_PREFIXES)}
+    return " ".join([run["task"]] + [h[0] for h in history[-3:]] + sorted(used) + ([bot["instructions"]] if bot else []))
 
 
 def continuity_note(thread_id: int, interrupted: dict | None) -> str:
