@@ -262,10 +262,11 @@ def address_problem(ip: str, strict: bool) -> str:
 
 
 def proxied(url: str) -> bool:
-    """True when httpx sends this URL through an HTTP(S)_PROXY / ALL_PROXY from the environment (the socket then
-    talks to the proxy, so its address says nothing about the target)."""
+    """True when httpx sends this URL through a proxy (the socket then talks to the proxy, so its address says nothing
+    about the target). Same source as httpx and the SDK's httpx2: HTTP(S)_PROXY / ALL_PROXY, else the system's
+    proxy settings (macOS, Windows), minus NO_PROXY."""
     try:
-        proxies = urllib.request.getproxies_environment()
+        proxies = urllib.request.getproxies()
         u = urlparse(url)
         if not (proxies.get(u.scheme) or proxies.get("all")):
             return False
@@ -308,9 +309,10 @@ def fetch_image(url: str, *, strict: bool, timeout: float = 120.0, max_bytes: in
         u = urlparse(url)
         if u.scheme not in ("http", "https") or not u.hostname:
             raise LLMError("the provider returned an image URL that is not http(s)")
+        if transport is None:
+            check_host(u.hostname, strict)  # also through a proxy: the target itself is vetted before any request
+        # at connect time too (DNS can change), unless a proxy makes the connection
         guarded = transport is None and not proxied(url)
-        if guarded:
-            check_host(u.hostname, strict)
         call = Call(policy=(lambda ip: address_problem(ip, strict)) if guarded else None)
         buf = bytearray()
         location = ""

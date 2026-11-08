@@ -283,8 +283,8 @@ LIMIT_PATTERNS = [
     r"([0-9][0-9,]*) maximum context length",
     # llama.cpp: {"type": "exceed_context_size_error", "n_prompt_tokens": 10000, "n_ctx": 8192}
     r"\"n_ctx\"\s*:\s*([0-9]+)",
-    # OpenAI: "Input tokens exceed the configured limit of 272000 tokens."
-    r"exceeds? the configured limit of ([0-9][0-9,]*)",
+    # OpenAI: "Input tokens exceed the configured limit of 272000 tokens." (tokens: not a gateway's byte/request limit)
+    r"exceeds? the configured limit of ([0-9][0-9,]*) tokens",
     r"context (?:window|length) (?:is|of) (?:only )?([0-9][0-9,]*)",  # LM Studio: "context length of only 4096"
     r"exceeds? (?:the )?(?:model'?s? )?(?:maximum )?(?:context|token) (?:limit|length) (?:of )?([0-9][0-9,]*)",
 ]

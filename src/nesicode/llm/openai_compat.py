@@ -109,13 +109,13 @@ class OpenAICompatConversation(Conversation):
         finish = choice.get("finish_reason") or "stop"
         calls: list[ToolCall] = []
         replay: list[dict] = []
-        for tc in msg.get("tool_calls") or []:
-            if not isinstance(tc, dict):
-                continue
+        tool_calls = [tc for tc in msg.get("tool_calls") or [] if isinstance(tc, dict)]
+        for n, tc in enumerate(tool_calls):
             fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
             name = str(fn.get("name") or "")
             args, err, raw = _arguments(fn.get("arguments"))
-            if err and finish == "length":
+            # Cut by the output cap: invalid arguments, or a last call that has its name but no arguments yet
+            if finish == "length" and (err or (n == len(tool_calls) - 1 and fn.get("arguments") in (None, ""))):
                 err = CUT
             cid = self.provider.unique_call_id(tc.get("id"))
             calls.append(ToolCall(id=cid, name=name, arguments=args, parse_error=err))
@@ -486,19 +486,33 @@ def _not_api(name: str, ctype: str, sample: bytes) -> str:
             "check the base URL (it usually ends in /v1)")
 
 
+# Error kinds another attempt cannot fix (OpenAI-style "type"/"code", Google-style "status")
+_FINAL_ERRORS = re.compile(r"invalid_request|invalid_argument|authenticat|permission|forbidden|not_found|"
+                           r"invalid_api_key|failed_precondition", re.I)
+
+
+def _is_error_list(data) -> bool:
+    """Google-style errors come wrapped in a list: [{"error": {...}}]."""
+    return isinstance(data, list) and any(isinstance(p, dict) and p.get("error") for p in data)
+
+
 def _reply_error(payload, name: str) -> Exception:
     """An error object inside a 200 reply (mid-stream or as plain JSON): transient ones are retried."""
     from . import parse_limit
 
+    if _is_error_list(payload):
+        payload = next(p for p in payload if isinstance(p, dict) and p.get("error"))
     err = payload.get("error") if isinstance(payload, dict) and payload.get("error") else payload
     message = str((err.get("message") or err.get("type") or err) if isinstance(err, dict) else err)
-    code = (err.get("code") or err.get("status")) if isinstance(err, dict) else None
+    raw_code = (err.get("code") or err.get("status")) if isinstance(err, dict) else None
+    kind = " ".join(str(err.get(k) or "") for k in ("type", "status", "code")) if isinstance(err, dict) else ""
     try:
-        code = int(code)
+        code = int(raw_code)
     except (TypeError, ValueError):
         code = None
     text = f"error in the reply: {message}"[:1500]
-    if parse_limit(message) or (code is not None and 400 <= code < 500 and code not in RETRY_STATUS):
+    if parse_limit(message) or (code is not None and 400 <= code < 500 and code not in RETRY_STATUS) \
+            or _FINAL_ERRORS.search(kind):
         return LLMError(f"{name} request failed: {text}")
     return Retryable(text)
 
@@ -508,7 +522,7 @@ def _json_reply(raw: bytes, name: str) -> dict:
         data = json.loads(raw)
     except ValueError as exc:
         raise LLMError(_not_api(name, "", raw)) from exc
-    if isinstance(data, dict) and data.get("error") and not data.get("choices"):
+    if (isinstance(data, dict) and data.get("error") and not data.get("choices")) or _is_error_list(data):
         raise _reply_error(data, name)
     if not isinstance(data, dict):
         raise LLMError(f"unexpected response from {name}: {str(data)[:300]}")
@@ -520,7 +534,7 @@ def _read_reply(resp: httpx.Response, call: Call, emit, name: str) -> tuple[dict
     that ignore `stream`). HTML or other non-API answers raise LLMError (wrong URL, proxy, captive portal)."""
     ctype = resp.headers.get("content-type", "").lower()
     decoder, reply = _SSE(), _Reply(name)
-    head, mode, raw = b"", "", bytearray()
+    head, mode, raw, sample = b"", "", bytearray(), b""
     try:
         for chunk in resp.iter_bytes():
             call.touch()
@@ -532,7 +546,7 @@ def _read_reply(resp: httpx.Response, call: Call, emit, name: str) -> tuple[dict
                 if "html" in ctype or start == b"<":
                     raise LLMError(_not_api(name, ctype, head))
                 mode = "json" if start in (b"{", b"[") and "event-stream" not in ctype else "sse"
-                chunk, head = head, b""
+                chunk, head, sample = head, b"", head[:200]
             if mode == "json":
                 raw += chunk
                 if len(raw) > MAX_BODY:
@@ -554,6 +568,9 @@ def _read_reply(resp: httpx.Response, call: Call, emit, name: str) -> tuple[dict
     if not mode:
         raise _Incomplete("the server sent an empty reply")
     if not reply.complete:
+        if not reply.seen and "event-stream" not in ctype:
+            # neither SSE nor JSON (plain text from a wrong URL, a proxy, a captive portal): retrying cannot help
+            raise LLMError(_not_api(name, ctype, sample))
         raise _Incomplete("the reply stream ended before it was complete")
     return reply.result(), True
 
@@ -647,12 +664,14 @@ class _Reply:
         self.finish: str | None = None
         self.usage: dict | None = None
         self.done = False
+        self.seen = 0  # SSE data events received (0 at the end: the body was not an event stream at all)
 
     @property
     def complete(self) -> bool:
         return self.done or self.finish is not None
 
     def add(self, event: str, data: str, emit, call: Call) -> None:
+        self.seen += 1
         if data.strip() == "[DONE]":
             self.done = True
             return
@@ -660,6 +679,8 @@ class _Reply:
             chunk = json.loads(data)
         except ValueError:
             return  # keep-alive or junk between events
+        if _is_error_list(chunk):
+            raise _reply_error(chunk, self.name)
         if not isinstance(chunk, dict):
             return
         if event == "error" or chunk.get("error"):

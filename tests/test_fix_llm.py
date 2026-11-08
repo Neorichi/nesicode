@@ -840,3 +840,77 @@ def test_accepted_probe_is_not_stored_nor_resent(srv):
     assert probe_limit(ok.url, {}, "big-model") is None and len(ok.requests) == 1  # and never sent again
     rejected = srv(default=respond(400, {"error": {"message": "This model's maximum context length is 131072 tokens"}}))
     assert probe_limit(rejected.url, {}, "small-model") == {"context": 131072, "output": None}
+
+
+# ---------------------------------------------------------------------- reviewer additions
+def test_openai_plain_text_200_is_not_retried(srv):
+    """Neither SSE nor JSON nor HTML (a web server's 'OK', a proxy notice): a wrong URL, not a cut stream."""
+    s = srv(default=respond(200, b"Hello from a web server", {"Content-Type": "text/plain"}))
+    _, conv = oa_conv(s)
+    with pytest.raises(LLMError, match="OpenAI-compatible API.*Hello from a web server"):
+        conv.step()
+    assert len(s.requests) == 1
+    with pytest.raises(LLMError, match="OpenAI-compatible"):
+        OpenAICompatProvider("x", s.url).post("/images/generations", {"model": "m"})
+    assert len(s.requests) == 2
+    # a real event stream that is cut short is still retried (no Content-Type check makes it "not an API")
+    s2 = srv(stream(b": still working\n\n"), stream(chunk({"content": "ok"}), chunk(finish="stop"), DONE))
+    _, conv = oa_conv(s2)
+    assert conv.step().text == "ok" and len(s2.requests) == 2
+
+
+def test_openai_length_cut_last_call_without_arguments_gets_parse_error(srv):
+    """The cap hit right after the last call's name: its arguments are missing, it must not run with {}."""
+    s = srv(stream(chunk({"tool_calls": [{"index": 0, "id": "c1", "function": {
+        "name": "write_file", "arguments": '{"path": "a.py", "content": "x"}'}}]}),
+        chunk({"tool_calls": [{"index": 1, "id": "c2", "function": {"name": "write_file", "arguments": ""}}]}),
+        chunk(finish="length"), DONE))
+    _, conv = oa_conv(s)
+    turn = conv.step()
+    assert turn.stop_reason == "max_tokens"
+    assert [(c.id, c.parse_error) for c in turn.tool_calls] == [("c1", ""), ("c2", CUT)]
+
+
+def test_parse_limit_ignores_limits_that_are_not_tokens():
+    from nesicode.llm import parse_limit
+
+    assert parse_limit("Request body exceeds the configured limit of 10485760 bytes") is None  # a gateway's size cap
+    assert parse_limit("Input tokens exceed the configured limit of 272000 tokens.") == 272000
+
+
+def test_openai_error_bodies_that_cannot_succeed_are_not_retried(srv):
+    # 200 + an error object (one-api / new-api style gateways) of a kind another attempt cannot fix
+    s = srv(default=respond(200, {"error": {"message": "Invalid schema for function 'write_file'",
+                                            "type": "invalid_request_error", "code": None}}))
+    _, conv = oa_conv(s)
+    with pytest.raises(LLMError, match="Invalid schema"):
+        conv.step()
+    assert len(s.requests) == 1
+    # Google-style errors come wrapped in a list; mid-stream they must surface, not look like a cut stream
+    s2 = srv(default=stream(b'data: [{"error": {"code": 400, "message": "Unknown name \\"foo\\"", '
+                            b'"status": "INVALID_ARGUMENT"}}]\n\n'))
+    _, conv = oa_conv(s2)
+    with pytest.raises(LLMError, match='Unknown name "foo"'):
+        conv.step()
+    assert len(s2.requests) == 1
+    # transient ones are still retried (LiteLLM: code "500" as a string)
+    s3 = srv(stream(b'data: {"error": {"message": "upstream hiccup", "type": "None", "code": "500"}}\n\n'),
+             stream(chunk({"content": "ok"}), chunk(finish="stop"), DONE))
+    _, conv = oa_conv(s3)
+    assert conv.step().text == "ok" and len(s3.requests) == 2
+
+
+def test_image_url_is_vetted_even_through_a_proxy(srv, monkeypatch):
+    """With HTTP_PROXY set the socket talks to the proxy, so the target is checked before anything is sent."""
+    proxy = srv(default=respond(200, PNG, {"Content-Type": "image/png"}))
+    for name in ("NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "http_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HTTP_PROXY", proxy.url)
+    assert transport.proxied("http://169.254.169.254/latest/meta-data/")
+    with pytest.raises(LLMError, match="link-local"):
+        transport.fetch_image("http://169.254.169.254/latest/meta-data/iam/security-credentials/r", strict=False)
+    with pytest.raises(LLMError, match="private or local"):
+        transport.fetch_image("http://127.0.0.1:9/img.png", strict=True)
+    assert not proxy.requests  # nothing reached the proxy
+    assert transport.fetch_image("http://127.0.0.1:9/img.png", strict=False) == (PNG, "image/png")
+    assert proxy.requests[-1]["path"] == "http://127.0.0.1:9/img.png"  # fetched through the proxy
