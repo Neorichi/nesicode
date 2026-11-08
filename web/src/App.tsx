@@ -1,6 +1,7 @@
-import { createContext, useCallback, useContext, useEffect, useState } from 'react'
-import { Navigate, Route, Routes, useNavigate } from 'react-router-dom'
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
+import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { api, ApiError, type Project, type Thread, type User } from './api'
+import { useVisibleInterval } from './hooks'
 import { getLang, setLang, t, useLang } from './i18n'
 import Sidebar from './components/Sidebar'
 import ImageViewer from './components/ImageViewer'
@@ -19,7 +20,11 @@ import BotsPage, { BotDetail } from './pages/Bots'
 type Ctx = {
   user: User
   projects: Project[]
+  /** The project the sidebar shows (the one in the URL, else the last one opened). */
+  pid: number | undefined
+  /** That project's conversations (all of them), and the project they were loaded for. */
   threads: Thread[]
+  threadsPid: number | undefined
   refreshProjects: () => Promise<Project[]>
   refreshThreads: () => Promise<void>
   logout: () => Promise<void>
@@ -47,21 +52,69 @@ function Home() {
   return <Navigate to={`/p/${p.id}`} replace />
 }
 
+/** The project the sidebar is about: the one in the URL, else the last one opened, else the first. */
+function sidebarPid(pathname: string, projects: Project[]): number | undefined {
+  const m = pathname.match(/^\/p\/(\d+)/)
+  if (m) return Number(m[1])
+  let last = 0
+  try {
+    last = Number(localStorage.getItem('nesi:project')) || 0
+  } catch {
+    /* storage unavailable */
+  }
+  return last || projects[0]?.id
+}
+
+// One element per conversation / project: a new id remounts the page, so nothing (drafts, attachments, a late
+// response, a pending timer, a recording) can leak from the previous one into it.
+function ChatRoute() {
+  const { tid } = useParams()
+  return <Chat key={tid} />
+}
+
+function NewChatRoute() {
+  const { pid } = useParams()
+  return <NewChat key={pid} />
+}
+
+function BotRoute() {
+  const { bid } = useParams()
+  return <BotDetail key={bid} />
+}
+
 export default function App() {
   const [user, setUser] = useState<User | null | undefined>(undefined)
   const [projects, setProjects] = useState<Project[]>([])
-  const [threads, setThreads] = useState<Thread[]>([])
+  const [threads, setThreads] = useState<{ pid: number | undefined; list: Thread[] }>({ pid: undefined, list: [] })
   const [menuOpen, setMenuOpen] = useState(false)
   const navigate = useNavigate()
+  const loc = useLocation()
   useLang()
+  const pid = sidebarPid(loc.pathname, projects)
+  const pidRef = useRef(pid)
+  pidRef.current = pid
+  const threadsReq = useRef(0)
 
   const refreshProjects = useCallback(async () => {
     const ps = await api.get<Project[]>('/api/projects')
     setProjects(ps)
     return ps
   }, [])
+  // The sidebar lists the current project's conversations (all of them: the global list is capped at 200 and a
+  // busy project could hide every other one). Only the newest request may update it.
   const refreshThreads = useCallback(async () => {
-    setThreads(await api.get<Thread[]>('/api/threads'))
+    const p = pidRef.current
+    const n = ++threadsReq.current
+    if (!p) {
+      setThreads({ pid: undefined, list: [] })
+      return
+    }
+    try {
+      const list = await api.get<Thread[]>(`/api/projects/${p}/threads`)
+      if (n === threadsReq.current) setThreads({ pid: p, list })
+    } catch (e) {
+      if (n === threadsReq.current && e instanceof ApiError && e.status === 404) setThreads({ pid: p, list: [] })
+    }
   }, [])
 
   useEffect(() => {
@@ -69,25 +122,26 @@ export default function App() {
       .get<User>('/api/auth/me')
       .then(async (u) => {
         loadServerLang()
-        await Promise.all([refreshProjects(), refreshThreads()])
+        await refreshProjects()
         setUser(u)
       })
       .catch((e) => {
         if (e instanceof ApiError && e.status === 401) setUser(null)
         else setUser(null)
       })
-  }, [refreshProjects, refreshThreads])
+  }, [refreshProjects])
 
+  // (re)load when the shown project changes
   useEffect(() => {
-    if (!user) return
-    // Conversations can also be created from Telegram: keep the sidebar fresh.
-    const id = setInterval(() => refreshThreads().catch(() => {}), 5000)
-    return () => clearInterval(id)
-  }, [user, refreshThreads])
+    if (user) refreshThreads()
+  }, [user, pid, refreshThreads])
+
+  // Conversations can also be created from Telegram: keep the sidebar fresh (not while the tab is hidden).
+  useVisibleInterval(() => void refreshThreads(), 5000, !!user)
 
   const onLogin = async (u: User) => {
     loadServerLang()
-    await Promise.all([refreshProjects(), refreshThreads()])
+    await refreshProjects()
     setUser(u)
     navigate('/')
   }
@@ -96,7 +150,7 @@ export default function App() {
     await api.post('/api/auth/logout')
     setUser(null)
     setProjects([])
-    setThreads([])
+    setThreads({ pid: undefined, list: [] })
     navigate('/')
   }
 
@@ -104,7 +158,7 @@ export default function App() {
   if (user === null) return <Login onLogin={onLogin} />
 
   return (
-    <AppCtx.Provider value={{ user, projects, threads, refreshProjects, refreshThreads, logout }}>
+    <AppCtx.Provider value={{ user, projects, pid, threads: threads.list, threadsPid: threads.pid, refreshProjects, refreshThreads, logout }}>
       <div className={`shell ${menuOpen ? 'menu-open' : ''}`}>
         <Sidebar onNavigate={() => setMenuOpen(false)} />
         <div className="scrim" onClick={() => setMenuOpen(false)} />
@@ -118,11 +172,11 @@ export default function App() {
             <Route path="/new" element={<NewProject />} />
             <Route path="/account" element={<Account />} />
             <Route path="/bots" element={<BotsPage />} />
-            <Route path="/bots/:bid" element={<BotDetail />} />
+            <Route path="/bots/:bid" element={<BotRoute />} />
             <Route path="/connectors" element={<ConnectorsPage />} />
             <Route path="/providers" element={<ProvidersPage />} />
-            <Route path="/p/:pid" element={<NewChat />} />
-            <Route path="/p/:pid/c/:tid" element={<Chat />} />
+            <Route path="/p/:pid" element={<NewChatRoute />} />
+            <Route path="/p/:pid/c/:tid" element={<ChatRoute />} />
             <Route path="/p/:pid/harness" element={<HarnessPage />} />
             <Route path="/p/:pid/harnessing" element={<Harnessing />} />
             <Route path="/p/:pid/harnessing/:rid" element={<Harnessing />} />

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
 import { t, translateError, useLang } from '../i18n'
+import { normalizeBaseUrl } from '../logic'
 
 type Assigned = { project: string; executor_model?: string; improver_model?: string; vision_model?: string }
 
@@ -174,16 +175,30 @@ function ProviderForm({ initial, templates, onDone }: { initial?: ProviderRow; t
   const useTemplate = (t: Template) =>
     setF((x) => ({ ...x, name: t.name === 'custom' ? '' : t.name, label: t.name === 'custom' ? '' : t.label, kind: t.kind, base_url: t.base_url }))
 
+  // "localhost:11434/v1" (no scheme) is a common way to type a local endpoint: complete it visibly
+  const baseUrl = () => {
+    const u = normalizeBaseUrl(f.base_url)
+    if (u !== f.base_url) set('base_url')(u)
+    return u
+  }
+
   const test = async (discover: boolean) => {
     setBusy(true)
     setMsg({})
-    const r = await api.post<{ ok: boolean; models?: string[]; error?: string }>('/api/providers/test', {
-      kind: f.kind, base_url: f.base_url, api_key: f.api_key || undefined, name: editing ? f.name : undefined,
-    })
-    setBusy(false)
-    if (!r.ok) return setMsg({ err: r.error ? translateError(r.error) : r.error })
-    setMsg({ ok: t('Conexión correcta · {n} modelos disponibles', { n: r.models!.length }) })
-    if (discover) set('models')(r.models!.join('\n'))
+    try {
+      const r = await api.post<{ ok: boolean; models?: string[]; error?: string }>('/api/providers/test', {
+        kind: f.kind, base_url: baseUrl(), api_key: f.api_key || undefined, name: editing ? f.name : undefined,
+      })
+      if (!r.ok) return setMsg({ err: r.error ? translateError(r.error) : t('No se pudo conectar con el proveedor.') })
+      const models = r.models ?? []
+      setMsg({ ok: t('Conexión correcta · {n} modelos disponibles', { n: models.length }) })
+      if (discover) set('models')(models.join('\n'))
+    } catch (e) {
+      // a 422 for a bad URL, a 500, the server restarting…: say so and keep the form usable
+      setMsg({ err: (e as Error).message })
+    } finally {
+      setBusy(false)
+    }
   }
 
   const save = async () => {
@@ -191,12 +206,13 @@ function ProviderForm({ initial, templates, onDone }: { initial?: ProviderRow; t
     setMsg({})
     const models = f.models.split(/[\n,]/).map((m) => m.trim()).filter(Boolean)
     try {
+      const base_url = baseUrl()
       if (editing) {
         await api.patch(`/api/providers/${initial!.name}`, {
-          label: f.label, kind: f.kind, base_url: f.base_url, models, ...(f.api_key ? { api_key: f.api_key } : {}),
+          label: f.label, kind: f.kind, base_url, models, ...(f.api_key ? { api_key: f.api_key } : {}),
         })
       } else {
-        const r = await api.post<{ assigned?: Assigned[] }>('/api/providers', { name: f.name, label: f.label, kind: f.kind, base_url: f.base_url, api_key: f.api_key || undefined, models })
+        const r = await api.post<{ assigned?: Assigned[] }>('/api/providers', { name: f.name, label: f.label, kind: f.kind, base_url, api_key: f.api_key || undefined, models })
         if (r.assigned?.length) {
           alertAssigned(assignedText(r.assigned))
         }
@@ -240,7 +256,7 @@ function ProviderForm({ initial, templates, onDone }: { initial?: ProviderRow; t
         </label>
         <label>
           {t('Endpoint (base URL)')}
-          <input value={f.base_url} onChange={(e) => set('base_url')(e.target.value)} placeholder={t('https://api.ejemplo.com/v1')} spellCheck={false} />
+          <input value={f.base_url} onChange={(e) => set('base_url')(e.target.value)} onBlur={() => baseUrl()} placeholder={t('https://api.ejemplo.com/v1')} spellCheck={false} />
         </label>
       </div>
       <label>
@@ -292,6 +308,17 @@ export default function ProvidersSection({ onAssigned }: { onAssigned?: () => vo
     }
   }, [])
 
+  // hide / show / delete: on failure say why instead of failing silently
+  const act = async (call: () => Promise<unknown>) => {
+    setMsg('')
+    try {
+      await call()
+    } catch (e) {
+      setMsg((e as Error).message)
+    }
+    reloadProviders().catch(() => {})
+  }
+
   if (!data) return <div className="muted">{t('Cargando…')}</div>
   return (
     <div className="providers">
@@ -331,7 +358,7 @@ export default function ProvidersSection({ onAssigned }: { onAssigned?: () => vo
                       {t('Editar')}
                     </button>
                   )}
-                  <button className="btn small ghost" onClick={async () => { await api.post(`/api/providers/${p.name}/hide`); reloadProviders() }}>
+                  <button className="btn small ghost" onClick={() => act(() => api.post(`/api/providers/${p.name}/hide`))}>
                     {t('Ocultar')}
                   </button>
                 </>
@@ -341,10 +368,9 @@ export default function ProvidersSection({ onAssigned }: { onAssigned?: () => vo
                   <button className="btn small" onClick={() => setEditing(p.name)}>{t('Editar')}</button>
                   <button
                     className="btn small ghost"
-                    onClick={async () => {
+                    onClick={() => {
                       if (!confirm(t('¿Eliminar el proveedor {name} y su API key de la bóveda?', { name: p.name }))) return
-                      await api.del(`/api/providers/${p.name}`)
-                      reloadProviders()
+                      act(() => api.del(`/api/providers/${p.name}`))
                     }}
                   >
                     {t('Eliminar')}
@@ -359,7 +385,7 @@ export default function ProvidersSection({ onAssigned }: { onAssigned?: () => vo
         <div className="small muted">
           {t('Ocultos:')}{' '}
           {data.hidden.map((h) => (
-            <button key={h.name} className="link small" onClick={async () => { await api.post(`/api/providers/${h.name}/unhide`); reloadProviders() }}>
+            <button key={h.name} className="link small" onClick={() => act(() => api.post(`/api/providers/${h.name}/unhide`))}>
               {h.label} ({t('mostrar')})
             </button>
           ))}

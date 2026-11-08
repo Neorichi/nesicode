@@ -1,11 +1,14 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, OS } from '../api'
 import { useApp } from '../App'
+import { useVisibleInterval } from '../hooks'
 import { t, useLang } from '../i18n'
+import { EDITABLE_TRIGGERS, intervalSpec, parseInterval, type IntervalUnit } from '../logic'
 
 // ------------------------------------------------------------------ types
-export type Trigger = { id?: number; kind: 'cron' | 'interval' | 'url'; spec: string; tz?: string; prompt?: string; config?: { every?: number }; next_at?: number | null }
+// 'once' = a follow-up the bot scheduled itself (bot_schedule_once); 'webhook' is managed on the bot's page.
+export type Trigger = { id?: number; kind: 'cron' | 'interval' | 'url' | 'once' | 'webhook'; spec: string; tz?: string; prompt?: string; config?: { every?: number }; next_at?: number | null }
 type RunRow = { id: number; status: string; trigger: string; created_at: number; finished_at?: number; summary?: string; usage?: { cost_usd?: number } }
 export type Bot = {
   id: number; project_id: number; project: string; name: string; description: string; instructions: string; model: string
@@ -39,9 +42,11 @@ function when(ts?: number | null): string {
 }
 
 function describeTrigger(tr: Trigger): string {
+  if (tr.kind === 'once') return `${t('Seguimiento')} · ${when(tr.next_at)}`
+  if (tr.kind === 'webhook') return 'webhook'
   if (tr.kind === 'interval') {
-    const m = /^(\d+)\s*([mhd]?)$/.exec(tr.spec.trim())
-    if (m) return t('Cada {n} {u}', { n: m[1], u: m[2] === 'h' ? t('horas') : m[2] === 'd' ? t('días') : t('minutos') })
+    const m = parseInterval(tr.spec ?? '')
+    if (m) return t('Cada {n} {u}', { n: m.n, u: m.u === 'h' ? t('horas') : m.u === 'd' ? t('días') : t('minutos') })
   }
   if (tr.kind === 'url') return t('Vigila {url} cada {n} min', { url: tr.spec.replace(/^https?:\/\//, '').slice(0, 40), n: tr.config?.every ?? 30 })
   const d = parseDaily(tr.spec)
@@ -88,7 +93,8 @@ export default function BotsPage() {
   const load = () => api.get<{ bots: Bot[]; telegram: boolean; tz: string }>('/api/bots').then((r) => {
     setBots(r.bots); setTelegram(r.telegram); setTz(r.tz)
   }).catch((e) => setError(e.message))
-  useEffect(() => { load(); const id = setInterval(load, 10000); return () => clearInterval(id) }, [])
+  useEffect(() => { load() }, [])
+  useVisibleInterval(load, 10000)
 
   const toggle = async (b: Bot) => { await api.patch(`/api/bots/${b.id}`, { enabled: !b.enabled }); load() }
   const runNow = async (b: Bot) => {
@@ -195,7 +201,13 @@ function NewBot({ tz, onCancel, onCreated }: { tz: string; onCancel: () => void;
 export function BotEditor({ initial, tz, onCancel, onSaved }: { initial: Draft; tz: string; onCancel: () => void; onSaved: (b: Bot) => void }) {
   useLang()
   const { projects } = useApp()
-  const [f, setF] = useState<Draft>({ policy: 'ask', notify: 'telegram', max_steps: 30, daily_cap: 24, ...initial })
+  // Only schedules the user owns are edited and sent; pending follow-ups the bot scheduled itself ('once') are
+  // shown read-only and kept by the server on save (sending them would be rejected).
+  const [f, setF] = useState<Draft>(() => ({
+    policy: 'ask', notify: 'telegram', max_steps: 30, daily_cap: 24, ...initial,
+    triggers: (initial.triggers ?? []).filter((tr) => EDITABLE_TRIGGERS.includes(tr.kind)),
+  }))
+  const followUps = (initial.triggers ?? []).filter((tr) => tr.kind === 'once')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const set = <K extends keyof Draft>(k: K, v: Draft[K]) => setF((x) => ({ ...x, [k]: v }))
@@ -204,7 +216,8 @@ export function BotEditor({ initial, tz, onCancel, onSaved }: { initial: Draft; 
     const body = {
       project_id: f.project_id, name: f.name, description: f.description ?? '', instructions: f.instructions, model: f.model ?? '',
       policy: f.policy, notify: f.notify, max_steps: f.max_steps, daily_cap: f.daily_cap,
-      triggers: f.triggers.map((tr) => ({ kind: tr.kind, spec: tr.spec, tz: tr.tz ?? '', prompt: tr.prompt ?? '', config: tr.config ?? {} })),
+      triggers: f.triggers.filter((tr) => EDITABLE_TRIGGERS.includes(tr.kind))
+        .map((tr) => ({ kind: tr.kind, spec: tr.spec, tz: tr.tz ?? '', prompt: tr.prompt ?? '', config: tr.config ?? {} })),
     }
     try {
       onSaved(f.id ? await api.patch<Bot>(`/api/bots/${f.id}`, body) : await api.post<Bot>('/api/bots', body))
@@ -227,6 +240,14 @@ export function BotEditor({ initial, tz, onCancel, onSaved }: { initial: Draft; 
 
       <h4>{t('Cuándo se ejecuta')}</h4>
       <TriggerList triggers={f.triggers} tz={tz} onChange={(tr) => set('triggers', tr)} />
+      {followUps.length > 0 && (
+        <div className="muted small">
+          {t('Seguimientos pendientes que programó el propio bot (se conservan al guardar):')}
+          {followUps.map((tr, i) => (
+            <div key={tr.id ?? i}>⏰ {describeTrigger(tr)}{tr.prompt ? ` — ${tr.prompt.slice(0, 120)}` : ''}</div>
+          ))}
+        </div>
+      )}
       <p className="muted small">{t('Además siempre puedes lanzarlo a mano, desde Telegram (/bot nombre) o por webhook (se activa en la ficha del bot).')}</p>
 
       <h4>{t('Permisos cuando no estás')}</h4>
@@ -279,17 +300,32 @@ function TriggerRow({ tr, tz, onChange, onRemove }: { tr: Trigger; tz: string; o
   const [next, setNext] = useState<number[]>([])
   const [err, setErr] = useState('')
   useEffect(() => {
-    if (tr.kind === 'url') { setNext([]); setErr(''); return }
+    if (tr.kind !== 'cron' && tr.kind !== 'interval') { setNext([]); setErr(''); return } // only schedules have a preview
+    let alive = true
     const id = setTimeout(() => {
       api.post<{ next: number[] }>('/api/bots/preview', { kind: tr.kind, spec: tr.spec, tz: tr.tz ?? tz })
-        .then((r) => { setNext(r.next); setErr('') }).catch((e) => { setNext([]); setErr(e.message) })
+        .then((r) => { if (alive) { setNext(r.next); setErr('') } }).catch((e) => { if (alive) { setNext([]); setErr(e.message) } })
     }, 300)
-    return () => clearTimeout(id)
+    return () => { alive = false; clearTimeout(id) }
   }, [tr.kind, tr.spec, tr.tz, tz])
-  const interval = useMemo(() => {
-    const m = /^(\d+)\s*([mhd]?)$/.exec(tr.spec.trim())
-    return m ? { n: m[1], u: m[2] || 'm' } : { n: '60', u: 'm' }
-  }, [tr.spec])
+  // The interval field keeps what the user types (it may be empty for a moment): the spec changes only when the
+  // number is valid, so clearing "60" to type "15" never snaps back to 60 (which gave 6015).
+  const parsed = parseInterval(tr.spec ?? '')
+  const [num, setNum] = useState(parsed?.n ?? '60')
+  const [unit, setUnit] = useState<IntervalUnit>(parsed?.u ?? 'm')
+  useEffect(() => {
+    const p = parseInterval(tr.spec ?? '')
+    if (p && intervalSpec(num, unit) !== intervalSpec(p.n, p.u)) {
+      setNum(p.n)
+      setUnit(p.u)
+    }
+  }, [tr.spec]) // eslint-disable-line react-hooks/exhaustive-deps
+  const setInterval_ = (n: string, u: IntervalUnit) => {
+    setNum(n)
+    setUnit(u)
+    const spec = intervalSpec(n, u)
+    if (spec) onChange({ ...tr, spec })
+  }
 
   return (
     <div className="trigger-row">
@@ -319,8 +355,9 @@ function TriggerRow({ tr, tz, onChange, onRemove }: { tr: Trigger; tz: string; o
         {tr.kind === 'interval' && (
           <div className="row wrap">
             {t('Cada')}
-            <input type="number" min={1} value={interval.n} style={{ width: 90 }} onChange={(e) => onChange({ ...tr, spec: `${e.target.value}${interval.u === 'm' ? '' : interval.u}` })} />
-            <select value={interval.u} onChange={(e) => onChange({ ...tr, spec: `${interval.n}${e.target.value === 'm' ? '' : e.target.value}` })}>
+            <input type="number" min={1} value={num} style={{ width: 90 }} onChange={(e) => setInterval_(e.target.value, unit)}
+              onBlur={() => { if (!intervalSpec(num, unit) && parsed) { setNum(parsed.n); setUnit(parsed.u) } }} />
+            <select value={unit} onChange={(e) => setInterval_(num, e.target.value as IntervalUnit)}>
               <option value="m">{t('minutos')}</option><option value="h">{t('horas')}</option><option value="d">{t('días')}</option>
             </select>
           </div>
@@ -353,8 +390,16 @@ export function BotDetail() {
   const [hook, setHook] = useState<{ url: string; token: string; url_with_token: string } | null>(null)
   const [error, setError] = useState('')
   const [runText, setRunText] = useState('')
-  const load = () => api.get<Bot>(`/api/bots/${bid}`).then(setB).catch((e) => setError(e.message))
-  useEffect(() => { load(); api.get<{ tz: string }>('/api/bots').then((r) => setTz(r.tz)).catch(() => {}); const id = setInterval(load, 8000); return () => clearInterval(id) }, [bid])
+  const alive = useRef(true)
+  // only this page's bot may paint (App keys the page by bid; this also covers late answers after leaving)
+  const load = () => api.get<Bot>(`/api/bots/${bid}`).then((r) => { if (alive.current && String(r.id) === bid) setB(r) }).catch((e) => alive.current && setError(e.message))
+  useEffect(() => {
+    alive.current = true
+    api.get<{ tz: string }>('/api/bots').then((r) => alive.current && setTz(r.tz)).catch(() => {})
+    return () => { alive.current = false }
+  }, [bid])
+  useVisibleInterval(load, 8000)
+  useEffect(() => { load() }, [bid]) // eslint-disable-line react-hooks/exhaustive-deps
   if (!b) return <div className="page">{error ? <div className="error-box">{error}</div> : '…'}</div>
   if (editing) return <div className="page narrow"><BotEditor initial={b} tz={tz} onCancel={() => setEditing(false)} onSaved={(n) => { setB(n); setEditing(false) }} /></div>
 

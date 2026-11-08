@@ -11,32 +11,47 @@ export async function startRecording(): Promise<Recording> {
   if (!navigator.mediaDevices?.getUserMedia) throw new Error('mic-unsupported')
   const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } })
   const Ctx = window.AudioContext || (window as any).webkitAudioContext
-  const ctx: AudioContext = new Ctx()
-  const source = ctx.createMediaStreamSource(stream)
-  const proc = ctx.createScriptProcessor(4096, 1, 1)
+  let ctx: AudioContext | null = null
+  let source: MediaStreamAudioSourceNode
+  let proc: ScriptProcessorNode
   const chunks: Float32Array[] = []
   let last = 0
-  proc.onaudioprocess = (e) => {
-    const data = e.inputBuffer.getChannelData(0)
-    chunks.push(new Float32Array(data))
-    let peak = 0
-    for (let i = 0; i < data.length; i += 16) peak = Math.max(peak, Math.abs(data[i]))
-    last = peak
+  try {
+    ctx = new Ctx() as AudioContext
+    source = ctx.createMediaStreamSource(stream)
+    proc = ctx.createScriptProcessor(4096, 1, 1)
+    proc.onaudioprocess = (e) => {
+      const data = e.inputBuffer.getChannelData(0)
+      chunks.push(new Float32Array(data))
+      let peak = 0
+      for (let i = 0; i < data.length; i += 16) peak = Math.max(peak, Math.abs(data[i]))
+      last = peak
+    }
+    source.connect(proc)
+    proc.connect(ctx.destination)
+  } catch (e) {
+    // never leave the microphone on when the audio graph could not be built
+    stream.getTracks().forEach((t) => t.stop())
+    ctx?.close().catch(() => {})
+    throw e
   }
-  source.connect(proc)
-  proc.connect(ctx.destination)
+  const audio = ctx
 
+  let closed = false
   const close = () => {
+    if (closed) return
+    closed = true
+    proc.onaudioprocess = null
     proc.disconnect()
     source.disconnect()
     stream.getTracks().forEach((t) => t.stop())
-    ctx.close().catch(() => {})
+    audio.close().catch(() => {})
   }
   return {
     level: () => last,
     cancel: close,
     stop: async () => {
-      const rate = ctx.sampleRate
+      const rate = audio.sampleRate
       close()
       return encodeWav(downsample(concat(chunks), rate, TARGET_RATE), TARGET_RATE)
     },

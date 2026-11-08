@@ -3,15 +3,45 @@ import { api, switchLang } from '../api'
 import { t, useLang } from '../i18n'
 import { useApp } from '../App'
 import { ConfigExport, ConfigImport } from '../components/ConfigTransfer'
+import { clampInt } from '../logic'
+
+/**
+ * A number setting: what the user types stays in the field (an empty or half-typed value is fine) and is saved on
+ * blur or Enter, clamped to [min, max]. Saving on every keystroke turned "20 → 50" into 205.
+ */
+function NumberSetting({ value, min, max, onCommit }: { value: number; min: number; max: number; onCommit: (n: number) => Promise<boolean> }) {
+  const [text, setText] = useState(String(value ?? ''))
+  useEffect(() => setText(String(value ?? '')), [value])
+  const commit = async () => {
+    const n = clampInt(text, min, max)
+    if (n === null || n === value) return setText(String(value ?? ''))
+    setText(String(n))
+    if (!(await onCommit(n))) setText(String(value ?? ''))
+  }
+  return (
+    <input type="number" min={min} max={max} value={text} onChange={(e) => setText(e.target.value)} onBlur={commit}
+      onKeyDown={(e) => e.key === 'Enter' && (e.currentTarget as HTMLInputElement).blur()} />
+  )
+}
 
 export default function Account() {
   const { user, projects } = useApp()
   const [lang] = useLang()
   const [prefs, setPrefs] = useState<Record<string, any> | null>(null)
+  const [error, setError] = useState('')
   useEffect(() => {
-    api.get<Record<string, any>>('/api/me/settings').then(setPrefs)
+    api.get<Record<string, any>>('/api/me/settings').then(setPrefs).catch((e) => setError(e.message))
   }, [])
-  const update = async (patch: Record<string, any>) => setPrefs(await api.put<Record<string, any>>('/api/me/settings', patch))
+  const update = async (patch: Record<string, any>) => {
+    setError('')
+    try {
+      setPrefs(await api.put<Record<string, any>>('/api/me/settings', patch))
+      return true
+    } catch (e) {
+      setError((e as Error).message)
+      return false
+    }
+  }
   const share = prefs ? !!prefs.share_workspace : null
   const toggleShare = (v: boolean) => update({ share_workspace: v })
 
@@ -23,6 +53,7 @@ export default function Account() {
           <p className="muted">{user.name} · {user.email}</p>
         </div>
       </header>
+      {error && <div className="error-box">{error}</div>}
       <div className="card">
         <h3>{t('Idioma')}</h3>
         <div className="seg">
@@ -75,17 +106,17 @@ export default function Account() {
           <div className="auto-grid">
             <label>
               {t('Se lanza si usa al menos')}
-              <input type="number" min={3} max={300} value={prefs.auto_harness_min_steps} onChange={(e) => update({ auto_harness_min_steps: Number(e.target.value) })} />
+              <NumberSetting min={3} max={300} value={prefs.auto_harness_min_steps} onCommit={(n) => update({ auto_harness_min_steps: n })} />
               {t('pasos')}
             </label>
             <label>
               {t('…o tiene al menos')}
-              <input type="number" min={1} max={50} value={prefs.auto_harness_min_errors} onChange={(e) => update({ auto_harness_min_errors: Number(e.target.value) })} />
+              <NumberSetting min={1} max={50} value={prefs.auto_harness_min_errors} onCommit={(n) => update({ auto_harness_min_errors: n })} />
               {t('errores de herramientas')}
             </label>
             <label>
               {t('Máximo al día')}
-              <input type="number" min={1} max={50} value={prefs.auto_harness_daily} onChange={(e) => update({ auto_harness_daily: Number(e.target.value) })} />
+              <NumberSetting min={1} max={50} value={prefs.auto_harness_daily} onCommit={(n) => update({ auto_harness_daily: n })} />
               {t('ejecuciones')}
             </label>
             <div className="muted small">{t('También se lanza si agota el límite de pasos. Nunca dos a la vez en el mismo proyecto.')}</div>

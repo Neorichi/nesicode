@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { api, money, statusLabel, type RunEvent } from '../api'
 import { t, translateError, useLang } from '../i18n'
+import { compactReason, interruptedSaved, retryGroups, retryText } from '../logic'
 import Markdown from './Markdown'
 import { downloadFile, showImage } from './ImageViewer'
 
@@ -110,10 +111,13 @@ function ApprovalCard({ req, runId, decision, live }: { req: RunEvent; runId?: n
   const what = req.name === 'bash' ? String(req.args?.command ?? '') : req.name === 'write_file' || req.name === 'edit_file' ? String(req.args?.path ?? '') : JSON.stringify(req.args)
   if (decision) {
     const ok = decision === 'allow' || decision === 'always'
+    // Stop while the card was waiting: nobody answered it, so it must not read as "denied"
+    const stopped = decision === 'cancelled'
     return (
-      <div className={`approval done ${ok ? 'ok' : 'no'}`}>
-        {ok ? '✓' : '✗'} {TOOL_LABEL()[req.name] ?? mcpLabel(req.name) ?? req.name} <code>{what.slice(0, 120)}</code> ·{' '}
-        {decision === 'always' ? t('permitido siempre en esta conversación') : ok ? t('permitido') : decision === 'timeout' ? t('sin respuesta') : t('denegado')}
+      <div className={`approval done ${ok ? 'ok' : stopped ? 'stopped' : 'no'}`}>
+        {ok ? '✓' : stopped ? '■' : '✗'} {TOOL_LABEL()[req.name] ?? mcpLabel(req.name) ?? req.name} <code>{what.slice(0, 120)}</code> ·{' '}
+        {decision === 'always' ? t('permitido siempre en esta conversación') : ok ? t('permitido') : stopped ? t('cancelado (se detuvo la respuesta)')
+          : decision === 'timeout' ? t('sin respuesta') : t('denegado')}
       </div>
     )
   }
@@ -197,9 +201,11 @@ function FileCard({ path, size, caption }: { path: string; size?: number; captio
 
 function Compacted({ e }: { e: RunEvent }) {
   const [open, setOpen] = useState(false)
+  const why = compactReason(e.reason)
   return (
     <div className="auto-note muted">
       🗜 {t('Contexto compactado ({u} de {l} tokens): el agente sigue con un resumen de lo hecho.', { u: Number(e.used).toLocaleString(), l: Number(e.limit).toLocaleString() })}{' '}
+      {why && <span className="small">({why}) </span>}
       {e.path && <code className="small">{e.path}</code>}{' '}
       <button className="link small" onClick={() => setOpen((v) => !v)}>{open ? t('Ocultar resumen') : t('Ver resumen')}</button>
       {open && <pre className="wrap notes">{e.summary}</pre>}
@@ -234,17 +240,20 @@ function Thinking({ text }: { text: string }) {
   )
 }
 
-/** Renders one agent run's events like a chat answer (text, tool calls, thinking). */
+/** Renders one agent run's events like a chat answer (text, tool calls, thinking). Unknown event types are skipped. */
 export default function Transcript({
   events,
   live,
   status,
   runId,
+  interrupted,
 }: {
   events: RunEvent[]
   live?: string
   status: string
   runId?: number
+  /** Text that was streaming when the reply was stopped or failed (the server doesn't keep it). */
+  interrupted?: string
 }) {
   useLang()
   const results = new Map<string, RunEvent>()
@@ -254,13 +263,36 @@ export default function Transcript({
   const shownImages = new Set<string>()
   const decided = new Map<string, string>()
   for (const e of events) if (e.type === 'approval_result') decided.set(e.id, e.decision)
+  const running = status === 'running' || status === 'queued'
+  const retries = retryGroups(events)
+  // the partial reply goes right before the "cancelled"/error line that ended it (or at the end)
+  const cut = interrupted && !interruptedSaved(events, interrupted) ? interrupted : ''
+  const cutAt = cut ? events.findIndex((e) => !e.depth && (e.type === 'cancelled' || e.type === 'error')) : -1
+  const cutNode = cut ? (
+    <div key="interrupted" className="answer interrupted">
+      <Markdown text={cut} />
+      <div className="muted small">{t('Respuesta interrumpida: este texto se quedó a medias y no se guardó en la conversación.')}</div>
+    </div>
+  ) : null
   events.forEach((e, i) => {
     const sub = e.depth ? <span className="sub-tag">{e.agent}</span> : null
-    if (e.type === 'assistant') {
+    if (i === cutAt) out.push(cutNode)
+    if (e.type === 'llm_retry') {
+      // one line per retried model call (the latest attempt); while it is still retrying it reads as live status
+      const count = retries.get(i)
+      if (!count) return
+      const current = running && !live && i === events.length - 1
       out.push(
-        <div key={i} className={`answer ${e.depth ? 'nested' : ''}`}>
+        <div key={i} className={`retry-note ${current ? 'now' : 'muted'} ${e.depth ? 'nested' : ''}`}>
+          {sub}↻ {retryText(e, count, current)}
+        </div>,
+      )
+    } else if (e.type === 'assistant') {
+      out.push(
+        <div key={i} className={`answer ${e.depth ? 'nested' : ''} ${e.interrupted ? 'interrupted' : ''}`}>
           {sub}
           <Markdown text={e.text} />
+          {e.interrupted && <div className="muted small">{t('Respuesta interrumpida: se detuvo antes de terminar.')}</div>}
         </div>,
       )
     } else if (e.type === 'tool_call') {
@@ -302,7 +334,7 @@ export default function Transcript({
       out.push(<div key={i} className="muted small">{t('Cancelado.')}</div>)
     }
   })
-  const running = status === 'running' || status === 'queued'
+  if (cut && cutAt < 0) out.push(cutNode)
   return (
     <div className="transcript">
       {out}

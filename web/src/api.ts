@@ -1,4 +1,5 @@
-import { getLang, setLang, t, translateError, type Lang } from './i18n'
+import { getLang, setLang, t, type Lang } from './i18n'
+import { errorMessage, parseBody } from './logic'
 
 export type User = { id: number; email: string; name: string; auth?: boolean }
 
@@ -85,36 +86,39 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(method: string, url: string, body?: unknown): Promise<T> {
-  const init: RequestInit = { method, credentials: 'same-origin', headers: {} }
+async function request<T>(method: string, url: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+  const init: RequestInit = { method, credentials: 'same-origin', headers: {}, signal }
   if (body instanceof FormData) {
     init.body = body
   } else if (body !== undefined) {
     init.body = JSON.stringify(body)
     ;(init.headers as Record<string, string>)['Content-Type'] = 'application/json'
   }
-  const res = await fetch(url, init)
-  const text = await res.text()
-  const data = text ? JSON.parse(text) : null
-  if (!res.ok) {
-    let msg = `Error ${res.status}`
-    if (data?.detail) {
-      msg = typeof data.detail === 'string' ? data.detail : data.detail.map((d: any) => d.msg).join('; ')
-    } else if (data?.errors) {
-      msg = t('El harness no es válido')
-    }
-    throw new ApiError(res.status, translateError(msg), data)
+  let res: Response
+  try {
+    res = await fetch(url, init)
+  } catch (e) {
+    if ((e as Error).name === 'AbortError') throw e
+    throw new ApiError(0, t('No se pudo conectar con Nesicode. Comprueba que la app sigue abierta.'))
   }
+  const text = await res.text()
+  // an error page from a proxy, or Starlette's plain-text 500, is not JSON: never show a JSON SyntaxError
+  const data = parseBody(text)
+  if (!res.ok) throw new ApiError(res.status, errorMessage(res.status, data ?? null), data)
+  if (data === undefined) throw new ApiError(res.status, t('El servidor devolvió una respuesta que no se entiende.'))
   return data as T
 }
 
 export const api = {
-  get: <T>(url: string) => request<T>('GET', url),
+  get: <T>(url: string, opts?: { signal?: AbortSignal }) => request<T>('GET', url, undefined, opts?.signal),
   post: <T>(url: string, body?: unknown) => request<T>('POST', url, body ?? {}),
   put: <T>(url: string, body?: unknown) => request<T>('PUT', url, body ?? {}),
   patch: <T>(url: string, body?: unknown) => request<T>('PATCH', url, body ?? {}),
   del: <T>(url: string) => request<T>('DELETE', url),
 }
+
+/** True when a request was cancelled on purpose (component gone, newer request issued). */
+export const isAbort = (e: unknown) => (e as Error)?.name === 'AbortError'
 
 export function relTime(ts: number): string {
   const s = Date.now() / 1000 - ts
@@ -129,24 +133,84 @@ export function money(usd?: number): string {
   return usd < 0.01 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`
 }
 
-/** Subscribe to a run's event stream. Returns a close function. */
+const HIDDEN_GRACE_MS = 5000 // a tab hidden this long gives its stream connection back (browsers allow ~6 per host)
+const MAX_STREAM_FAILURES = 6
+/** onEnd status when the stream gave up reconnecting (server unreachable), as opposed to the run's final status. */
+export const STREAM_LOST = 'stream-lost'
+
+/**
+ * Subscribe to a run's event stream. Returns a close function.
+ *
+ * Every (re)connection asks only for the events after the last one received, and the server then replays the
+ * current reply's live items from the start: `onOpen` fires first so the caller can drop its partial live text
+ * (otherwise it would be shown twice). A tab hidden for a few seconds closes its stream and resumes when visible,
+ * so many open tabs can't starve the browser's connections (Stop, sending, loading other pages).
+ */
 export function streamRun(
   runId: number,
   after: number,
-  handlers: { onEvent: (e: RunEvent) => void; onLive?: (items: RunEvent[]) => void; onEnd?: (status: string) => void },
+  handlers: { onEvent: (e: RunEvent) => void; onLive?: (items: RunEvent[]) => void; onEnd?: (status: string) => void; onOpen?: () => void },
 ): () => void {
-  const es = new EventSource(`/api/runs/${runId}/stream?after=${after}`)
-  es.addEventListener('event', (m) => handlers.onEvent(JSON.parse((m as MessageEvent).data)))
-  es.addEventListener('live', (m) => handlers.onLive?.(JSON.parse((m as MessageEvent).data)))
-  es.addEventListener('end', (m) => {
-    handlers.onEnd?.(JSON.parse((m as MessageEvent).data).status)
-    es.close()
-  })
-  es.onerror = () => {
-    // The browser retries automatically; close if the run is gone.
-    if (es.readyState === EventSource.CLOSED) handlers.onEnd?.('error')
+  let last = after
+  let es: EventSource | null = null
+  let done = false
+  let failures = 0
+  let retry: number | undefined
+  let hide: number | undefined
+  const hidden = () => typeof document !== 'undefined' && document.visibilityState === 'hidden'
+  const drop = () => {
+    es?.close()
+    es = null
   }
-  return () => es.close()
+  const stop = () => {
+    done = true
+    drop()
+    clearTimeout(retry)
+    clearTimeout(hide)
+    document.removeEventListener('visibilitychange', onVisibility)
+  }
+  const open = () => {
+    if (done || es || hidden()) return
+    const src = new EventSource(`/api/runs/${runId}/stream?after=${last}`)
+    es = src
+    src.onopen = () => {
+      failures = 0
+      handlers.onOpen?.()
+    }
+    src.addEventListener('event', (m) => {
+      const e = JSON.parse((m as MessageEvent).data) as RunEvent
+      if (typeof e.seq === 'number' && e.seq > last) last = e.seq
+      handlers.onEvent(e)
+    })
+    src.addEventListener('live', (m) => handlers.onLive?.(JSON.parse((m as MessageEvent).data)))
+    src.addEventListener('end', (m) => {
+      stop()
+      handlers.onEnd?.(JSON.parse((m as MessageEvent).data).status)
+    })
+    src.onerror = () => {
+      if (es !== src || done) return
+      // Reconnect ourselves (the browser would reuse the first URL and replay everything since `after`).
+      drop()
+      if (++failures > MAX_STREAM_FAILURES) {
+        stop()
+        handlers.onEnd?.(STREAM_LOST) // not the run's status: the run may well go on
+        return
+      }
+      clearTimeout(retry)
+      retry = window.setTimeout(open, Math.min(15000, 500 * 2 ** failures))
+    }
+  }
+  const onVisibility = () => {
+    clearTimeout(hide)
+    if (hidden()) hide = window.setTimeout(drop, HIDDEN_GRACE_MS)
+    else if (!es && !done) {
+      clearTimeout(retry)
+      open()
+    }
+  }
+  document.addEventListener('visibilitychange', onVisibility)
+  open()
+  return stop
 }
 
 export const ACTIVE = new Set(['queued', 'running'])
