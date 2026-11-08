@@ -184,8 +184,10 @@ def browser_tools(user_id: int) -> dict:
             except _Stopped:
                 raise
             except Exception as exc:
-                if injected and _TAB_GONE.search(str(exc)):  # the tab used last was closed or taken out of the group
+                gone = _TAB_GONE.search(str(exc)) and a.get("tab_id") is not None and a.get("tab_id") == last["tab"]
+                if gone:  # the tab used last was closed or taken out of the group: never aim at it again
                     last["tab"] = None
+                if gone and injected:
                     raise ToolError(f"{exc} (it was the tab used last, id {a['tab_id']}, which is no longer available: "
                                     "call chrome_tabs to see the open tabs, or open a page with chrome_open)") from exc
                 raise ToolError(str(exc)) from exc

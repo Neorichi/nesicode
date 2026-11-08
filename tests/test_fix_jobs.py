@@ -721,6 +721,14 @@ def test_chrome_open_opens_a_new_tab_and_a_closed_tab_is_forgotten(tmp_path, mon
         use("chrome_read")
     use("chrome_read")
     assert hub.sent[-1] == ("read", {})
+    # same when the agent names the vanished tab itself
+    hub.open.add(404)
+    use("chrome_read", {"tab_id": 404})
+    hub.open.discard(404)
+    with pytest.raises(ToolError, match="Nesicode"):
+        use("chrome_read", {"tab_id": 404})
+    use("chrome_read")
+    assert hub.sent[-1] == ("read", {})
 
 
 # ------------------------------------------------------------------ connectors#19: Stop during connector calls
