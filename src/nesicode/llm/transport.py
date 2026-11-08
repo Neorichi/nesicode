@@ -261,18 +261,50 @@ def address_problem(ip: str, strict: bool) -> str:
     return ""
 
 
-def proxied(url: str) -> bool:
-    """True when httpx sends this URL through a proxy (the socket then talks to the proxy, so its address says nothing
-    about the target). Same source as httpx and the SDK's httpx2: HTTP(S)_PROXY / ALL_PROXY, else the system's
-    proxy settings (macOS, Windows), minus NO_PROXY."""
+def _routing(lib: str):
+    """(proxy mounts from the environment, URLPattern, URL) exactly as the library that makes the request builds and
+    matches them: httpx for the providers, model lists, probes and image downloads; the Anthropic SDK reads the
+    environment its own way and its client (httpx2) matches the mounts."""
+    if lib == "anthropic":
+        import httpx2
+        from anthropic._utils._httpx import get_environment_proxies
+
+        return get_environment_proxies(), httpx2._utils.URLPattern, httpx2.URL
+    import httpx
+
+    return httpx._utils.get_environment_proxies(), httpx._utils.URLPattern, httpx.URL
+
+
+def proxied(url: str, lib: str = "httpx") -> bool:
+    """True when the HTTP library that makes the request (`lib`: "httpx", or "anthropic" for the SDK) sends this URL
+    through a proxy: the socket then talks to the proxy, so its address says nothing about the target. Decided with
+    that library's own rules (HTTP(S)_PROXY / ALL_PROXY, else the system's proxy settings, minus NO_PROXY), never
+    urllib's: they differ (`localhost,*` means no proxy at all, `host:port` and `scheme://host` entries, a leading dot,
+    CIDR ranges), and a disagreement either skipped the private-network check of a direct connection or refused a
+    legitimate endpoint behind the proxy."""
     try:
-        proxies = urllib.request.getproxies()
-        u = urlparse(url)
-        if not (proxies.get(u.scheme) or proxies.get("all")):
-            return False
-        return not urllib.request.proxy_bypass_environment(u.hostname or "", proxies)
-    except Exception:  # noqa: BLE001
+        mounts, pattern, URL = _routing(lib)
+        target = URL(url)
+        rules = []
+        for key, proxy in mounts.items():
+            try:
+                rules.append((pattern(key), proxy))
+            except Exception:  # noqa: BLE001 — an entry the library cannot parse (httpx2 drops it too)
+                continue
+        # the client tries its mounts in this order (port, host, then scheme first) and takes the first that matches
+        for rule, proxy in sorted(rules, key=lambda r: r[0]):
+            if rule.matches(target):
+                return proxy is not None
         return False
+    except Exception:  # noqa: BLE001 — (library internals moved) the environment as urllib reads it
+        try:
+            proxies = urllib.request.getproxies()
+            u = urlparse(url)
+            if not (proxies.get(u.scheme) or proxies.get("all")):
+                return False
+            return not urllib.request.proxy_bypass_environment(u.hostname or "", proxies)
+        except Exception:  # noqa: BLE001
+            return False
 
 
 def check_host(host: str, strict: bool) -> None:
@@ -300,9 +332,10 @@ def image_mime(data: bytes) -> str | None:
 
 
 def fetch_image(url: str, *, strict: bool, timeout: float = 120.0, max_bytes: int = IMAGE_MAX_BYTES,
-                transport=None) -> tuple[bytes, str]:
+                transport=None, cancel=None) -> tuple[bytes, str]:
     """Download an image a provider returned by URL: http(s) only, every hop (no automatic redirects) checked
-    against the address policy before and at connect time, at most `max_bytes`, and it must really be an image."""
+    against the address policy before and at connect time, at most `max_bytes`, and it must really be an image.
+    `cancel` (the user's Stop) aborts it at once."""
     import httpx
 
     for _hop in range(4):
@@ -314,25 +347,28 @@ def fetch_image(url: str, *, strict: bool, timeout: float = 120.0, max_bytes: in
         # at connect time too (DNS can change), unless a proxy makes the connection
         guarded = transport is None and not proxied(url)
         call = Call(policy=(lambda ip: address_problem(ip, strict)) if guarded else None)
-        buf = bytearray()
-        location = ""
-        try:
+
+        def produce(call: Call, emit, url=url) -> tuple[bytes, str]:  # (image bytes, or where it redirects)
+            buf = bytearray()
             with httpx.Client(timeout=httpx.Timeout(timeout, connect=CONNECT_TIMEOUT), follow_redirects=False,
                               transport=transport) as client:
                 with client.stream("GET", url, headers={"Accept-Encoding": "identity"},
                                    extensions={"trace": call.trace}) as r:
                     if r.is_redirect and r.headers.get("location"):
-                        location = urljoin(url, r.headers["location"])
-                    elif r.status_code >= 400:
+                        return b"", urljoin(url, r.headers["location"])
+                    if r.status_code >= 400:
                         raise LLMError(f"could not download the generated image: HTTP {r.status_code}")
-                    else:
-                        size = r.headers.get("content-length", "")
-                        if size.isdigit() and int(size) > max_bytes:
+                    size = r.headers.get("content-length", "")
+                    if size.isdigit() and int(size) > max_bytes:
+                        raise LLMError(f"the generated image is larger than {max_bytes // (1024 * 1024)} MB")
+                    for chunk in r.iter_bytes():
+                        buf += chunk
+                        if len(buf) > max_bytes:
                             raise LLMError(f"the generated image is larger than {max_bytes // (1024 * 1024)} MB")
-                        for chunk in r.iter_bytes():
-                            buf += chunk
-                            if len(buf) > max_bytes:
-                                raise LLMError(f"the generated image is larger than {max_bytes // (1024 * 1024)} MB")
+            return bytes(buf), ""
+
+        try:
+            data, location = pump(produce, call, cancel=cancel)  # (on a helper thread: Stop is watched meanwhile)
         except httpx.HTTPError as exc:
             if call.blocked:
                 raise LLMError(call.blocked) from exc
@@ -342,8 +378,8 @@ def fetch_image(url: str, *, strict: bool, timeout: float = 120.0, max_bytes: in
         if location:
             url = location
             continue
-        mime = image_mime(bytes(buf))
+        mime = image_mime(data)
         if not mime:
             raise LLMError("the provider's image URL did not return a PNG, JPEG, WebP or GIF image")
-        return bytes(buf), mime
+        return data, mime
     raise LLMError("too many redirects while downloading the generated image")

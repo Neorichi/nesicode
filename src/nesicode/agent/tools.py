@@ -413,16 +413,16 @@ def _nested_repeat(pattern: str) -> bool:
     return walk(tree, False)
 
 
-def _search_regex(pattern: str):
+def _search_regex(pattern: str, flags: int = 0):
     """re.search already tries every start position, so a leading `.*` only adds quadratic backtracking
     (`.*TODO.*` on a minified bundle froze the server): drop it, the set of matching lines is the same."""
     m = re.match(r"(?:\.\*\??)+", pattern)
     if m and pattern[m.end() : m.end() + 1] not in ("*", "+", "?", "{"):
         try:
-            return re.compile(pattern[m.end() :])
+            return re.compile(pattern[m.end() :], flags)
         except re.error:
             pass
-    return re.compile(pattern)
+    return re.compile(pattern, flags)
 
 
 def _match(rx, line: str, deadline: float):

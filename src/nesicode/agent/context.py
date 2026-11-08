@@ -21,12 +21,14 @@ import os
 import re
 import time
 
+from .tools import SEARCH_WINDOW, _lines, _match, _nested_repeat, _search_regex
 from .workspace import ToolError, Workspace, _walk
 
 MASK_AT = 0.49          # layer 1 trigger (share of the context window)
 SUMMARY_AT = 0.67       # layer 2 trigger
 KEEP_RESULTS = 8        # newest results kept by Conversation implementations without a size budget (old API)
 MASK_KEEP_SHARE = 0.20  # newest tool results kept by size when masking (share of the window)
+SMALL_WINDOW = 32_768   # up to this window, past MASK_AT only the newest reply keeps its replayed reasoning
 SAFETY_TOKENS = 4096    # margin for token-estimation error (cap; see safety_tokens)
 OUTPUT_PER_TURN = 16_384
 MIN_OUTPUT = 8_192      # (cap; see min_output)
@@ -76,6 +78,8 @@ _PROMPT_TOKENS_RX = (
     r"request has ([0-9][0-9,]*) input tokens",     # vLLM (newer wording)
     r"prompt is too long: ([0-9][0-9,]*) tokens",   # Anthropic
     r"request \(([0-9][0-9,]*) tokens\) exceeds",   # llama.cpp
+    r"input \(([0-9][0-9,]*) tokens\) is longer",   # SGLang: "The input (40000 tokens) is longer than the model's ..."
+    r"prompt \(length ([0-9][0-9,]*)\)",            # vLLM: "The decoder prompt (length 40000) is longer than ..."
 )
 
 
@@ -123,6 +127,8 @@ def _write_archive(ws: Workspace, rel: str, text: str) -> None:
 
 _NUM_LINE = re.compile(r"^\s*(\d+)\t")
 _MORE_LINES = re.compile(r"^\.\.\. \((\d+) more lines; use offset=(\d+)\)$")
+_MORE_MAYBE = re.compile(r"^\.\.\. \(more lines may follow; use offset=(\d+)\)$")  # a huge file: its total is unknown
+_READ_NOTE = re.compile(r"^\(.*\)$")  # read_file's notes after the trailer: "(encoding: cp1252)", "(large file: …)"
 
 
 def inline_output(text: str, rel: str, limit: int = INLINE_LIMIT, tool: str = "", args: dict | None = None) -> str:
@@ -140,15 +146,22 @@ def inline_output(text: str, rel: str, limit: int = INLINE_LIMIT, tool: str = ""
 
 def _cut_read(text: str, rel: str, limit: int, args: dict) -> str | None:
     lines = text.split("\n")
-    more = 0
+    notes: list[str] = []  # read_file ends with its notes (encoding, large file) AFTER the "N more lines" trailer
+    while len(lines) > 1 and _READ_NOTE.match(lines[-1]) and not _NUM_LINE.match(lines[-1]):
+        notes.insert(0, lines.pop())
+    more, known = 0, True
     if lines and (m := _MORE_LINES.match(lines[-1])):
         more, lines = int(m.group(1)), lines[:-1]
+    elif lines and _MORE_MAYBE.match(lines[-1]):
+        known, lines = False, lines[:-1]
     nums = [int(m.group(1)) for ln in lines if (m := _NUM_LINE.match(ln))]
     if not nums:
         return None
     total = nums[-1] + more
     path = str(args.get("path", ""))
-    room = max(200, limit - 500)
+    room = max(200, limit - 500 - sum(len(n) + 1 for n in notes))
+    tail = "".join(f"\n{n}" for n in notes)
+    of, upto = (f"of {total}", f"–{total}") if known else (f"of more than {total}", " on")
     kept: list[str] = []
     size = 0
     first_hidden = None
@@ -163,15 +176,15 @@ def _cut_read(text: str, rel: str, limit: int, args: dict) -> str | None:
     if not shown:  # the first line alone is longer than the limit
         first = next(ln for ln in lines if _NUM_LINE.match(ln))
         n = int(_NUM_LINE.match(first).group(1))
-        return (first[:room] + f"\n[... line {n} is {len(first):,} chars long and was cut at {room:,}; lines {n + 1}–{total} are "
+        return (first[:room] + f"\n[... line {n} is {len(first):,} chars long and was cut at {room:,}; lines {n + 1}{upto} are "
                 f"NOT shown. The full output is saved to {rel} — continue with read_file(path=\"{path}\", offset={n + 1}) "
-                f"or bash (e.g. cut/fold) on {rel}]")
+                f"or bash (e.g. cut/fold) on {rel}]{tail}")
     if first_hidden is None:
         first_hidden = shown[-1] + 1
     page = max(1, shown[-1] - shown[0] + 1)
     return ("\n".join(kept) + f"\n[... read_file output cut by the inline limit ({limit:,} chars): showing lines {shown[0]}–{shown[-1]} "
-            f"of {total}; lines {first_hidden}–{total} are NOT shown. Continue with read_file(path=\"{path}\", "
-            f"offset={first_hidden}, limit={page}); full output saved to {rel}]")
+            f"{of}; lines {first_hidden}{upto} are NOT shown. Continue with read_file(path=\"{path}\", "
+            f"offset={first_hidden}, limit={page}); full output saved to {rel}]{tail}")
 
 
 def _cut_middle(text: str, rel: str, limit: int) -> str:
@@ -511,6 +524,17 @@ def earlier_turns(history: list[tuple[str, str]], budget: int) -> str:
     return "\n".join(f"{u}\n{a}".rstrip() for u, a in out)
 
 
+def clip_summary(summary: str, n: int) -> str:
+    """A checkpoint summary in about n chars: head and tail of its sections (the cut said), and always its
+    `## Next Step` — the section written for resuming."""
+    if len(summary) <= n:
+        return summary
+    i = summary.rfind("## Next Step")
+    nxt = summary[i:] if i >= 0 else ""
+    nxt = nxt[: n // 3]
+    return clip(summary[: i] if i >= 0 else summary, max(400, n - len(nxt)), "summary") + ("\n" + nxt if nxt else "")
+
+
 def clean_summary(text: str, stop_reason: str = "end_turn", thinking: str = "") -> tuple[str, str]:
     """(usable summary, problem). Closed <think>/<analysis> blocks are removed; a summary cut at max_tokens before
     its last section, an empty one or one stuck in an unclosed reasoning block is rejected."""
@@ -625,6 +649,28 @@ def write_context_file(ws: Workspace, name: str, text: str, archive: str = ".nes
 
 ARCHIVE_READ_MAX = 50_000_000  # bytes of one archive file searched (history.md, transcripts, saved outputs)
 RANKED_HITS = 20
+HISTORY_SEARCH_BUDGET = 15.0  # seconds; a longer search returns what it found so far, and says so
+NO_MATCHES = "no matches in this conversation's history"
+
+
+class _Budget:
+    """Stop and a deadline for one search_history call. The regex comes from the model and the archive keeps lines of
+    any length (one-line JSON of connectors, minified files): Python's re holds the GIL while it backtracks, so the
+    work is cut into bounded pieces (windows of long lines) checked against both — as in the `search` tool."""
+
+    def __init__(self, ws: Workspace):
+        self.cancel = getattr(ws, "cancel", None)
+        self.deadline = time.monotonic() + HISTORY_SEARCH_BUDGET
+        self.why = ""
+
+    def over(self) -> bool:
+        if not self.why:
+            if self.cancel is not None and self.cancel.is_set():
+                self.why = "[search stopped by the user]"
+            elif time.monotonic() > self.deadline:
+                self.why = (f"[search stopped after {HISTORY_SEARCH_BUDGET:.0f} s: results are partial — use more specific "
+                            "words]")
+        return bool(self.why)
 
 
 def search_history(ws: Workspace, args: dict, archive: str = ".nesicode") -> str:
@@ -632,34 +678,46 @@ def search_history(ws: Workspace, args: dict, archive: str = ".nesicode") -> str
     query = str(args.get("query", "")).strip()
     if not query:
         raise ToolError("`query` is required")
+    note = ""
     try:
-        rx = re.compile(query, re.I)
-    except re.error:
+        rx = _search_regex(query, re.I)  # (a leading `.*` dropped: it only adds quadratic backtracking)
+    except re.error:  # not a regex: the text as typed
         rx = re.compile(re.escape(query), re.I)
+    else:
+        if _nested_repeat(query):  # `(a+)+$`, `(\w+\s?)*x`: exponential on one short line, with the GIL held
+            rx = re.compile(re.escape(query), re.I)
+            note = ("(searched as plain text: as a regex it repeats a group made only of repetitions, which can take "
+                    "exponential time; use plain keywords or a simpler regex)\n")
+    budget = _Budget(ws)
     files = _archive_files(ws, archive)  # only THIS conversation's archive, regular files, never through a link
-    hits = _search(ws, files, rx)
-    if hits:
-        return hits
+    hits = _search(ws, files, rx, budget)
+    if hits or budget.why:
+        return note + _ended(hits or NO_MATCHES, budget)
     # nothing verbatim: the lines with the most of the words (4+ letters), then close spellings ("ckeifor" → "ckeditor")
     words = list(dict.fromkeys(w for w in re.findall(r"[\w./-]{4,}", query.lower())))
     if not words:
-        return "no matches in this conversation's history"
-    hits = _ranked(ws, files, words)
-    if hits:
-        return (f"(no exact match; up to {RANKED_HITS} lines ranked by how many of the words they contain — the agent's "
-                "and the user's own words before tool outputs)\n" + hits)
+        return note + NO_MATCHES
+    hits = _ranked(ws, files, words, budget)
+    if hits or budget.why:
+        return note + _ended((f"(no exact match; up to {RANKED_HITS} lines ranked by how many of the words they contain — "
+                              "the agent's and the user's own words before tool outputs)\n" + hits) if hits else NO_MATCHES,
+                             budget)
     import difflib
 
     vocab = set()
-    for _, lines in _read_all(ws, files):
+    for _, lines in _read_all(ws, files, budget):
         vocab.update(re.findall(r"[a-z]{4,}|[a-z0-9_]{4,}", "\n".join(lines).lower())[:300_000])
     terms = {t for w in words for t in re.findall(r"[a-z]{4,}|[a-z0-9_]{4,}", w)}
     close = {m for w in terms for m in difflib.get_close_matches(w, vocab, n=3, cutoff=0.75)}
     if close:
-        hits = _search(ws, files, re.compile("|".join(re.escape(w) for w in sorted(close)), re.I))
+        hits = _search(ws, files, re.compile("|".join(re.escape(w) for w in sorted(close)), re.I), budget)
         if hits:
-            return f"(no exact match; similar words: {', '.join(sorted(close))})\n" + hits
-    return "no matches in this conversation's history"
+            return note + _ended(f"(no exact match; similar words: {', '.join(sorted(close))})\n" + hits, budget)
+    return note + _ended(NO_MATCHES, budget)
+
+
+def _ended(text: str, budget: _Budget) -> str:
+    return text + (f"\n{budget.why}" if budget.why else "")
 
 
 def _archive_files(ws: Workspace, archive: str) -> list:
@@ -685,24 +743,46 @@ def _archive_files(ws: Workspace, archive: str) -> list:
     return [p for _, p in sorted(found, key=lambda x: x[0], reverse=True)]
 
 
-def _read_all(ws: Workspace, files: list):
+def _read_all(ws: Workspace, files: list, budget: _Budget | None = None):
     """(relative path, lines) of each file, read one at a time, each opened without following any link on its way
-    (a link swapped in after the listing is refused too)."""
+    (a link swapped in after the listing is refused too); none once the budget is over. Lines are split exactly as
+    read_file splits them (on \\n only: a progress bar's bare \\r or a form feed is not a break), so every file:line
+    given is a read_file offset."""
     for p in files:
+        if budget is not None and budget.over():
+            return
         try:
             data = ws.read_bytes(p, ARCHIVE_READ_MAX)
         except (ToolError, OSError):
             continue
-        yield ws.rel(p), data.decode("utf-8", "replace").splitlines()
+        yield ws.rel(p), _lines(data.decode("utf-8", "replace"))
 
 
-def _search(ws, files, rx) -> str:
+def _excerpt(line: str, start: int, end: int) -> str:
+    """A result line with its secrets hidden: a long line (one-line JSON, minified code) shows where it matched, not
+    its start. The hiding runs on a wide stretch around the match, so a value is never cut in two before it."""
+    s = line.strip()
+    if len(s) <= 240:
+        return redact(s)
+    lo = max(0, start - 2_000)
+    seg = redact(line[lo: end + 2_000])
+    hit = line[start:end][:60]
+    at = seg.find(hit) if hit else -1
+    at = max(0, (at if at >= 0 else min(len(seg), start - lo)) - 80)
+    return ("…" if lo + at > 0 else "") + seg[at: at + 240].strip() + "…"
+
+
+def _search(ws, files, rx, budget: _Budget | None = None) -> str:
     hits = []
     hidden = False
-    for rel, lines in _read_all(ws, files):
+    deadline = budget.deadline if budget is not None else float("inf")
+    for rel, lines in _read_all(ws, files, budget):
         for i, line in enumerate(lines, 1):
-            if rx.search(line):
-                shown = redact(line.strip()[:240])
+            if budget is not None and (i % 256 == 0 or len(line) > SEARCH_WINDOW) and budget.over():
+                break
+            m = _match(rx, line, deadline)  # long lines in windows: the backtracking of one call stays bounded
+            if m:
+                shown = _excerpt(line, m.start(), m.end())
                 hidden = hidden or "<redacted" in shown
                 hits.append(f"{rel}:{i}: {shown}")
                 if len(hits) >= 80:
@@ -718,11 +798,11 @@ _KIND_RANK = {"said": 0, "user": 0, "summary": 1, "action": 2, "other": 2, "outp
 _NO_WORDS: frozenset = frozenset()
 
 
-def _ranked(ws, files, words: list[str]) -> str:
+def _ranked(ws, files, words: list[str], budget: _Budget | None = None) -> str:
     """Lines (or 3-line windows) with the most distinct query words; on a tie the agent's own words, the user's
     messages and checkpoints come before tool-output dumps, then newer files first. The best RANKED_HITS, file:line."""
     scored = []
-    for order, (rel, lines) in enumerate(_read_all(ws, files)):
+    for order, (rel, lines) in enumerate(_read_all(ws, files, budget)):
         kind = "output" if "/outputs/" in f"/{rel}" else ("summary" if "compact-" in rel.rsplit("/", 1)[-1] else "other")
         base = kind
         found = []  # the query words on each line (one shared empty set for the many lines without any)
@@ -743,7 +823,9 @@ def _ranked(ws, files, words: list[str]) -> str:
         if (rel, i - 1) in taken or (rel, i + 1) in taken:
             continue  # the same spot again
         taken.add((rel, i))
-        shown = redact(line.strip()[:240])
+        low = line.lower()
+        at, word = min(((p, w) for w in words if (p := low.find(w)) >= 0), default=(0, ""))
+        shown = _excerpt(line, at, at + len(word))
         hidden = hidden or "<redacted" in shown
         hits.append(f"{rel}:{i + 1}: {shown}")
         if len(hits) >= RANKED_HITS:
