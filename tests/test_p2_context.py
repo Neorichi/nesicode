@@ -1103,6 +1103,10 @@ def test_digest_sees_curl_behind_timeout_loops_and_wrappers():
         d = run_digest([{"type": "tool_call", "id": "1", "name": "bash", "args": {"command": cmd}},
                         {"type": "tool_result", "id": "1", "name": "bash", "output": f"exit code: 0\nHTTP/2 20{i}\nserver: x"}])
         assert f"HTTP 20{i}" in d, cmd
+    d = run_digest([{"type": "tool_call", "id": "1", "name": "bash", "args": {"command": "wget -S -O /dev/null https://e.org"}},
+                    {"type": "tool_result", "id": "1", "name": "bash",
+                     "output": "exit code: 0\n--2026-11-08--  https://e.org/\n  HTTP/1.1 301 Moved\n  HTTP/1.1 200 OK"}])
+    assert "HTTP 200 301" in d  # wget -S indents its status lines
     d = run_digest([{"type": "tool_call", "id": "1", "name": "bash", "args": {"command": "cat fixtures/raw.txt"}},
                     {"type": "tool_result", "id": "1", "name": "bash", "output": "exit code: 0\nHTTP/1.1 500 Oops"}])
     assert "HTTP 500" not in d  # a file that holds a raw response is not a network call
@@ -1140,3 +1144,12 @@ def test_a_turn_stopped_while_still_reasoning_brings_the_end_of_its_reasoning():
     assert interrupted.get("later_empty") == 1
     assert thinking.startswith("[this turn was cancelled while still reasoning, before doing any work")
     assert thinking.endswith("(BUG-413)") and len(thinking) < 1_800 and "unverified" in thinking
+
+
+def test_a_trail_whose_last_reply_alone_is_too_big_keeps_where_it_stopped():
+    events = [{"type": "tool_call", "id": "1", "name": "read_file", "args": {"path": "a"}},
+              {"type": "tool_result", "id": "1", "name": "read_file", "output": "ok"},
+              {"type": "assistant", "text": "INICIO " + "informe " * 3_000 + "DONDE-PARO", "interrupted": True}]
+    trail = trajectory_text(events, 5_000, fit="tail")
+    assert len(trail) <= 5_000 and trail.endswith("DONDE-PARO")
+    assert "[ASSISTANT] (interrupted mid-reply) INICIO" in trail and "first 1 tool call(s)" in trail

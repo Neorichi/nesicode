@@ -781,7 +781,8 @@ _CLI_PASS_RX = re.compile(
     r"|(\bPGPASSWORD=)([^\s\"']+)")
 # HTTP statuses come only from status lines (curl -i / -v, raw responses of MCP and browser tools), and only in the
 # outputs of network tools: never a source line such as `response.status === 401` or a JSON field of a file read.
-_HTTP_STATUS_RX = re.compile(r"(?m)^(?:< )?HTTP/\d(?:\.\d)?\s+([1-5]\d\d)\b")
+# (indented status lines too: `wget -S` prints "  HTTP/1.1 200 OK")
+_HTTP_STATUS_RX = re.compile(r"(?m)^[ \t]*(?:< )?HTTP/\d(?:\.\d)?\s+([1-5]\d\d)\b")
 # A command that talks HTTP: curl/wget/httpie/xh as a command word (first word of the line, or after ; & | ( $( ` { !
 # or do/then/else/if/while/until), maybe behind wrappers (`timeout 20 curl`, `xargs -n1 curl`, `env A=1 curl`)
 _NET_CMD = re.compile(r"(?:^|[;&|(`{!]|\$\(|\b(?:do|then|else|if|while|until)\b)\s*"

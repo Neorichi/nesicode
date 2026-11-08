@@ -1332,8 +1332,10 @@ def trajectory_text(events: list[dict], max_chars: int = 30_000, obs_chars: int 
             used += len(it[1]) + 1
         while kept and kept[0][0] == "obs":  # an output whose call is not shown
             kept.pop(0)
-        if not kept and items:  # the newest item alone is too big: its start
-            kept = [(items[-1][0], items[-1][1][: max(200, room)] + " …")]
+        if not kept and items:  # the newest item alone is too big (a long reply cut by Stop): its label and its END,
+            kind, line = items[-1]  # where the turn stopped
+            keep = max(200, room)
+            kept = [(kind, line[:60] + " […] " + line[len(line) - (keep - 66):])]
         hidden = sum(1 for k, _ in items[: len(items) - len(kept)] if k == "action")
         return "\n".join(([gap.format(n=hidden)] if hidden else []) + [x for _, x in kept])
     text = "\n".join(x for _, x in items)
