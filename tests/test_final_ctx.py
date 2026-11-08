@@ -109,12 +109,16 @@ def answer(text, finish="stop"):
 # ====================================================================== ctx#1 / security#3: search_history's regex
 def _search_in_child(root, query, timeout=20.0):
     """search_history in a child process: (seconds the search took, its output); None if it was still running."""
+    import nesicode
+
     code_ = ("import sys, time, json\nfrom nesicode.agent import Workspace\nfrom nesicode.agent import context as c\n"
              "t0 = time.monotonic()\nout = c.search_history(Workspace(sys.argv[1]), {'query': sys.argv[2]}, sys.argv[3])\n"
              "print(json.dumps([time.monotonic() - t0, out]))\n")
+    src = os.path.dirname(os.path.dirname(nesicode.__file__))  # the child imports the very code under test
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in (src, os.environ.get("PYTHONPATH", "")) if p)}
     try:
         p = subprocess.run([sys.executable, "-c", code_, str(root), query, ARCHIVE], capture_output=True, text=True,
-                           timeout=timeout, env=os.environ.copy())
+                           timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         return None
     assert p.returncode == 0, p.stderr[-2000:]
