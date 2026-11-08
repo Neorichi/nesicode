@@ -682,8 +682,9 @@ class Agent:
         return "\n\n".join(parts)
 
     def _rebuild(self, provider, model, system, options, task, summary, anchors, new_events, tr_rel):
-        """New conversation: system + earlier turns (re-fitted) + checkpoint, aiming at ~35% of the window so the next
-        compaction is far away even on 16k-32k windows: above it the parts shrink in order (tail, files, skills,
+        """New conversation: system + earlier turns (re-fitted) + checkpoint, aiming at ~35% of a small window and ~32k
+        tokens of a 128k one (ctxm.post_compact_target), so the next compaction is far away and Layer 1 has room to work
+        in between: above it the parts shrink in order (tail, files, skills,
         identifiers, history); the essentials (unanswered results, summary, the user's message) only while the rebuild
         is still over half the window."""
         lim = self.context_limit
@@ -705,7 +706,7 @@ class Agent:
             msg = self._checkpoint(task, summary, anchors, tail_events, b, cache, git, saved, tr_rel)
             chars = sum(len(u) + len(a) + 32 for u, a in hist) + len(msg) + 16
             est = int((self._fixed_chars + chars) / self._cpt)
-            if est <= lim * ctxm.POST_COMPACT_TARGET:
+            if est <= ctxm.post_compact_target(lim):
                 break
             k = next((k for k in order if scale[k] > 0.125 and k not in essential), None)
             if k is None and est > lim * ctxm.POST_COMPACT_MAX:
@@ -1193,7 +1194,9 @@ class Agent:
             if freed:
                 reason = "masked"
                 self.emit({"type": "masked", "freed": freed // 4, "used": used, "limit": lim})
-            self._masked_at = used
+                # Hysteresis only after a real masking: a dry run that found too little to clear must not postpone the
+                # next try by min_freed tokens (it then came after the compaction threshold: Layer 1 never ran there).
+                self._masked_at = used
         # Layer 2: structured summary — only with real growth since the last one (no thrash).
         if used > ctxm.SUMMARY_AT * lim and used >= self._last_compact_after + ctxm.COMPACT_GROWTH * lim \
                 and self._can_compact():

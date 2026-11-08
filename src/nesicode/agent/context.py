@@ -33,6 +33,7 @@ MIN_OUTPUT = 8_192      # (cap; see min_output)
 MAX_COMPACTIONS = 40    # cost guard; thrash is prevented by hysteresis and the no-progress check
 COMPACT_GROWTH = 0.15   # after a compaction, the next one needs this much growth (share of the window)
 POST_COMPACT_TARGET = 0.35  # a rebuilt conversation is shrunk (tail → files → skills → history) above this share...
+POST_COMPACT_ABS = 32_000   # ...or above this many tokens (never under 20% of the window: see post_compact_target)...
 POST_COMPACT_MAX = 0.50     # ...and its essentials (unanswered results, summary, message) only above this one
 INLINE_LIMIT = 8_000    # chars of a tool output kept in context when the window is unknown (see inline_limit)
 INLINE_MIN = 4_000      # floor for small windows: 16k-32k models get ~5% of their window per output, not 8k chars
@@ -63,6 +64,13 @@ def inline_limit(limit: int | None) -> int:
 def min_freed_tokens(limit: int) -> int:
     """Only mask when it frees enough to be worth breaking the prompt cache."""
     return max(2_000, min(12_000, int(limit * 0.09)))
+
+
+def post_compact_target(limit: int) -> int:
+    """Tokens a rebuilt conversation aims at: 35% of small windows, ~32k on 128k ones (20% of huge ones). What follows
+    a compaction must leave Layer 1 room to work: with a 44k base on a 128k window every new output still sat in the
+    newest-kept share when the next compaction came (seen live: 9 compactions in an hour after «continúa»)."""
+    return int(min(POST_COMPACT_TARGET * limit, max(0.20 * limit, POST_COMPACT_ABS)))
 
 
 def summary_target(limit: int) -> int:
