@@ -106,7 +106,7 @@ def test_walkers_never_follow_symlinks_out_of_the_cage(tmp_path):
     (outside / "deep").mkdir()
     (outside / "deep" / "more.txt").write_text("SECRET too\n")
     ws = Workspace(tmp_path / "ws")
-    (ws.root / "app.py").write_text("print('hi')\n")
+    (ws.root / "app.py").write_bytes(b"print('hi')\n")  # (12 bytes on every OS: no CRLF)
     os.symlink(outside / "secret.env", ws.root / "notes.txt")  # what a caged `ln -s` can do
     os.symlink(outside, ws.root / "otherdir")
 
@@ -526,7 +526,7 @@ def test_read_file_offsets_and_line_numbers(tmp_path):
     assert read_file(ws, {"path": "ten.txt", "offset": 50}) == "(no lines at offset 50: the file has 10 lines)"
     (ws.root / "empty.txt").write_text("")
     assert read_file(ws, {"path": "empty.txt"}) == "(empty file)"
-    (ws.root / "ff.py").write_text("a = 1\n\x0c\nb = ' '\nc = 3\nTARGET = 5\n")
+    (ws.root / "ff.py").write_bytes("a = 1\n\x0c\nb = ' '\nc = 3\nTARGET = 5\n".encode("utf-8"))  # (as is)
     assert search(ws, {"pattern": "TARGET"}) == "ff.py:5: TARGET = 5"  # what grep -n says
     assert "     5\tTARGET = 5" in read_file(ws, {"path": "ff.py"})
 

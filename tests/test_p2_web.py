@@ -56,7 +56,7 @@ def run_ts(tmp_path: Path, body: str, head: str = ""):
         f"b.onResolve({{filter: /[\\\\/]Markdown$/}}, () => ({{path: {json.dumps(str(stub))}}})) }}}}]}})"
         ".catch((e) => { console.error(e); process.exit(1) })\n", encoding="utf-8")
     for args in ([NODE, str(build)], [NODE, str(bundle)]):
-        p = subprocess.run(args, capture_output=True, text=True, timeout=90, cwd=tmp_path)
+        p = subprocess.run(args, capture_output=True, encoding="utf-8", timeout=90, cwd=tmp_path)  # (node prints UTF-8)
         assert p.returncode == 0, p.stderr[-4000:]
     return json.loads(p.stdout.strip().splitlines()[-1])
 
