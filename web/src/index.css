@@ -444,6 +444,11 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 .folder-pick { display: flex; gap: 8px; }
 .folder-pick input { font-family: var(--mono); font-size: 13px; }
 
+/* folders the agent may read (project settings) */
+.read-dirs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.read-dirs li { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+.read-dirs code { word-break: break-all; font-size: 13px; }
+
 /* image viewer */
 .img-btn { border: 0; padding: 0; background: none; cursor: zoom-in; display: block; width: 100%; }
 .att .img-btn { width: auto; }

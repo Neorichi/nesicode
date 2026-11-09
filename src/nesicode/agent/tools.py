@@ -525,9 +525,14 @@ def bash(ws: Workspace, args: dict) -> str:
         command = PIPE_TRAP + command  # same line: bash's "line N" in error messages stays the agent's line N
     code, out = ws.run(command, _int(args, "timeout", 120))
     out = out if len(out) <= 30_000 else out[:15_000] + "\n... (output truncated) ...\n" + out[-15_000:]
-    if _refused_by_sandbox(command, out):  # (whatever the exit code: `ls ~/Downloads | head; echo` ends 0)
-        out += "\n[sandbox] That is out of your reach: you only see this workspace, not the user's other folders or " \
-               "apps, and no other command will get you there. " + OUTSIDE_HINT
+    dirs = ws.seen_read_dirs() if hasattr(ws, "seen_read_dirs") else []
+    if _refused_by_sandbox(command, out, dirs):  # (whatever the exit code: `ls ~/Downloads | head; echo` ends 0)
+        out += ("\n[sandbox] That is out of your reach, and no other command will get you there. " + ws.outside_hint()
+                if dirs else
+                "\n[sandbox] That is out of your reach: you only see this workspace, not the user's other folders or "
+                "apps, and no other command will get you there. " + OUTSIDE_HINT)
+    elif _refused_in_read_dirs(command, out, dirs):
+        out += READ_ONLY_NOTE
     return f"exit code: {code}\n{out}"
 
 
@@ -536,13 +541,38 @@ _HOME_REF = re.compile(r"(~|\$HOME\b|\$\{HOME\}|/Users/|/home/|\b(?:Downloads|Do
 _USER_DIRS = re.compile(r"(/Users/|/home/|\b(?:Downloads|Documents|Desktop|Escritorio|Descargas|Documentos)\b)")
 _APP_LAUNCH = re.compile(r"(?:^|[;&|(\s])(?:open|osascript)\s")
 _APP_REFUSED = re.compile(r"lsopen|launchservices|not permitted|not authori[sz]ed|execution error|-54\b|-600\b|-1743\b", re.I)
+_PATH_END = r"(?=$|[\\/\s'\";|&()<>`])[^\s'\";|&()<>`]*"  # the rest of a path that starts with a folder's own name
+READ_ONLY_NOTE = ("\n[sandbox] The user's folders you may read are read-only for you, and places with keys or credentials "
+                  "in them stay out of reach: copy what you need into the workspace and work on the copy. If even a plain "
+                  "read is refused there, the system may not let Nesicode into that folder yet: tell the user (on a Mac: "
+                  "System Settings → Privacy & Security → Files and Folders).")
 
 
-def _refused_by_sandbox(command: str, out: str) -> bool:
+def _without_read_dirs(command: str, read_dirs) -> str:
+    """The command with the paths into the folders the agent may read taken out: what fails there (a file that is
+    not there, one written to) is no wall of the sandbox around the user's folders."""
+    for d in sorted(read_dirs, key=len, reverse=True):
+        for spelled in dict.fromkeys((d, d.replace(" ", "\\ "))):
+            command = re.sub(re.escape(spelled) + _PATH_END, " ", command)
+    return command
+
+
+def _refused_in_read_dirs(command: str, out: str, read_dirs) -> bool:
+    """A command that tried to change something in a folder the agent may only read (or to read a secret in it)."""
+    if not read_dirs or sandbox_mode() not in ("macos", "docker"):
+        return False
+    low = out.lower()
+    return ("operation not permitted" in low or "read-only file system" in low) and \
+        _without_read_dirs(command, read_dirs) != command
+
+
+def _refused_by_sandbox(command: str, out: str, read_dirs=()) -> bool:
     """A command that tried to reach the user's folders or launch an app while the OS sandbox is on — judged by what
-    it printed, not its exit code (a pipe or a trailing `; echo` hides the failure)."""
+    it printed, not its exit code (a pipe or a trailing `; echo` hides the failure). Paths into the folders the user
+    lets the agent read (`read_dirs`) do not count: a read there works, and a failure there is of another kind."""
     if sandbox_mode() not in ("macos", "docker"):
         return False
+    command = _without_read_dirs(command, read_dirs)
     low = out.lower()
     if "operation not permitted" in low and _HOME_REF.search(command):
         return True

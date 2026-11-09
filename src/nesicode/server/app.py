@@ -28,7 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Stre
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from ..agent.workspace import IGNORE_DIRS
+from ..agent.workspace import IGNORE_DIRS, sandbox_mode
 from ..config import settings
 from ..harness import COMPONENTS, base_harness, component_of, diff_summary, inventory, normalize, unified_diff, validate
 from ..llm import (
@@ -45,6 +45,7 @@ from .jobs import (
 )
 from .config_io import KEY_RX
 from .limits import endpoint_problem, vetted
+from .read_dirs import ReadDirError, check_read_dirs, stored_read_dirs
 from ..harnessing.engine import remove_tree  # (read-only files too: git's objects on Windows)
 
 try:  # raised when the project lock stays taken (apply/«Aplicar» while a shared conversation works)
@@ -1867,10 +1868,15 @@ class ProjectPatch(BaseModel):
     vision_model: str | None = Field(default=None, max_length=200)
     image_model: str | None = Field(default=None, max_length=200)
     transcribe_model: str | None = Field(default=None, max_length=200)
+    # folders the agent may read (the whole list; [] = none): checked by read_dirs.check_read_dirs, local mode only
+    read_dirs: list[str] | None = Field(default=None, max_length=100)
 
 
 def project_view(p: dict) -> dict:
-    return {**p, "workspace": str(project_ws(p)), "external": bool(p.get("folder"))}
+    # read_dirs_mode: what keeps the agent to them — 'macos' | 'docker' (a sandbox), 'none' (nothing: Windows, Linux
+    # without Docker) or 'off' (a shared server: the setting is not available)
+    return {**p, "workspace": str(project_ws(p)), "external": bool(p.get("folder")), "read_dirs": stored_read_dirs(p),
+            "read_dirs_mode": "off" if settings.auth_enabled else sandbox_mode()}
 
 
 @app.get("/api/projects")
@@ -2036,6 +2042,11 @@ def patch_project(project_id: int, body: ProjectPatch, user: dict = Depends(curr
     for key in ("executor_model", "improver_model", "vision_model", "image_model", "transcribe_model"):
         if fields.get(key):
             check_model(fields[key], user)
+    if "read_dirs" in fields:
+        try:
+            fields["read_dirs"] = json.dumps(check_read_dirs(fields["read_dirs"]), ensure_ascii=False)
+        except ReadDirError as exc:
+            raise HTTPException(exc.status, str(exc)) from None
     if fields:
         sets = ", ".join(f"{k}=?" for k in fields)
         db.execute(f"UPDATE projects SET {sets} WHERE id=?", (*fields.values(), project_id))

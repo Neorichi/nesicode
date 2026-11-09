@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { api, type Profile, type Thread } from '../api'
+import { api, type Profile, type Project, type Thread } from '../api'
 import { useApp, useProject } from '../App'
 import { forgetDraft } from '../drafts'
 import ProvidersSection, { RolePicker } from '../components/Providers'
@@ -140,6 +140,8 @@ export default function ProjectSettings() {
         <UploadSkipped skipped={upSkipped} />
       </div>
 
+      <ReadDirsCard project={project} onSaved={() => refreshProjects()} />
+
       <div className="card danger">
         <h3>{t('Zona peligrosa')}</h3>
         {delError && <div className="error-box">{delError}</div>}
@@ -159,6 +161,95 @@ export function UploadSkipped({ skipped }: { skipped: string[] }) {
       <ul className="apply-list small">
         {skipped.map(skippedPath).map((s, i) => <li key={`${s.path}:${i}`}><code>{s.path}</code>{s.reason && <> — {s.reason}</>}</li>)}
       </ul>
+    </div>
+  )
+}
+
+/**
+ * Folders of the user's the agent may READ (never change) in this project: the list, «Quitar», a path to add (or the
+ * desktop app's folder picker) and «Añadir Descargas». Every change is saved at once; the server checks each folder and
+ * stores it as the OS spells it (shown back), or says why not (its `detail`, shown as it comes).
+ */
+export function ReadDirsCard({ project, onSaved }: { project: Project; onSaved: () => void }) {
+  useLang()
+  const [dirs, setDirs] = useState<string[]>(project.read_dirs ?? [])
+  const [path, setPath] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  useEffect(() => setDirs(project.read_dirs ?? []), [project.read_dirs])
+  const mode = project.read_dirs_mode ?? 'off'
+  const native = typeof window !== 'undefined' && !!window.pywebview?.api?.pick_folder
+  const hasDownloads = dirs.some((d) => /[\\/]Downloads$/i.test(d))
+
+  const save = async (next: string[]) => {
+    setBusy(true)
+    setError('')
+    try {
+      const p = await api.patch<Project>(`/api/projects/${project.id}`, { read_dirs: next })
+      setDirs(p.read_dirs ?? [])
+      setPath('')
+      onSaved()
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+  const add = (p: string) => {
+    if (p.trim() && !busy) save([...dirs, p.trim()])
+  }
+  const pick = async () => {
+    const p = await window.pywebview?.api?.pick_folder?.()
+    if (p) add(p)
+  }
+
+  return (
+    <div className="card form">
+      <h3>{t('Carpetas que el agente puede leer')}</h3>
+      <p className="warn small">{t('El agente puede leer estas carpetas (nunca cambiarlas) y lo que lea se envía al modelo.')}</p>
+      {mode === 'off' ? (
+        <p className="muted small">{t('Solo en la app de escritorio / modo local')}</p>
+      ) : (
+        <>
+          {dirs.length ? (
+            <ul className="read-dirs">
+              {dirs.map((d) => (
+                <li key={d}>
+                  <code>{d}</code>
+                  <button type="button" className="btn small" disabled={busy} onClick={() => save(dirs.filter((x) => x !== d))}>{t('Quitar')}</button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="muted small">{t('Ninguna: el agente solo ve la carpeta de la conversación.')}</p>
+          )}
+          <div className="folder-pick">
+            {native && <button type="button" className="btn" disabled={busy} onClick={pick}>{t('Elegir carpeta…')}</button>}
+            <input
+              value={path}
+              onChange={(e) => setPath(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  add(path)
+                }
+              }}
+              placeholder={t('/ruta/a/la/carpeta')}
+              spellCheck={false}
+            />
+            <button type="button" className="btn" disabled={busy || !path.trim()} onClick={() => add(path)}>{t('Añadir')}</button>
+          </div>
+          {!hasDownloads && (
+            <div className="row">
+              <button type="button" className="btn small" disabled={busy} onClick={() => add('~/Downloads')}>{t('Añadir Descargas')}</button>
+            </div>
+          )}
+          {mode === 'none' && (
+            <p className="muted small">{t('En este equipo los comandos del agente no van en una jaula: esta lista le dice qué carpetas puede leer, pero no le impide leer otras.')}</p>
+          )}
+          {error && <div className="error-box">{error}</div>}
+        </>
+      )}
     </div>
   )
 }

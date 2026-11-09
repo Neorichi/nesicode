@@ -78,6 +78,9 @@ if IS_DESKTOP:
     os.environ.setdefault("NESICODE_DATA_DIR", str(app_data_dir() / "data"))
     _load_dotenv(app_data_dir() / ".env")
 _load_dotenv(Path.cwd() / ".env")
+# The .env files settings (API keys…) come from: no caged command may read them, not even inside a folder the user lets
+# the agent read (agent/workspace.py, secret_paths).
+DOTENV_PATHS = ([app_data_dir() / ".env"] if IS_DESKTOP else []) + [Path.cwd() / ".env"]
 
 
 def _env(name: str, default: str = "") -> str:

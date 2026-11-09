@@ -13,6 +13,7 @@ import errno
 import hashlib
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -25,7 +26,7 @@ import uuid
 import weakref
 from pathlib import Path
 
-from ..config import settings
+from ..config import DOTENV_PATHS, app_data_dir, settings
 from ..harness import Harness
 
 # Not listed, not diffed, not copied back.
@@ -102,6 +103,16 @@ TOOLCHAIN_SECRETS = (".cargo/credentials", ".cargo/credentials.toml")  # registr
 # MySQL/PostgreSQL/MongoDB files and their logs; no toolchain reads them).
 SHARED_DIRS = ("/Volumes", "/Users", "/private/tmp", "/private/var/tmp", "/private/var/folders",
                "/opt/homebrew/var", "/usr/local/var", "/opt/local/var")
+# Keys, credentials and private stores under $HOME that no caged command may read, not even inside a folder the user
+# lets the agent read (~/.config holds gh's token, ~/Library the keychains, a browser profile its cookies).
+SECRET_PLACES = (
+    ".ssh", ".gnupg", ".aws", ".azure", ".docker", ".kube", ".netrc", ".npmrc", ".pypirc", ".git-credentials",
+    ".vault-token", ".password-store", ".gem/credentials", ".terraform.d/credentials.tfrc.json", ".nesicode",
+    ".config/gh", ".config/hub", ".config/gcloud", ".config/git/credentials", ".config/op", ".config/google-chrome",
+    ".config/chromium", ".mozilla", "Library/Keychains", "Library/Cookies", "Library/Mail", "Library/Messages",
+    "Library/Safari", "Library/Application Support/Google/Chrome", "Library/Application Support/Firefox",
+    "Library/Application Support/Microsoft Edge", "Library/Application Support/BraveSoftware",
+)
 
 
 # Variables Windows programs need to start at all (PATH alone is not enough there).
@@ -145,6 +156,11 @@ def shell_argv(command: str) -> list[str]:
 
 OUTSIDE_HINT = ("Files from elsewhere (the user's Downloads, Documents…) only reach you when the user attaches them "
                 "to the chat or puts them in the project folder: ask for the file instead of looking for a way in.")
+# The same when the user lets the agent read some folders of theirs (a project setting): it says which, and how.
+READ_DIRS_HINT = ("You may READ (never change) only these folders of the user, with bash: {dirs} (`~` is your own "
+                  "private home, not the user's). Copy what you need into the workspace and work on the copy. Other "
+                  "files only reach you when the user attaches them to the chat or puts them in the project folder: "
+                  "ask for the file instead of looking for a way in.")
 
 
 def sandbox_mode() -> str:
@@ -174,7 +190,46 @@ def _sandbox_paths() -> tuple[list[Path], list[Path], list[Path]]:
     return first, tools, after
 
 
-def macos_profile(cage: Path, home: Path, deny_ports=()) -> str:
+def vault_key_file() -> Path:
+    """Where the vault's master key lives (server/vault.py) when it is not given in the environment."""
+    return Path(os.environ.get("NESICODE_VAULT_KEY_FILE", "~/.nesicode/vault.key")).expanduser()
+
+
+def secret_paths() -> list[Path]:
+    """What no caged command may read, not even inside a folder the user lets the agent read: SECRET_PLACES under the
+    home and Nesicode's own (its data dir, the desktop app's folder, the vault key, the .env files settings come from).
+    Each is listed where it is spelled and where it really is (a ~/.ssh linked into a dotfiles folder): the sandbox
+    judges the real path."""
+    home = Path(os.path.expanduser("~")).resolve()
+    out: list[Path] = []
+    for p in [*(home / s for s in SECRET_PLACES), settings.data_dir, app_data_dir(), vault_key_file(), *DOTENV_PATHS]:
+        for q in (Path(os.path.abspath(p)), Path(os.path.realpath(p))):
+            if q not in out:
+                out.append(q)
+    return out
+
+
+def container_path(p: str, windows: bool | None = None) -> str:
+    """Where a folder of this machine appears inside a command's container (docker mode): at the same path; a Windows
+    path at its POSIX spelling (C:\\Users\\me\\Downloads at /c/Users/me/Downloads)."""
+    if not (os.name == "nt" if windows is None else windows):
+        return p
+    from pathlib import PureWindowsPath
+
+    w = PureWindowsPath(p)
+    if not w.drive:
+        return p.replace("\\", "/")
+    unc = w.drive.startswith(("\\\\", "//"))
+    root = "/unc/" + w.drive.strip("\\/").replace("\\", "/") if unc else "/" + w.drive.rstrip(":").lower()
+    return "/".join([root, *w.parts[1:]])
+
+
+def seen_paths(read_dirs, mode: str) -> list[str]:
+    """The folders the user lets the agent read, as its commands see them in sandbox `mode`."""
+    return [container_path(d) if mode == "docker" else d for d in read_dirs]
+
+
+def macos_profile(cage: Path, home: Path, deny_ports=(), read_dirs=()) -> str:
     """Seatbelt profile: the command may read the OS and the toolchains, and read or write only its own
     cage and private home. Off limits: the user's home, the data dir (other users, projects and
     conversations), the nesicode repo (.env), other disks and users, the shared and per-user temp dirs,
@@ -182,16 +237,25 @@ def macos_profile(cage: Path, home: Path, deny_ports=()) -> str:
     Apple Events (both run code outside the sandbox), signals to other processes and nesicode's own API
     port (`deny_ports`). Seatbelt cannot stop sysctl(KERN_PROCARGS2) from reading another same-user
     process's launch environment, so secrets must never be in one (caged commands get a minimal env).
-    In SBPL the LAST matching rule wins, so denies come first and the cage allow last."""
+    In SBPL the LAST matching rule wins, so denies come first and the cage allow last.
+
+    `read_dirs`: folders of the user's the command may also READ (a project setting, validated by the server; they
+    come canonical and are used as they are: Seatbelt matches the real path of what is opened, so a link inside one
+    that leads elsewhere opens nothing, and one that became a link opens nothing either). Their allow comes after the
+    first denies, which it must beat (the home, /Users, /Volumes…), and before the secret ones, which must beat it
+    (secret_paths, then the repo and the rest of `after`); nothing ever lets a command write there."""
     cage, home = cage.resolve(), home.resolve()
     first, tools, after = _sandbox_paths()
     sub = lambda paths: " ".join(f"(subpath {_q(p)})" for p in paths)  # noqa: E731
+    readable = [Path(d) for d in read_dirs]
     return "\n".join([
         "(version 1)",
         "(allow default)",
         f"(deny file-read* file-write* {sub(first)})",
         '(deny file-write* (subpath "/"))',
         f"(allow file-read* {sub(tools)})",
+        *([f"(allow file-read* {sub(readable)})"] if readable else []),
+        f"(deny file-read* file-write* {sub(secret_paths())})",
         f"(deny file-read* file-write* {sub(after)})",
         "(allow file-read-metadata)",
         # Apple's xcrun shims (/usr/bin/python3, git…) read their lookup cache; writing it is denied (the user's
@@ -224,6 +288,7 @@ def _cage_path(path: str, cage: Path, home: Path) -> str:
     """The server's PATH minus directories the sandbox denies (a denied interpreter, e.g. the repo's .venv
     under `uv run`, would crash instead of being 'not found'), with the cage's shims first."""
     first, tools, after = _sandbox_paths()
+    after = [*secret_paths(), *after]
     allowed = [str(cage.resolve()), str(home.resolve())]
     keep = [str(_cage_bin(home))]
     for entry in path.split(os.pathsep):
@@ -952,18 +1017,36 @@ def apply_cage(base: dict[str, str], root: Path, target: Path) -> dict:
 
 
 class Workspace:
-    def __init__(self, root: Path | str):
+    def __init__(self, root: Path | str, read_dirs=()):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        # Folders of the user's that its commands may also READ (a project setting: chat and bot runs; jobs.py passes
+        # them validated and canonical). Only bash reaches them: the file tools below stay inside the root.
+        self.read_dirs: tuple[str, ...] = tuple(str(d) for d in read_dirs)
         self._bg = _Background()
         self._watcher: threading.Thread | None = None
         weakref.finalize(self, self._bg.kill)  # the run that used this workspace is over
+
+    def seen_read_dirs(self) -> list[str]:
+        """read_dirs as this workspace's commands see them (in docker mode, where they are mounted)."""
+        return seen_paths(self.read_dirs, sandbox_mode()) if self.read_dirs else []
+
+    def outside_hint(self) -> str:
+        """What the agent is told when it reaches for something outside the workspace."""
+        dirs = self.seen_read_dirs()
+        return READ_DIRS_HINT.format(dirs=", ".join(f"`{d}`" for d in dirs)) if dirs else OUTSIDE_HINT
 
     def resolve(self, rel: str) -> Path:
         rel = (rel or ".").strip()
         p = (self.root / rel).resolve()
         if p != self.root and self.root not in p.parents:
-            raise ToolError(f"path {rel!r} is outside the workspace. {OUTSIDE_HINT}")
+            for d, seen in zip(self.read_dirs, self.seen_read_dirs()):
+                if _within(str(p), d):  # a file the agent may read, but only with bash: say how
+                    there = seen + str(p)[len(d):].replace(os.sep, "/" if seen.startswith("/") else os.sep)
+                    raise ToolError(f"path {rel!r} is in a folder of the user's you may only READ, with bash (your file "
+                                    f"tools work only inside the workspace): copy it in first, e.g. `cp {shlex.quote(there)} .`, "
+                                    "and work on the copy.")
+            raise ToolError(f"path {rel!r} is outside the workspace. {self.outside_hint()}")
         return p
 
     def rel(self, p: Path) -> str:
@@ -1099,12 +1182,12 @@ class Workspace:
         container = None
         if mode == "docker":
             container = f"nesicode-{uuid.uuid4().hex[:16]}"
-            argv, env = docker_argv(self.root, command, container), None
+            argv, env = docker_argv(self.root, command, container, self.read_dirs), None
         else:
             env = self._local_env(mode)
             argv = shell_argv(command)
             if mode == "macos":
-                argv = ["sandbox-exec", "-p", macos_profile(self.root, self.home, _listening_ports())] + argv
+                argv = ["sandbox-exec", "-p", macos_profile(self.root, self.home, _listening_ports(), self.read_dirs)] + argv
         # Windows: started suspended, put in its own job, then let go (see _WinJob): not even its first child can start
         # outside the job
         suspend = os.name == "nt" and _WinJob.ready()
@@ -1211,16 +1294,85 @@ _XCRUN_NOISE = re.compile(r"^[^\n:]{1,80}: error: couldn't create cache file '[^
 _CONTAINERS: set[str] = set()
 
 
-def docker_argv(root: Path, command: str, name: str) -> list[str]:
+def _mount(**fields: str | None) -> str:
+    """A --mount value: CSV, so a path with a comma or a quote is quoted (docker reads it with Go's csv)."""
+    out = []
+    for k, v in fields.items():
+        item = k if v is None else f"{k}={v}"
+        out.append('"' + item.replace('"', '""') + '"' if any(c in item for c in ',"\n\r') else item)
+    return ",".join(out)
+
+
+EMPTY_FILE = ".empty"  # in the data dir: bind-mounted over a secret file inside a folder the agent may read
+
+
+def _empty_file() -> Path | None:
+    """An empty regular file of the server's (caged commands never write the data dir) to mount over a secret file;
+    None when it cannot be vouched for (never a link, never anything with content)."""
+    p = settings.data_dir.resolve() / EMPTY_FILE
+    try:
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC | _BINARY, 0o444)
+        os.close(fd)
+    except FileExistsError:
+        pass
+    except OSError:
+        return None
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return None
+    return p if stat.S_ISREG(st.st_mode) and st.st_size == 0 else None
+
+
+def _docker_read_mounts(read_dirs) -> list[str]:
+    """--mount arguments for the folders the agent may read: each read-only at the same path (container_path), and
+    what must stay unreadable inside them (secret_paths, the repo, NESICODE_SANDBOX_DENY…) hidden under an empty
+    tmpfs (a folder) or an empty file (a file). A folder whose secret file cannot be hidden is not mounted at all."""
+    if not read_dirs:
+        return []
+    _, _, after = _sandbox_paths()
+    hidden = list(dict.fromkeys(str(h) for h in [*secret_paths(), *after]))
+    out: list[str] = []
+    for d in read_dirs:
+        if any(_within(d, s) for s in hidden):  # (the server never lets one be named; never mounted either)
+            print(f"nesicode: {d} is not mounted for the agent (it is a place it may never read)")
+            continue
+        masks, ok = [], True
+        for s in hidden:
+            if not _within(s, d):
+                continue
+            try:
+                st = os.lstat(s)
+            except OSError:
+                continue  # not there: nothing to hide
+            if stat.S_ISDIR(st.st_mode):
+                masks += ["--mount", _mount(type="tmpfs", destination=container_path(s), **{"tmpfs-size": "65536"})]
+            elif stat.S_ISREG(st.st_mode):
+                empty = _empty_file()
+                if empty is None:
+                    ok = False
+                    break
+                masks += ["--mount", _mount(type="bind", source=str(empty), destination=container_path(s), readonly=None)]
+            # (a link: it leads where the container has nothing of the host, or into a folder hidden here by its real path)
+        if ok:
+            out += ["--mount", _mount(type="bind", source=d, destination=container_path(d), readonly=None), *masks]
+        else:
+            print(f"nesicode: {d} is not mounted for the agent (a secret file inside it could not be hidden)")
+    return out
+
+
+def docker_argv(root: Path, command: str, name: str, read_dirs=()) -> list[str]:
     """A throwaway container with a name (so Stop/timeout can `docker kill` it: killing the CLI does not stop
-    it) and, on Linux, the server's uid (files it creates stay the server's, not root's)."""
+    it) and, on Linux, the server's uid (files it creates stay the server's, not root's). The folders the user lets
+    the agent read are mounted read-only (_docker_read_mounts)."""
     user: list[str] = []
     if sys.platform.startswith("linux") and hasattr(os, "getuid"):
         user = ["--user", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp"]
     return [
         "docker", "run", "--rm", "--init", "--name", name, *user, "--network", settings.docker_network,
         "--memory", "2g", "--cpus", "2", "--pids-limit", "512", "-e", "PYTHONDONTWRITEBYTECODE=1", "-e", "PYTHONUTF8=1",
-        "-v", f"{root}:/workspace", "-w", "/workspace", settings.docker_image, "bash", "-lc", command,
+        "-v", f"{root}:/workspace", *_docker_read_mounts(read_dirs), "-w", "/workspace", settings.docker_image,
+        "bash", "-lc", command,
     ]
 
 

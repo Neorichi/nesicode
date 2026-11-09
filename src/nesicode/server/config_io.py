@@ -102,6 +102,8 @@ def build(db: DB, user_id: int, *, project_id: int | None, include_telegram: boo
         p = db.one("SELECT * FROM projects WHERE id=? AND user_id=?", (project_id, user_id))
         if p:
             h = db.one("SELECT files FROM harness_versions WHERE project_id=? AND version=?", (p["id"], p["harness_version"]))
+            # (never the folders the agent may read, read_dirs: they are this machine's, and a file must never widen
+            # what an agent may read — validate_import and create_project take named keys only, so none come in either)
             doc["project_template"] = {
                 "from": p["name"],
                 **{k: p.get(k) for k in ("executor_model", "improver_model", "vision_model", "image_model",

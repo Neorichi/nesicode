@@ -233,6 +233,9 @@ MIGRATIONS = [
     # main folder picked by the user on disk ('' = nesicode keeps the files in its data dir)
     ("projects", "folder", "TEXT NOT NULL DEFAULT ''"),
     ("threads", "allowed_tools", "TEXT NOT NULL DEFAULT '[]'"),
+    # folders of the user's the agent may READ (never change) in this project's chat and bot runs: a JSON list of
+    # canonical absolute paths, validated by server/read_dirs.py; [] = none (the default)
+    ("projects", "read_dirs", "TEXT NOT NULL DEFAULT '[]'"),
 ]
 
 
