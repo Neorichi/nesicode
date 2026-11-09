@@ -19,6 +19,7 @@ def test_checkbox_labels_wrap_instead_of_running_off_the_page():
     check = rule(".check")
     assert "nowrap" not in check and "flex-start" in check  # (the box stays by the first line)
     assert "flex: none" in rule(".check input")
+    assert "flex: none" in rule(".page-head > .check")  # (a short one beside a title keeps its line)
 
 
 def test_bot_cards_fit_their_actions_and_never_widen_the_page():

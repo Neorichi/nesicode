@@ -249,6 +249,7 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 .form { display: flex; flex-direction: column; gap: 16px; }
 .check { display: flex !important; flex-direction: row !important; align-items: flex-start; gap: 8px; font-size: 14px; }
 .check input { width: auto; flex: none; } /* (a long label wraps beside its box instead of running off the page) */
+.page-head > .check { flex: none; } /* (a short one beside a page's title keeps its line: Lessons' «Todos los dominios») */
 .empty { color: var(--ink-3); padding: 40px; text-align: center; border: 1px dashed var(--line-2); border-radius: 12px; }
 .banner { display: flex; justify-content: space-between; align-items: center; gap: 12px; background: var(--accent-soft); padding: 10px 14px; border-radius: 10px; margin-bottom: 12px; flex-wrap: wrap; }
 
@@ -559,7 +560,7 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 .bot-name:hover { color: var(--accent); }
 .bot-meta { display: flex; flex-wrap: wrap; gap: 6px 14px; color: var(--ink-2); align-items: center; }
 .bot-meta .warn { color: #b4540a; }
-.bot-meta .done, .hint-box .done { color: var(--ok); font-weight: 500; }
+.bot-meta .done, .hint-box .done, .bot-bar-meta .done { color: var(--ok); font-weight: 500; }
 .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); vertical-align: middle; }
 .status-dot.ok { background: #16794c; } .status-dot.err { background: var(--err); } .status-dot.run { background: #b4540a; animation: nesi-pulse 1s infinite; }
 .switch { position: relative; width: 36px; height: 20px; flex: none; cursor: pointer; }

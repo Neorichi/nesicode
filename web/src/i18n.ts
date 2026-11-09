@@ -852,6 +852,7 @@ const EN: Record<string, string> = {
   'Ver memoria': 'View memory',
   'Avisar': 'Notify',
   'Programar seguimiento': 'Schedule follow-up',
+  'Terminar tarea': 'Finish task',
   'Resumen diario de noticias': 'Daily news digest',
   'Vigilar una web': 'Watch a web page',
   'Informe semanal en Word': 'Weekly Word report',

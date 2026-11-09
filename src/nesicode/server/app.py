@@ -1226,9 +1226,9 @@ def draft_bot(body: BotDraft, user: dict = Depends(current_user)):
     prompt = (
         "Turn the user's request into a JSON bot configuration for Nesicode. Reply with ONLY a JSON object:\n"
         '{"name": short name, "description": one line, "instructions": complete self-contained brief for an unattended '
-        'agent (what to check, how to report, when to stay silent by answering NOTHING_NEW, and — if the goal has an end, '
-        'like "tell me when X happens" — to switch itself off with bot_finish once it is reached and reported), written in '
-        'the user\'s language, '
+        'agent (what to check, how to report, when to stay silent by answering NOTHING_NEW, and — only for a one-time goal '
+        'like "tell me when X is published" — to switch itself off with bot_finish once X has happened and been reported), '
+        'written in the user\'s language, '
         '"triggers": [' + cron + ' | {"kind": "interval", "spec": "30" (minutes) or "2h"} '
         '| {"kind": "url", "spec": "https://…", "config": {"every": 30}}] (empty list if it should only run on demand), '
         '"policy": "readonly" if it only needs to read/fetch/report, else "ask"}\n\nUser request:\n' + body.description

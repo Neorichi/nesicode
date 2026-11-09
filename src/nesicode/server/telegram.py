@@ -597,6 +597,9 @@ class TelegramBridge:
                         row.append({"text": "♾ Siempre", "callback_data": data("always")})
                     row.append({"text": "⛔ Denegar", "callback_data": data("deny")})
                     self._safe_send(chat_id, f"🔐 Nesicode quiere usar {e.get('name')}:\n{what}", [row])
+                elif t == "bot_finished" and not bot_name and not e.get("depth"):
+                    # a chat with the bot from here: its finish sends no separate notice, so this is where the user sees it
+                    self._safe_send(chat_id, f"✅ Tarea cumplida: el bot se ha desactivado — {e.get('text', '')}")
                 elif t == "image":
                     self._send_file(chat_id, ws, e.get("path", ""), e.get("caption", ""), photo=True)
                 elif t == "file":

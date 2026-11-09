@@ -7,6 +7,7 @@ import Composer, { AttachmentChip } from '../components/Composer'
 import Diff from '../components/Diff'
 import Transcript from '../components/Transcript'
 import { forgetDraft } from '../drafts'
+import { PausedNote } from './Bots'
 import { t, useLang } from '../i18n'
 import {
   applySummary, compactionNotice, compactReason, endedRuns, endsLiveText, followAgainIn, liveText, mergeLoaded, openFileError, queueStalled,
@@ -643,7 +644,7 @@ function BotBar({ bot, onRun }: { bot: any; onRun: () => void }) {
         <span className="muted small">{bot.description || t('Bot')}</span>
       </div>
       <div className="bot-bar-meta small">
-        {bot.enabled ? (next ? <span>{t('Próxima tarea')}: <b>{next}</b></span> : <span>{t('Sin horario')}</span>) : <span className="warn">⏸ {t('En pausa')}</span>}
+        {bot.enabled ? (next ? <span>{t('Próxima tarea')}: <b>{next}</b></span> : <span>{t('Sin horario')}</span>) : <PausedNote b={bot} />}
         <button className="btn small" onClick={onRun}>▶ {t('Ejecutar tarea ahora')}</button>
         <Link className="btn small ghost" to={`/bots/${bot.id}`}>{t('Tareas y ajustes')}</Link>
       </div>

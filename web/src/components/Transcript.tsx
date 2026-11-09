@@ -35,6 +35,7 @@ const TOOL_LABEL = (): Record<string, string> => ({
   bot_memory_delete: t('Olvidar'),
   bot_notify: t('Avisar'),
   bot_schedule_once: t('Programar seguimiento'),
+  bot_finish: t('Terminar tarea'),
   show_image: t('Mostrar imagen'),
 })
 
