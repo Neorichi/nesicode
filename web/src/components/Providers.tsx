@@ -246,9 +246,9 @@ function ProviderForm({ initial, templates, onDone }: { initial?: ProviderRow; t
     <div className="prov-form">
       {!editing && (
         <div className="templates">
-          {templates.map((t) => (
-            <button key={t.name} type="button" className="idea" onClick={() => useTemplate(t)}>
-              {t.label}
+          {templates.map((tp) => (
+            <button key={tp.name} type="button" className="idea" onClick={() => useTemplate(tp)}>
+              {t(tp.label)}
             </button>
           ))}
         </div>

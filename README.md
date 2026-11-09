@@ -4,7 +4,7 @@ A coding agent that **improves its own harness** task by task, with a multi-user
 
 ![Nesicode quick start: add a provider, pick models by role, chat, connectors and bots](docs/demo/nesicode-demo.gif)
 
-▶ [Watch the quick-start video (MP4, 104 s)](docs/demo/nesicode-demo.mp4) — pick a project profile, add your API key, choose a model for each role, chat, connectors and bots.
+▶ [Watch the quick-start video (MP4, 96 s)](docs/demo/nesicode-demo.mp4) — pick a project profile, add your API key, choose a model for each role, chat, connectors and bots.
 
 ## Quick tour
 
@@ -36,6 +36,12 @@ A coding agent that **improves its own harness** task by task, with a multi-user
 <summary><b>5 · Bots</b> — tasks that run on their own (<a href="docs/demo/clips/5-bots.mp4">MP4</a>)</summary>
 
 ![Bots](docs/demo/clips/5-bots.gif)
+</details>
+
+<details>
+<summary><b>How to add providers and pick models</b> — templates (Nesi Labs, Claude, OpenAI, OpenRouter, Gemini, GLM, Grok, DeepSeek, Ollama or any OpenAI-compatible API), test the connection, discover its models, models by role, export / import to another computer (<a href="docs/demo/providers.mp4">MP4, 80 s</a>)</summary>
+
+![How to add a provider and pick models](docs/demo/providers.gif)
 </details>
 
 The model's weights never change: what gets optimized is the system around it (instructions, rules, memory,
@@ -167,6 +173,8 @@ them for very slow local models or long hidden reasoning.
 
 ## Providers, per-role models and vault
 
+▶ [Video: how to add a provider and pick a model for each role (MP4, 80 s)](docs/demo/providers.mp4)
+
 - In **Project settings → Providers** each user adds their own: name, type (OpenAI-compatible or Anthropic), endpoint, API key and models. There are templates, "Test connection" and "Discover models".
 - In **Models by role** you pick provider and model for **Chat** (executor), **Improvement** (proposes, composes and selects harnesses; use your strongest model), **Vision** (reads images when the chat model cannot), **Image generation** and **Transcription**.
 - API keys go to a **vault**: AES-256-GCM envelope encryption (one data key per secret, wrapped with a master key), bound to user and provider. The master key is not in the database or in `data/`, but in `~/.nesicode/vault.key` (0600) or in `NESICODE_VAULT_KEY`. The API only returns a hint (`••••1234`).
@@ -209,7 +217,7 @@ src/nesicode/
 web/            React + Vite (chat, harness editor, harnessing pipeline, lessons, integrations)
 extension/      Chrome extension ("Nesicode" tab group)
 packaging/      macOS (.app/.dmg) and Windows (installer) builds
-docs/demo/      quick-start video and the script that records it
+docs/demo/      quick-start and providers videos, and the scripts that record them
 tests/          uv run pytest
 ```
 

@@ -333,6 +333,7 @@ const EN: Record<string, string> = {
   'nombre': 'name',
   'Etiqueta': 'Label',
   'Tipo de API': 'API type',
+  'Otro (compatible con OpenAI)': 'Other (OpenAI-compatible)',
   'Compatible con OpenAI': 'OpenAI-compatible',
   'Endpoint (base URL)': 'Endpoint (base URL)',
   'https://api.ejemplo.com/v1': 'https://api.example.com/v1',
