@@ -75,9 +75,11 @@ jobs:
           $log = Join-Path $env:APPDATA "nesicode\nesicode.log"
           if (-not $port) { if (Test-Path $log) { Get-Content $log -Tail 80 }; throw "the packaged app did not start its server" }
           Write-Host "app server on port $port"
-          $h = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$port/api/health"
+          # The desktop server only serves its own window (it answers 403 «abre la app desde su ventana» to anything
+          # else): that answer proves the bundled server is up and guarded.
+          $h = Invoke-WebRequest -UseBasicParsing -SkipHttpErrorCheck "http://127.0.0.1:$port/api/health"
           Write-Host "health: $($h.StatusCode) $($h.Content)"
-          if ($h.StatusCode -ne 200) { throw "health check failed" }
+          if (-not ($h.StatusCode -eq 200 -or ($h.StatusCode -eq 403 -and $h.Content -match 'nesicode desktop'))) { throw "unexpected answer" }
           Start-Sleep -Seconds 5
           if ($p.HasExited) { throw "the app exited" }
           if (Test-Path $log) { Write-Host "---- app log ----"; Get-Content $log -Tail 60 }
