@@ -16,6 +16,7 @@ import shlex
 import shutil
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,14 @@ MACOS = sys.platform == "darwin" and shutil.which("sandbox-exec") is not None
 macos_only = pytest.mark.skipif(not MACOS, reason="needs the macOS sandbox (sandbox-exec)")
 posix_only = pytest.mark.skipif(os.name == "nt", reason="symbolic links need admin rights on Windows")
 FINAL = {"done", "error", "cancelled", "interrupted", "max_steps", "refusal"}
+SHARED_ROOTS = rd.SHARED_ROOTS
+
+
+@pytest.fixture(autouse=True)
+def _the_temp_dir_is_ours_here(monkeypatch):
+    """The folders these tests make live in the temp dir, which the server refuses as a place every program shares
+    (test_places_every_program_shares_are_never_read checks that): out of the way everywhere else."""
+    monkeypatch.setattr(rd, "SHARED_ROOTS", ())
 
 
 @pytest.fixture()
@@ -81,7 +90,8 @@ def test_folders_the_agent_is_never_let_read(home, tmp_path, monkeypatch):
         _refused(p, "no tu carpeta personal")
     _refused(tmp_path / "Users" / "other" / "Downloads", "de otro usuario")
     _refused(tmp_path / "Users" / "other", "de otro usuario")
-    for p in (home / ".ssh", home / ".config" / "gh", home / "Library" / "Keychains"):
+    (home / ".colima" / "_lima").mkdir(parents=True)  # (the SSH key of the VM that runs Docker, with the home mounted)
+    for p in (home / ".ssh", home / ".config" / "gh", home / "Library" / "Keychains", home / ".colima" / "_lima"):
         _refused(p, "claves o credenciales")
     for p in (home / ".config", home / "Library"):
         _refused(p, "datos privados de tus apps")
@@ -104,6 +114,29 @@ def test_folders_the_agent_is_never_let_read(home, tmp_path, monkeypatch):
         _refused("/System/Library" if sys.platform == "darwin" else "/proc/self", "del sistema")
         monkeypatch.setenv("NESICODE_SANDBOX_DENY", str(home / "Documents"))
         _refused(home / "Documents" / "x", "vetada")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX places")
+def test_places_every_program_shares_are_never_read(home, tmp_path, monkeypatch):
+    """/tmp and the like hold other programs' files and sockets, and in docker mode a folder is mounted: a read-only
+    mount still lets a socket in it be connected to (tmux's, an ssh-agent's, a rootless Docker's: a shell outside the
+    cage). Never one of them, a folder inside one or a folder that holds one; a USB disk Linux mounts under /run/media
+    is no such place."""
+    monkeypatch.setattr(rd, "SHARED_ROOTS", SHARED_ROOTS)
+    for p in ("/tmp", "/var/tmp", "/private/tmp", "/var", "/private", "/opt/homebrew/var", "/usr/local/var"):
+        if Path(p).is_dir():  # (refused: some of them hold this test's home too, which is said first)
+            with pytest.raises(rd.ReadDirError):
+                rd.check_read_dir(p)
+    # the rule, on places of this test's own
+    run, tmp = tmp_path / "run", tmp_path / "tmp"
+    for d in (run / "user" / "501", run / "media" / "me" / "USB", tmp / "tmux-501", tmp_path / "srv" / "x"):
+        d.mkdir(parents=True)
+    monkeypatch.setattr(rd, "SHARED_ROOTS", (_c(run), _c(tmp)))
+    monkeypatch.setattr(rd, "REMOVABLE_ROOTS", (_c(run / "media"),))
+    for p in (run, run / "user" / "501", tmp, tmp / "tmux-501", tmp_path / "srv" / ".." / "tmp"):
+        _refused(p, "la comparten todos los programas")
+    assert rd.check_read_dir(str(run / "media" / "me" / "USB")) == _c(run / "media" / "me" / "USB")
+    assert rd.check_read_dir(str(tmp_path / "srv" / "x")) == _c(tmp_path / "srv" / "x")
 
 
 @pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions (root reads everything)")
@@ -226,6 +259,36 @@ def test_the_setting_is_kept_with_the_project_and_checked_by_the_server(home, mo
     assert c.get(url).json()["read_dirs"] == [dl]
     assert c.patch(url, json={"read_dirs": "~/Downloads"}).status_code == 422
     assert c.patch(url, json={"read_dirs": []}).json()["read_dirs"] == []
+
+
+def test_folders_can_always_be_taken_off_the_list(home, tmp_path, monkeypatch):
+    """Two disks unplugged (or two folders macOS no longer lets Nesicode into) must never keep the user from taking a
+    folder off the list: before, every folder kept was checked again, so «Quitar» on either one failed because of the
+    other, and the user could not take back what the agent may read. The folders kept stay as they are (each run checks
+    them again); the ones added are still checked."""
+    c = _local(monkeypatch)
+    url = f"/api/projects/{_project(c)['id']}"
+    usb1, usb2 = tmp_path / "usb1", tmp_path / "usb2"
+    usb1.mkdir()
+    usb2.mkdir()
+    dl = _c(home / "Downloads")
+    stored = c.patch(url, json={"read_dirs": [str(usb1), str(usb2), dl]}).json()["read_dirs"]
+    assert stored == [_c(usb1), _c(usb2), dl]
+    usb1.rmdir()  # both disks unplugged
+    usb2.rmdir()
+    r = c.patch(url, json={"read_dirs": [stored[1], dl]})  # «Quitar» on the first one
+    assert r.status_code == 200 and r.json()["read_dirs"] == [stored[1], dl], r.text
+    assert c.patch(url, json={"read_dirs": [dl]}).json()["read_dirs"] == [dl]
+    # what is added is checked as ever, and a folder spelled anew is a folder added
+    r = c.patch(url, json={"read_dirs": [dl, str(home)]})
+    assert r.status_code == 422 and "no tu carpeta personal" in r.json()["detail"]
+    assert c.patch(url, json={"read_dirs": [dl, str(usb1)]}).status_code == 422
+    # a shared server (login on) never takes a folder in, but lets the ones stored in local mode go
+    monkeypatch.setattr(settings, "auth_enabled", True)
+    assert rd.check_read_dirs([], kept=[dl]) == [] and rd.check_read_dirs([dl], kept=[dl]) == [dl]
+    with pytest.raises(rd.ReadDirError) as e:
+        rd.check_read_dirs([dl, str(home / "Documents" / "x")], kept=[dl])
+    assert e.value.status == 403
 
 
 def test_a_shared_server_never_lets_the_agent_read_its_folders(home, monkeypatch):
@@ -419,6 +482,60 @@ def test_a_key_kept_in_a_dotfiles_folder_stays_out_when_that_folder_may_be_read(
     assert code != 0 and "not permitted" in out and "K-SSH" not in out
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS's data volume alias")
+def test_a_key_behind_a_link_through_the_data_volume_alias_stays_out(tmp_path, monkeypatch):
+    """~/.ssh linked as /System/Volumes/Data/…/dotfiles/ssh: the kernel names that folder by its short path, and a deny
+    spelled with the alias matched nothing, so with the dotfiles' folder allowed the key could be read — and that
+    folder itself could even be named."""
+    me = tmp_path / "Users" / "me"
+    dot = me / "Documents" / "dotfiles"
+    (dot / "ssh").mkdir(parents=True)
+    (dot / "ssh" / "id_ed25519").write_text("K-SSH", encoding="utf-8")
+    (dot / "zshrc").write_text("publico", encoding="utf-8")
+    alias = Path("/System/Volumes/Data" + str(rd.canonical(dot / "ssh")))
+    if not alias.is_dir():
+        pytest.skip("this temp folder has no data volume alias")
+    (me / ".ssh").symlink_to(alias)
+    monkeypatch.setenv("HOME", str(me))
+    assert Path(os.path.realpath(me / ".ssh")) == alias  # (Python follows links, not firmlinks)
+    _refused(dot / "ssh", "claves o credenciales")
+    allowed = rd.check_read_dir(str(dot))
+    assert f"(subpath {wsmod._q(rd.canonical(dot / 'ssh'))})" in wsmod.macos_profile(tmp_path, tmp_path, (), [allowed])
+    ws = Workspace(tmp_path / "ws", read_dirs=[allowed])
+    assert ws.run(f"cat {shlex.quote(str(dot / 'zshrc'))}")[1] == "publico"
+    code, out = ws.run(f"cat {shlex.quote(str(dot / 'ssh' / 'id_ed25519'))} 2>&1")
+    assert code != 0 and "not permitted" in out and "K-SSH" not in out
+
+
+@posix_only
+@pytest.mark.skipif(sys.platform != "darwin", reason="a disk that compares names blind to case and normalisation")
+def test_a_secret_spelled_otherwise_than_on_disk_is_still_one_and_hidden_in_docker(tmp_path, monkeypatch):
+    """A link to a secret place that spells its folders otherwise than the disk does (another case, another Unicode
+    normalisation) leads to the same place: the server refuses to let it be read, and Docker hides it inside a folder
+    that may be read — at that folder's own spelling (a mask spelled otherwise lands beside the mount and hides
+    nothing), where before it did not hide it at all."""
+    me = tmp_path / "Users" / "me"
+    nfd = unicodedata.normalize("NFD", "Configuración")
+    dot = me / "Documents" / nfd / "dotfiles"
+    (dot / "ssh").mkdir(parents=True)
+    (dot / "ssh" / "id_ed25519").write_text("K-SSH", encoding="utf-8")
+    if not (me / "DOCUMENTS").is_dir():
+        pytest.skip("case-sensitive volume")
+    # the link: another case and the composed (NFC) form of the folder's name
+    (me / ".ssh").symlink_to(me / "DOCUMENTS" / unicodedata.normalize("NFC", "Configuración") / "DOTFILES" / "ssh")
+    monkeypatch.setenv("HOME", str(me))
+    monkeypatch.setenv("USERPROFILE", str(me))
+    _refused(dot / "ssh", "claves o credenciales")
+    docs = rd.check_read_dir(str(me / "Documents"))
+    argv = wsmod.docker_argv(tmp_path / "ws", "ls", "nesicode-x", [docs])
+    mounts = [argv[i + 1] for i, a in enumerate(argv) if a == "--mount"]
+    hidden = str(Path(docs, nfd, "dotfiles", "ssh"))
+    assert any(m.startswith("type=tmpfs,") and wsmod.path_key(m.split("destination=", 1)[1].split(",")[0].strip('"'))
+               == wsmod.path_key(hidden) and m.split("destination=", 1)[1].startswith(docs) for m in mounts), mounts
+    # and the folder itself, spelled either way, is never mounted
+    assert "--mount" not in wsmod.docker_argv(tmp_path / "ws", "ls", "n", [str(rd.canonical(dot / "ssh"))])
+
+
 # ---------------------------------------------------------------------------------------------------- the agent
 def test_the_agent_is_told_which_folders_it_may_read_only_when_there_are_some(tmp_path, monkeypatch):
     plain = Workspace(tmp_path / "a")
@@ -500,6 +617,12 @@ def test_the_settings_card_lists_them_and_shows_the_servers_reasons_in_both_lang
     reasons.append("Como mucho 10 carpetas")
     reasons.append(f"Nesicode no tiene permiso para leer esa carpeta (en el Mac: Ajustes del Sistema → Privacidad y "
                    f"seguridad → Archivos y carpetas): {home / 'Downloads'}")
+    (tmp_path / "tmp").mkdir()
+    with pytest.raises(rd.ReadDirError) as e:  # (a place every program shares)
+        with pytest.MonkeyPatch.context() as m:
+            m.setattr(rd, "SHARED_ROOTS", (_c(tmp_path / "tmp"),))
+            rd.check_read_dir(str(tmp_path / "tmp"))
+    reasons.append(str(e.value))
     out = run_ts(tmp_path, f"""
       import {{ ReadDirsCard }} from {json.dumps(str(SRC / 'pages' / 'ProjectSettings.tsx'))}
       import {{ translateError }} from {json.dumps(str(SRC / 'i18n.ts'))}

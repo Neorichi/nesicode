@@ -7,18 +7,19 @@ the /System/Volumes/Data alias), which is also the spelling the sandbox matches:
 folder that holds it, another user's home, Nesicode's own folders (its data, the desktop app's folder, a source
 checkout with its .env) or a folder that holds them, a place with keys or credentials (agent/workspace.py,
 SECRET_PLACES) or a folder inside one, a folder that only holds apps' private data (~/Library, ~/.config…: name a
-folder inside it), or the system. Only in local mode: on a shared server the folders would be the server's.
+folder inside it), the temporary folders every program shares (/tmp…: other programs' files and sockets), or the
+system. Only in local mode: on a shared server the folders would be the server's.
 
 Each run gets the folders again through usable_read_dirs, checked again: one that went away, changed into a link or
-stopped passing is left out of that run."""
+stopped passing is left out of that run. Taking folders off the list never checks the ones kept (check_read_dirs)."""
 
 from __future__ import annotations
 
 import os
 import sys
-from pathlib import Path, PurePath
+from pathlib import Path
 
-from ..agent.workspace import REPO_DIR, SECRET_PLACES, TOOLCHAIN_SECRETS, vault_key_file
+from ..agent.workspace import REPO_DIR, SECRET_PLACES, TOOLCHAIN_SECRETS, path_key, spellings, vault_key_file
 from ..config import app_data_dir, settings
 from .db import loads
 
@@ -32,8 +33,14 @@ APP_DATA_ROOTS = ("Library", "Library/Application Support", "Library/Containers"
 SYSTEM_ROOTS = ("/System", "/dev", "/proc", "/sys") if os.name != "nt" else ()
 ROOT_HOMES = ("/var/root", "/private/var/root", "/root") if os.name != "nt" else ()
 SHARED_HOMES = {"shared", "public"}  # /Users/Shared (macOS), C:\Users\Public (Windows): nobody's home
-# The disk's own name may differ in case (macOS and Windows): compare paths case-folded there.
-_FOLD = sys.platform == "darwin" or os.name == "nt"
+# Places every program shares (temporary files, sockets, the local databases Homebrew/MacPorts run): never one of them,
+# a folder inside one or a folder that holds one. Other programs' files are there (the sandbox keeps them out for that:
+# workspace.SHARED_DIRS), and in docker mode a folder is mounted, and a read-only mount still lets a socket in it be
+# connected to (tmux's, an ssh-agent's, a rootless Docker's: commands run as the user outside the container).
+SHARED_ROOTS = ("/tmp", "/var/tmp", "/run", "/var/run", "/private/tmp", "/private/var/tmp", "/private/var/run",
+                "/private/var/folders", "/var/folders", "/opt/homebrew/var", "/usr/local/var", "/opt/local/var",
+                ) if os.name != "nt" else ()
+REMOVABLE_ROOTS = ("/run/media",)  # (where some Linux desktops mount USB disks: not a shared place)
 
 
 class ReadDirError(ValueError):
@@ -69,9 +76,9 @@ def canonical(p: Path | str) -> Path:
     return _getpath(real) if real.is_dir() else real
 
 
-def _key(p: Path | str) -> tuple[str, ...]:
-    s = os.path.normpath(str(p))
-    return PurePath(s.casefold() if _FOLD else s).parts
+# Paths are compared as the disk compares names: on macOS and Windows blind to case (and on macOS to Unicode
+# normalisation), so a folder spelled two ways is one folder.
+_key = path_key
 
 
 def _inside(child: Path | str, parent: Path | str) -> bool:
@@ -80,12 +87,8 @@ def _inside(child: Path | str, parent: Path | str) -> bool:
     return len(c) >= len(p) and c[: len(p)] == p
 
 
-def _spellings(p: Path) -> list[Path]:
-    """A place as written and where it really is (a link to a dotfiles folder…). Never opened: comparisons fold case
-    already, and several of these places (~/Library/Mail, Messages…) are ones macOS guards."""
-    out = [Path(os.path.abspath(p))]
-    real = Path(os.path.realpath(p))
-    return out if real in out else out + [real]
+# A place as written, where it really is (a link to a dotfiles folder…) and without macOS's data volume alias.
+_spellings = spellings
 
 
 def _nesicode_paths() -> list[Path]:
@@ -141,6 +144,10 @@ def check_read_dir(raw: object) -> str:
         raise ReadDirError(f"Esa carpeta está vetada para el agente (NESICODE_SANDBOX_DENY): {real}")
     if any(_inside(real, s) for s in SYSTEM_ROOTS):
         raise ReadDirError(f"Esa carpeta es del sistema: {real}")
+    if any(_inside(s, real) or (_inside(real, s) and not any(_inside(real, m) for m in REMOVABLE_ROOTS))
+           for s in SHARED_ROOTS):
+        raise ReadDirError(f"Esa carpeta la comparten todos los programas (temporales, sockets); elige una tuya "
+                           f"(p. ej. Descargas): {real}")
     try:  # what the server cannot read, no command of the agent can (the same user, fewer rights). On macOS this is
         # also when the system asks the user to let Nesicode into ~/Downloads, ~/Documents… (privacy settings).
         with os.scandir(real) as entries:
@@ -153,15 +160,19 @@ def check_read_dir(raw: object) -> str:
     return str(real)
 
 
-def check_read_dirs(items: object) -> list[str]:
-    """The list as stored: every folder checked and canonical, each once, at most MAX_READ_DIRS. Local mode only."""
+def check_read_dirs(items: object, kept=()) -> list[str]:
+    """The list as stored: every folder added checked and canonical, each once, at most MAX_READ_DIRS. A folder already
+    on the list (`kept`: the stored one, sent back as it is) stays as it is, unchecked: taking folders off the list must
+    never fail because another one does not pass now (an unplugged disk, a folder macOS no longer lets Nesicode into),
+    and each run checks them all again anyway (usable_read_dirs). Adding is for local mode only."""
     if not isinstance(items, list):
         raise ReadDirError("Lista de carpetas no válida")
-    if items and settings.auth_enabled:
+    kept = [d for d in kept if isinstance(d, str)]
+    if settings.auth_enabled and any(raw not in kept for raw in items):
         raise ReadDirError("Las carpetas que el agente puede leer solo se pueden elegir en modo local (sin login)", 403)
     out: list[str] = []
     for raw in items:
-        d = check_read_dir(raw)
+        d = raw if raw in kept else check_read_dir(raw)
         if not any(_key(d) == _key(x) for x in out):
             out.append(d)
     if len(out) > MAX_READ_DIRS:

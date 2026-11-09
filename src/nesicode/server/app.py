@@ -2037,14 +2037,15 @@ def read_project(project_id: int, user: dict = Depends(current_user)):
 
 @app.patch("/api/projects/{project_id}")
 def patch_project(project_id: int, body: ProjectPatch, user: dict = Depends(current_user)):
-    get_project(user, project_id)
+    project = get_project(user, project_id)
     fields = body.model_dump(exclude_none=True)
     for key in ("executor_model", "improver_model", "vision_model", "image_model", "transcribe_model"):
         if fields.get(key):
             check_model(fields[key], user)
     if "read_dirs" in fields:
-        try:
-            fields["read_dirs"] = json.dumps(check_read_dirs(fields["read_dirs"]), ensure_ascii=False)
+        try:  # (the folders already on the list stay as they are: «Quitar» never fails because another one is gone)
+            fields["read_dirs"] = json.dumps(check_read_dirs(fields["read_dirs"], kept=stored_read_dirs(project)),
+                                             ensure_ascii=False)
         except ReadDirError as exc:
             raise HTTPException(exc.status, str(exc)) from None
     if fields:

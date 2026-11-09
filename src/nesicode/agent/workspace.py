@@ -22,9 +22,10 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import uuid
 import weakref
-from pathlib import Path
+from pathlib import Path, PurePath
 
 from ..config import DOTENV_PATHS, app_data_dir, settings
 from ..harness import Harness
@@ -108,6 +109,8 @@ SHARED_DIRS = ("/Volumes", "/Users", "/private/tmp", "/private/var/tmp", "/priva
 SECRET_PLACES = (
     ".ssh", ".gnupg", ".aws", ".azure", ".docker", ".kube", ".netrc", ".npmrc", ".pypirc", ".git-credentials",
     ".vault-token", ".password-store", ".gem/credentials", ".terraform.d/credentials.tfrc.json", ".nesicode",
+    # the SSH keys of the local VMs that run Docker (they mount the user's home): one gets a shell outside the cage
+    ".colima", ".lima", ".orbstack",
     ".config/gh", ".config/hub", ".config/gcloud", ".config/git/credentials", ".config/op", ".config/google-chrome",
     ".config/chromium", ".mozilla", "Library/Keychains", "Library/Cookies", "Library/Mail", "Library/Messages",
     "Library/Safari", "Library/Application Support/Google/Chrome", "Library/Application Support/Firefox",
@@ -185,7 +188,7 @@ def _sandbox_paths() -> tuple[list[Path], list[Path], list[Path]]:
     # A source checkout of nesicode (its .env holds keys); an installed package's parents[3] is just a lib dir.
     repo = [REPO_DIR] if (REPO_DIR / "pyproject.toml").is_file() else []
     after = [*repo, *(real_home / s for s in TOOLCHAIN_SECRETS)] + [
-        Path(p).resolve() for p in os.environ.get("NESICODE_SANDBOX_DENY", "").split(":") if p
+        q for p in os.environ.get("NESICODE_SANDBOX_DENY", "").split(":") if p for q in spellings(Path(p).resolve())
     ]
     return first, tools, after
 
@@ -195,15 +198,53 @@ def vault_key_file() -> Path:
     return Path(os.environ.get("NESICODE_VAULT_KEY_FILE", "~/.nesicode/vault.key")).expanduser()
 
 
+# macOS: the data volume's own mount. /Users, /private, /Volumes… are firmlinks into it, and the kernel (so the sandbox)
+# names what is there by the short path: a rule spelled /System/Volumes/Data/Users/me/… matches nothing at all.
+DATA_VOLUME = "/System/Volumes/Data"
+
+
+def spellings(p: Path | str) -> list[Path]:
+    """A place as written, where it really is (links followed: a ~/.ssh kept in a dotfiles folder) and, on macOS, each
+    without the data volume's alias (a link that reads /System/Volumes/Data/Users/me/dotfiles/ssh): the sandbox judges
+    the real path as the kernel names it. Never opened: several of these places are ones macOS guards (~/Library/Mail…),
+    and case and Unicode normalisation need no help (Seatbelt matches them as the disk does)."""
+    out: list[Path] = []
+    for q in (os.path.abspath(p), os.path.realpath(p)):
+        alias = sys.platform == "darwin" and q.casefold().startswith(DATA_VOLUME.casefold() + "/")
+        for r in (q, q[len(DATA_VOLUME):]) if alias else (q,):
+            if Path(r) not in out:
+                out.append(Path(r))
+    return out
+
+
+def path_key(p: Path | str) -> tuple[str, ...]:
+    """A path's names as the disk compares them: on macOS and Windows blind to case (and on macOS to Unicode
+    normalisation), as their disks usually are, so a place spelled two ways is still one place."""
+    s = os.path.normpath(str(p))
+    if sys.platform == "darwin":
+        s = unicodedata.normalize("NFC", s)
+    if sys.platform == "darwin" or os.name == "nt":
+        s = s.casefold()
+    return PurePath(s).parts
+
+
+def below(child: Path | str, parent: Path | str) -> tuple[str, ...] | None:
+    """The names that lead from `parent` down to `child` (as `child` spells them; () for parent itself), compared as
+    the disk compares names (path_key); None when `child` is not there."""
+    c, p = path_key(child), path_key(parent)
+    if len(c) < len(p) or c[: len(p)] != p:
+        return None
+    return PurePath(os.path.normpath(str(child))).parts[len(p):]
+
+
 def secret_paths() -> list[Path]:
     """What no caged command may read, not even inside a folder the user lets the agent read: SECRET_PLACES under the
     home and Nesicode's own (its data dir, the desktop app's folder, the vault key, the .env files settings come from).
-    Each is listed where it is spelled and where it really is (a ~/.ssh linked into a dotfiles folder): the sandbox
-    judges the real path."""
+    Each is listed where it is spelled and where it really is (spellings): the sandbox judges the real path."""
     home = Path(os.path.expanduser("~")).resolve()
     out: list[Path] = []
     for p in [*(home / s for s in SECRET_PLACES), settings.data_dir, app_data_dir(), vault_key_file(), *DOTENV_PATHS]:
-        for q in (Path(os.path.abspath(p)), Path(os.path.realpath(p))):
+        for q in spellings(p):
             if q not in out:
                 out.append(q)
     return out
@@ -1331,29 +1372,41 @@ def _docker_read_mounts(read_dirs) -> list[str]:
     if not read_dirs:
         return []
     _, _, after = _sandbox_paths()
-    hidden = list(dict.fromkeys(str(h) for h in [*secret_paths(), *after]))
+    hidden = list(dict.fromkeys(str(q) for h in [*secret_paths(), *after] for q in spellings(h)))
     out: list[str] = []
     for d in read_dirs:
-        if any(_within(d, s) for s in hidden):  # (the server never lets one be named; never mounted either)
+        # Places are compared as the disk compares names (below: a ~/.ssh link that reads …/DotFiles/ssh still leads
+        # into …/dotfiles), and a mask goes where the folder is mounted, at its own spelling plus the names below it:
+        # spelled otherwise it would land beside the mount, outside it, and hide nothing.
+        if any(below(d, s) is not None for s in hidden):  # (the server never lets one be named; never mounted either)
             print(f"nesicode: {d} is not mounted for the agent (it is a place it may never read)")
             continue
-        masks, ok = [], True
+        masks: list[str] = []
+        seen: set[tuple[str, ...]] = set()
+        ok = True
         for s in hidden:
-            if not _within(s, d):
+            rest = below(s, d)
+            if rest is None:
                 continue
+            target = str(Path(d, *rest))
+            if path_key(target) in seen:
+                continue  # (the same place spelled two ways)
             try:
                 st = os.lstat(s)
             except OSError:
                 continue  # not there: nothing to hide
             if stat.S_ISDIR(st.st_mode):
-                masks += ["--mount", _mount(type="tmpfs", destination=container_path(s), **{"tmpfs-size": "65536"})]
+                masks += ["--mount", _mount(type="tmpfs", destination=container_path(target), **{"tmpfs-size": "65536"})]
             elif stat.S_ISREG(st.st_mode):
                 empty = _empty_file()
                 if empty is None:
                     ok = False
                     break
-                masks += ["--mount", _mount(type="bind", source=str(empty), destination=container_path(s), readonly=None)]
-            # (a link: it leads where the container has nothing of the host, or into a folder hidden here by its real path)
+                masks += ["--mount", _mount(type="bind", source=str(empty), destination=container_path(target), readonly=None)]
+            else:
+                continue  # (a link: it leads where the container has nothing of the host, or into a folder hidden here
+                # by its real path)
+            seen.add(path_key(target))
         if ok:
             out += ["--mount", _mount(type="bind", source=d, destination=container_path(d), readonly=None), *masks]
         else:

@@ -100,6 +100,7 @@ const ERROR_PATTERNS: [RegExp, (...m: string[]) => string][] = [
   [/^Esa carpeta está vetada para el agente \(NESICODE_SANDBOX_DENY\): (.*)$/s, (p) => `That folder is off limits to the agent (NESICODE_SANDBOX_DENY): ${p}`],
   [/^Esa carpeta solo guarda datos privados de tus apps; elige una carpeta dentro de ella: (.*)$/s, (p) => `That folder only holds your apps' private data; choose a folder inside it: ${p}`],
   [/^Esa carpeta es del sistema: (.*)$/s, (p) => `That is a system folder: ${p}`],
+  [/^Esa carpeta la comparten todos los programas \(temporales, sockets\); elige una tuya \(p\. ej\. Descargas\): (.*)$/s, (p) => `Every program shares that folder (temporary files, sockets); choose one of yours (e.g. Downloads): ${p}`],
   [/^Como mucho (\d+) carpetas$/, (n) => `At most ${n} folders`],
   [/^Nesicode no tiene permiso para leer esa carpeta \(en el Mac: Ajustes del Sistema → Privacidad y seguridad → Archivos y carpetas\): (.*)$/s, (p) => `Nesicode is not allowed to read that folder (on a Mac: System Settings → Privacy & Security → Files and Folders): ${p}`],
 ]
