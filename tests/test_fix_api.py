@@ -670,6 +670,29 @@ def test_deleting_a_project_waits_for_replies_that_ignore_stop(stuck_step, monke
     assert a.delete(f"/api/projects/{pa['id']}").status_code == 200
 
 
+def test_deleting_a_conversation_or_a_project_removes_read_only_files_too():
+    """git marks its objects read-only (Windows refuses to delete such a file, and rmtree's ignore_errors left the
+    clone behind), and Go's module cache is a read-only tree (POSIX: nothing in a read-only folder can be deleted)."""
+    from nesicode.server.jobs import project_root, thread_dir
+
+    a = _user("ro")
+    pa = _project(a)
+    t, cage = _thread(a, pa)
+    for root in (cage, Path(pa["workspace"])):
+        objects = root / ".git" / "objects" / "ab"
+        objects.mkdir(parents=True, exist_ok=True)
+        (objects / "cdef01").write_bytes(b"blob")
+        os.chmod(objects / "cdef01", 0o444)
+        os.chmod(objects, 0o555)
+    p = db.one("SELECT * FROM projects WHERE id=?", (pa["id"],))
+    tdir, proot = thread_dir(p, t["id"]), project_root(p)
+    assert cage.is_relative_to(tdir) and Path(pa["workspace"]).is_relative_to(proot)
+    assert a.delete(f"/api/threads/{t['id']}").json()["ok"]
+    assert not tdir.exists()
+    assert a.delete(f"/api/projects/{pa['id']}").json()["ok"]
+    assert not proot.exists()
+
+
 def test_project_delete_revokes_bot_webhooks_and_new_bots_never_inherit_one():
     a = _user("hook")
     p1 = _project(a)
