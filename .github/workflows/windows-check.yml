@@ -5,7 +5,7 @@ name: windows-check
 on:
   workflow_dispatch:
   push:
-    branches: [windows-ci]
+    branches: ['windows-*']
 
 jobs:
   tests:
