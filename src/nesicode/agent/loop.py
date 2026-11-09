@@ -19,7 +19,7 @@ from . import context as ctxm
 from .tools import (BASIC_TOOLS, GENERATE_IMAGE, SCHEMAS, SEARCH_HISTORY, SHARE_FILE, SHOW_IMAGE, VIEW_IMAGE, delegate_tool,
                     read_file_spec, skill_tool)
 from .vision import describe_image, generate_image, image_mime
-from .workspace import HARNESS_DIR, Cancelled, ToolError, Workspace
+from .workspace import HARNESS_DIR, Cancelled, ToolError, Workspace, sandbox_mode
 
 Emit = Callable[[dict], None]
 
@@ -39,6 +39,13 @@ CONTINUE_NOTE = (
 EMPTY_CUT_NOTE = (
     "[harness] Your previous reply hit the output limit ({cap:,} tokens) before any visible answer (the reasoning used it "
     "up). Keep the reasoning short now and write the answer, or make the next tool call."
+)
+# The OS sandbox keeps the user's other folders and apps out of reach: say so up front, so a needed file is asked
+# for instead of hunted (seen live: an agent relaunching Finder «cold» to read ~/Downloads).
+OUT_OF_REACH = (
+    "You only see this workspace: the user's other folders (Downloads, Documents, Desktop…) and other apps (Finder, "
+    "browsers…) are out of your reach, and no command will get you there. When you need a file from there, ask the "
+    "user to attach it to the chat (up to 25 MB) or to put it in the project folder, then wait for it."
 )
 READ_STREAK = 20  # tool calls in a row without writing anything before the reminder (once per streak; again after a
 # masking or a compaction while the streak goes on, at least READ_STREAK // 2 calls after the previous one)
@@ -110,6 +117,8 @@ def build_system(h: Harness, ws: Workspace, *, base: str | None = None, extra_to
         "facts you will need later (exact values, findings, decisions) in your visible replies, the deliverable or a "
         "notes file as soon as you have them.",
     ]
+    if sandbox_mode() in ("macos", "docker"):
+        env.append(OUT_OF_REACH)
     if scripts:
         env.append(
             f"Harness scripts are installed under `{HARNESS_DIR}/` (e.g. `bash {HARNESS_DIR}/{scripts[0]}` or "

@@ -143,6 +143,10 @@ def shell_argv(command: str) -> list[str]:
     return ["bash", "-lc", RESTORE_PATH + command]
 
 
+OUTSIDE_HINT = ("Files from elsewhere (the user's Downloads, Documents…) only reach you when the user attaches them "
+                "to the chat or puts them in the project folder: ask for the file instead of looking for a way in.")
+
+
 def sandbox_mode() -> str:
     """docker | macos | none. `auto`/`local` pick the OS sandbox when one is available."""
     mode = settings.sandbox
@@ -955,7 +959,7 @@ class Workspace:
         rel = (rel or ".").strip()
         p = (self.root / rel).resolve()
         if p != self.root and self.root not in p.parents:
-            raise ToolError(f"path {rel!r} is outside the workspace")
+            raise ToolError(f"path {rel!r} is outside the workspace. {OUTSIDE_HINT}")
         return p
 
     def rel(self, p: Path) -> str:
