@@ -331,7 +331,9 @@ class _OfflineCompat(OpenAICompatProvider):
         return {"choices": [{"message": msg, "finish_reason": finish}], "usage": {"prompt_tokens": inp, "completion_tokens": out}}, False
 
 
-@pytest.mark.parametrize("window,most", [(16_384, 7), (32_768, 2)])
+# (16k: 8 since the always-on safety lines of the system prompt — what the sandbox keeps out, never get past a site's
+# bot protection — added ~90 tokens; 7 before them, 9 before P1/P11. The gaps of >= 4 calls are what matters.)
+@pytest.mark.parametrize("window,most", [(16_384, 8), (32_768, 2)])
 def test_small_windows_with_a_reasoning_model_compact_rarely(tmp_path, monkeypatch, window, most):
     """P11's scenario and bounds (test_p2_context::test_small_windows_compact_rarely_and_rebuild_to_about_a_third) with
     2,500 chars of reasoning in every reply, replayed (P1): before, 9 compactions at 16k and 6 at 32k."""

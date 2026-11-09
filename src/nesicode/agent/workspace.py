@@ -203,8 +203,12 @@ def macos_profile(cage: Path, home: Path, deny_ports=()) -> str:
         "(deny signal)",
         "(allow signal (target same-sandbox))",
         "(deny network-outbound (remote unix-socket))",
-        f"(allow network-outbound (remote unix-socket (subpath {_q(cage)}) (subpath {_q(home)}) "
-        '(literal "/private/var/run/mDNSResponder") (literal "/private/var/run/syslog")))',
+        f"(allow network-outbound (remote unix-socket (subpath {_q(cage)}) (subpath {_q(home)})))",
+        # Name resolution (getaddrinfo: curl, pip, npm, git…) talks to mDNSResponder's socket and `logger` to
+        # syslog's. Their own rules, with path-literal: as `literal` filters in the rule above they never matched,
+        # and no caged command could resolve a host name (0.4.0–0.4.2).
+        '(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))',
+        '(allow network-outbound (remote unix-socket (path-literal "/private/var/run/syslog")))',
         '(deny mach-lookup (global-name "com.apple.pasteboard.1"))',
         "(deny lsopen)",
         "(deny appleevent-send)",

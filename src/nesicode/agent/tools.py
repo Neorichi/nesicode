@@ -525,24 +525,30 @@ def bash(ws: Workspace, args: dict) -> str:
         command = PIPE_TRAP + command  # same line: bash's "line N" in error messages stays the agent's line N
     code, out = ws.run(command, _int(args, "timeout", 120))
     out = out if len(out) <= 30_000 else out[:15_000] + "\n... (output truncated) ...\n" + out[-15_000:]
-    if code != 0 and _refused_by_sandbox(command, out):
+    if _refused_by_sandbox(command, out):  # (whatever the exit code: `ls ~/Downloads | head; echo` ends 0)
         out += "\n[sandbox] That is out of your reach: you only see this workspace, not the user's other folders or " \
                "apps, and no other command will get you there. " + OUTSIDE_HINT
     return f"exit code: {code}\n{out}"
 
 
 _HOME_REF = re.compile(r"(~|\$HOME\b|\$\{HOME\}|/Users/|/home/|\b(?:Downloads|Documents|Desktop|Escritorio|Descargas|Documentos)\b)")
+# The user's own folders, named outright (the cage's private HOME has none of them, so "not found" there means this)
+_USER_DIRS = re.compile(r"(/Users/|/home/|\b(?:Downloads|Documents|Desktop|Escritorio|Descargas|Documentos)\b)")
 _APP_LAUNCH = re.compile(r"(?:^|[;&|(\s])(?:open|osascript)\s")
+_APP_REFUSED = re.compile(r"lsopen|launchservices|not permitted|not authori[sz]ed|execution error|-54\b|-600\b|-1743\b", re.I)
 
 
 def _refused_by_sandbox(command: str, out: str) -> bool:
-    """A failed command that tried to reach the user's folders or launch an app while the OS sandbox is on."""
+    """A command that tried to reach the user's folders or launch an app while the OS sandbox is on — judged by what
+    it printed, not its exit code (a pipe or a trailing `; echo` hides the failure)."""
     if sandbox_mode() not in ("macos", "docker"):
         return False
     low = out.lower()
-    # (the cage's HOME is a private folder of its own: ~/Downloads there simply does not exist)
-    denied = "operation not permitted" in low or "no such file or directory" in low
-    return bool(_APP_LAUNCH.search(command)) or (denied and bool(_HOME_REF.search(command)))
+    if "operation not permitted" in low and _HOME_REF.search(command):
+        return True
+    if "no such file or directory" in low and _USER_DIRS.search(command):
+        return True
+    return bool(_APP_LAUNCH.search(command)) and bool(_APP_REFUSED.search(out))
 
 
 SCHEMAS = {

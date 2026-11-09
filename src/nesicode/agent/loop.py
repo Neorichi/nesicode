@@ -43,9 +43,14 @@ EMPTY_CUT_NOTE = (
 # The OS sandbox keeps the user's other folders and apps out of reach: say so up front, so a needed file is asked
 # for instead of hunted (seen live: an agent relaunching Finder «cold» to read ~/Downloads).
 OUT_OF_REACH = (
-    "You only see this workspace: the user's other folders (Downloads, Documents, Desktop…) and other apps (Finder, "
-    "browsers…) are out of your reach, and no command will get you there. When you need a file from there, ask the "
-    "user to attach it to the chat (up to 25 MB) or to put it in the project folder, then wait for it."
+    "You only see this workspace: the user's other folders (Downloads, Documents…) and apps are out of reach. If you "
+    "need a file from there, ask the user to attach it to the chat or put it in the project, and wait."
+)
+# Seen live: to get a file the user had downloaded in their browser, an agent replayed the site's anti-bot download-token
+# flow with curl posing as Chrome. The user stopped it; ask instead.
+NO_BOT_EVASION = (
+    "Never get past a site's bot protection (CAPTCHAs, challenge pages, anti-bot or download tokens) or pose as a "
+    "browser to do it unless the user asked you to test it: if a download needs a real browser, ask for the file."
 )
 READ_STREAK = 20  # tool calls in a row without writing anything before the reminder (once per streak; again after a
 # masking or a compaction while the streak goes on, at least READ_STREAK // 2 calls after the previous one)
@@ -119,6 +124,7 @@ def build_system(h: Harness, ws: Workspace, *, base: str | None = None, extra_to
     ]
     if sandbox_mode() in ("macos", "docker"):
         env.append(OUT_OF_REACH)
+    env.append(NO_BOT_EVASION)
     if scripts:
         env.append(
             f"Harness scripts are installed under `{HARNESS_DIR}/` (e.g. `bash {HARNESS_DIR}/{scripts[0]}` or "
