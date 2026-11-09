@@ -1296,9 +1296,11 @@ def test_toolchains_still_start_with_that_environment(tool):
     """What local MCP servers are launched with (npx …, uvx …) still finds and runs its toolchain."""
     from nesicode.connectors import server_env
 
-    if not shutil.which(tool):
+    if not (exe := shutil.which(tool)):
         pytest.skip(f"{tool} is not installed")
-    r = subprocess.run([tool, "--version"], env=server_env({"npm_config_update_notifier": "false"}),
+    # started the way the MCP stdio client starts it: the command found on the PATH first (on Windows `npx` is npx.cmd,
+    # which CreateProcess never finds by its bare name; a .cmd runs in cmd.exe, which needs ComSpec, PATHEXT, SystemRoot)
+    r = subprocess.run([exe, "--version"], env=server_env({"npm_config_update_notifier": "false"}),
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 0 and (r.stdout or r.stderr).strip(), r
 
@@ -1309,13 +1311,17 @@ def _env_names(m, cfg) -> set[str]:
 
 
 SECRETS = {"OPENAI_API_KEY": "sk-FAKE", "NESICODE_DESKTOP_TOKEN": "FAKE-desktop", "SOME_SECRET": "s", "GH_TOKEN": "g"}
+# What a server needs to find its toolchain and its home: Windows has no HOME (USERPROFILE is the home there), and a
+# .cmd launcher (npx.cmd) needs cmd.exe to run at all
+NEEDED = ({"PATH", "USERPROFILE", "SYSTEMROOT", "COMSPEC", "PATHEXT", "APPDATA", "LOCALAPPDATA", "TEMP"} if os.name == "nt"
+          else {"PATH", "HOME"})
 
 
 def test_a_python_mcp_server_starts_without_the_servers_secrets(mcp_script, mgr, monkeypatch):
     for k, v in SECRETS.items():
         monkeypatch.setenv(k, v)
     names = _env_names(mgr, _stdio("py", mcp_script, CONNECTOR_TOKEN="suyo"))
-    assert not set(SECRETS) & names and {"PATH", "HOME", "CONNECTOR_TOKEN"} <= names
+    assert not set(SECRETS) & names and NEEDED | {"CONNECTOR_TOKEN"} <= names
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node is not installed")
@@ -1328,7 +1334,7 @@ def test_a_node_mcp_server_found_on_path_starts_without_the_servers_secrets(tmp_
     script.write_text(NODE_SERVER)
     cfg = ConnectorConfig(name="nodo", kind="stdio", command="node", args=[str(script)], env={"CONNECTOR_TOKEN": "suyo"})
     names = _env_names(mgr, cfg)  # `node` itself is found through the PATH it inherits
-    assert not set(SECRETS) & names and {"PATH", "HOME", "CONNECTOR_TOKEN"} <= names
+    assert not set(SECRETS) & names and NEEDED | {"CONNECTOR_TOKEN"} <= names
 
 
 # ====================================================================== Q4 — a hung MCP server

@@ -594,17 +594,22 @@ def test_stream_ends_when_its_run_is_deleted_and_never_shows_a_reused_id():
 
 @pytest.fixture()
 def stuck_step(monkeypatch):
-    """A model step that ignores Stop for a while (like an MCP call or a connector starting)."""
+    """A model step that ignores Stop for a while (like an MCP call or a connector starting). Returns an event set once
+    a reply is inside it: 'running' comes earlier (the run is claimed, then set up), and a Stop that lands before the
+    step ends the reply right away (on a slow machine — Windows — a delete sent at 'running' always did)."""
     from nesicode.llm import mock
 
     orig = mock.MockConversation.step
+    inside = threading.Event()
 
     def step(self, on_event=None):
         if "ignore-stop" in (self.task or "") and self.steps == 0:
+            inside.set()
             time.sleep(1.5)
         return orig(self, on_event)
 
     monkeypatch.setattr(mock.MockConversation, "step", step)
+    return inside
 
 
 def test_deleting_a_conversation_mid_reply_never_touches_the_next_run(stuck_step, monkeypatch):
@@ -613,7 +618,7 @@ def test_deleting_a_conversation_mid_reply_never_touches_the_next_run(stuck_step
     pa = _project(a)
     t1, _ = _thread(a, pa)
     r1 = a.post(f"/api/threads/{t1['id']}/messages", json={"text": "ignore-stop: long step"}).json()
-    _wait(lambda: _status(r1["id"]) == "running")
+    assert stuck_step.wait(10) and _status(r1["id"]) == "running"
     assert a.delete(f"/api/threads/{t1['id']}").json()["ok"]
     row = db.one("SELECT thread_id FROM runs WHERE id=?", (r1["id"],))
     assert row and row["thread_id"] is None  # kept, detached, while its worker is still busy: the id stays taken
@@ -659,7 +664,7 @@ def test_deleting_a_project_waits_for_replies_that_ignore_stop(stuck_step, monke
     pa = _project(a)
     t, _ = _thread(a, pa)
     r = a.post(f"/api/threads/{t['id']}/messages", json={"text": "ignore-stop please"}).json()
-    _wait(lambda: _status(r["id"]) == "running")
+    assert stuck_step.wait(10) and _status(r["id"]) == "running"
     assert a.delete(f"/api/projects/{pa['id']}").status_code == 409  # its id must not be reused under a live worker
     _wait(lambda: _status(r["id"]) in FINAL)
     assert a.delete(f"/api/projects/{pa['id']}").status_code == 200
