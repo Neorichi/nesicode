@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import threading
 import time
 from dataclasses import dataclass, field
@@ -19,7 +20,7 @@ from . import context as ctxm
 from .tools import (BASIC_TOOLS, GENERATE_IMAGE, SCHEMAS, SEARCH_HISTORY, SHARE_FILE, SHOW_IMAGE, VIEW_IMAGE, delegate_tool,
                     read_file_spec, skill_tool)
 from .vision import describe_image, generate_image, image_mime
-from .workspace import HARNESS_DIR, Cancelled, ToolError, Workspace, sandbox_mode
+from .workspace import HARNESS_DIR, Cancelled, ToolError, Workspace, sandbox_mode, seen_paths
 
 Emit = Callable[[dict], None]
 
@@ -45,6 +46,16 @@ EMPTY_CUT_NOTE = (
 OUT_OF_REACH = (
     "You only see this workspace: the user's other folders (Downloads, Documents…) and apps are out of reach. If you "
     "need a file from there, ask the user to attach it to the chat or put it in the project, and wait."
+)
+# Folders the user lets the agent read (a project setting): which, and how (only bash reaches them). Only when set.
+READ_DIRS_NOTE = (
+    "You may also READ (never change) these folders of the user: {dirs}. Your file tools work only inside the workspace: "
+    "copy what you need from them with bash (e.g. `cp {example} .`) and work on the copy. `~` is your own private home, "
+    "not the user's: use those absolute paths."
+)
+OUT_OF_REACH_BESIDES = (
+    "Apart from those folders you only see this workspace: the user's other folders and apps are out of reach. If you "
+    "need a file from elsewhere, ask the user to attach it to the chat or put it in the project, and wait."
 )
 # Seen live: to get a file the user had downloaded in their browser, an agent replayed the site's anti-bot download-token
 # flow with curl posing as Chrome. The user stopped it; ask instead.
@@ -122,8 +133,14 @@ def build_system(h: Harness, ws: Workspace, *, base: str | None = None, extra_to
         "facts you will need later (exact values, findings, decisions) in your visible replies, the deliverable or a "
         "notes file as soon as you have them.",
     ]
-    if sandbox_mode() in ("macos", "docker"):
-        env.append(OUT_OF_REACH)
+    mode = sandbox_mode()
+    dirs = seen_paths(getattr(ws, "read_dirs", ()), mode)
+    if dirs:  # (with no OS sandbox nothing enforces it: still what the user allows, so still true)
+        sep = "\\" if "\\" in dirs[0] and "/" not in dirs[0] else "/"
+        env.append(READ_DIRS_NOTE.format(dirs=", ".join(f"`{d}`" for d in dirs),
+                                         example=shlex.quote(dirs[0].rstrip(sep) + sep + "<file>")))
+    if mode in ("macos", "docker"):
+        env.append(OUT_OF_REACH_BESIDES if dirs else OUT_OF_REACH)
     env.append(NO_BOT_EVASION)
     if scripts:
         env.append(

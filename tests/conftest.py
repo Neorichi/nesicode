@@ -26,6 +26,10 @@ import pytest  # noqa: E402
 @pytest.fixture(autouse=True, scope="session")
 def _stop_jobs_at_exit():
     yield
+    from nesicode.harnessing.engine import remove_tree
     from nesicode.server.app import jobs  # runs left waiting on an approval must not keep the interpreter alive
 
     jobs.shutdown()
+    # The data dir made above for this run goes too (best effort: a run still stopping may hold a file): each run left
+    # one behind in the temp dir, and hundreds of them helped fill a developer's disk.
+    remove_tree(os.environ["NESICODE_DATA_DIR"])

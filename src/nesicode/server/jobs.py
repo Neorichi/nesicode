@@ -27,6 +27,7 @@ from ..harnessing import HarnessingConfig, HarnessingRun, apply_rollout
 from ..harnessing.engine import remove_tree
 from .auth import user_keys
 from .db import DB, loads
+from .read_dirs import usable_read_dirs
 
 FINAL = {"done", "error", "cancelled", "interrupted", "max_steps", "refusal"}
 
@@ -1287,7 +1288,8 @@ class Jobs:
         keys = user_keys(db, project["user_id"])
         vision = project.get("vision_model") or settings.vision_model
         image = project.get("image_model") or settings.image_model
-        ws = Workspace(thread_ws(project, thread))
+        # the folders of the user's this project lets the agent read (chat and bot runs; never harnessing rollouts)
+        ws = Workspace(thread_ws(project, thread), read_dirs=usable_read_dirs(project))
         bot = db.one("SELECT * FROM bots WHERE id=?", (run["bot_id"],)) if run.get("bot_id") else None
         from .limits import learn_limit, model_limits
 
