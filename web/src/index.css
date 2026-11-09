@@ -247,8 +247,8 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin-bottom: 14px; }
 .card.danger { border-color: var(--err-soft); }
 .form { display: flex; flex-direction: column; gap: 16px; }
-.check { display: flex !important; flex-direction: row !important; align-items: center; gap: 8px; font-size: 14px; white-space: nowrap; }
-.check input { width: auto; }
+.check { display: flex !important; flex-direction: row !important; align-items: flex-start; gap: 8px; font-size: 14px; }
+.check input { width: auto; flex: none; } /* (a long label wraps beside its box instead of running off the page) */
 .empty { color: var(--ink-3); padding: 40px; text-align: center; border: 1px dashed var(--line-2); border-radius: 12px; }
 .banner { display: flex; justify-content: space-between; align-items: center; gap: 12px; background: var(--accent-soft); padding: 10px 14px; border-radius: 10px; margin-bottom: 12px; flex-wrap: wrap; }
 
@@ -550,8 +550,9 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 
 /* bots */
 .hint-box { background: var(--accent-soft); color: var(--ink-2); border-radius: 8px; padding: 9px 12px; font-size: 13.5px; margin: 8px 0 14px; }
-.bot-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
-.bot-card { display: flex; flex-direction: column; gap: 8px; margin: 0; }
+/* (a card wide enough for its three actions in Spanish; on a phone, one card per row; long names and URLs break) */
+.bot-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(380px, 100%), 1fr)); gap: 14px; }
+.bot-card { display: flex; flex-direction: column; gap: 8px; margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .bot-card.off { opacity: .7; }
 .bot-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .bot-name { font-weight: 600; font-size: 15.5px; color: var(--ink); text-decoration: none; }

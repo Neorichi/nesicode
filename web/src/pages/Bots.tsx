@@ -145,7 +145,7 @@ export default function BotsPage() {
               {b.enabled ? <span>{t('Próxima')}: <b>{when(b.next_at)}</b></span> : <span className="warn">⏸ {b.paused_reason || t('En pausa')}</span>}
               {b.last_run && <span>{t('Última')}: <StatusDot s={b.last_run.status} /> {when(b.last_run_at)}</span>}
             </div>
-            <div className="row">
+            <div className="row wrap">
               <button className="btn small" onClick={() => runNow(b)}>▶ {t('Ejecutar ahora')}</button>
               {b.thread_id && <Link className="btn small" to={`/p/${b.project_id}/c/${b.thread_id}`}>💬 {t('Hablar')}</Link>}
               <Link className="btn small ghost" to={`/bots/${b.id}`}>{t('Tareas y ajustes')}</Link>
