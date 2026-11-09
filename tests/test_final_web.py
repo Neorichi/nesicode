@@ -61,7 +61,7 @@ def run_ts(tmp_path: Path, body: str, head: str = ""):
         f"b.onResolve({{filter: /[\\\\/]Markdown$/}}, () => ({{path: {json.dumps(str(stub))}}})) }}}}]}})"
         ".catch((e) => { console.error(e); process.exit(1) })\n", encoding="utf-8")
     for args in ([NODE, str(build)], [NODE, str(bundle)]):
-        p = subprocess.run(args, capture_output=True, text=True, timeout=90, cwd=tmp_path)
+        p = subprocess.run(args, capture_output=True, encoding="utf-8", timeout=90, cwd=tmp_path)  # (node prints UTF-8)
         assert p.returncode == 0, p.stderr[-4000:]
     return json.loads(p.stdout.strip().splitlines()[-1])
 
@@ -149,6 +149,16 @@ def test_the_retry_is_offered_whenever_the_server_keeps_the_copies(tmp_path):
     from nesicode.harnessing import apply_rollout
     from nesicode.server.jobs import _fully_applied
 
+    def lock(folder: Path, locked: bool) -> None:
+        """Make `folder` one nothing can be written into (or undo it). Windows ignores a folder's read-only flag for
+        what is created inside it, so there an ACL entry denies adding files and folders to it, for everyone."""
+        if os.name == "nt":
+            change = ["/deny", "*S-1-1-0:(WD,AD)"] if locked else ["/remove:d", "*S-1-1-0"]
+            r = subprocess.run(["icacls", str(folder), *change], capture_output=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+        else:
+            folder.chmod(stat.S_IRUSR | stat.S_IXUSR if locked else 0o755)
+
     def case(name: str, files: dict, setup=None) -> tuple[dict, bool]:
         base = tmp_path / name
         before, after, target = (base / n for n in ("source", "rollouts/sel/ws", "target"))
@@ -165,7 +175,7 @@ def test_the_retry_is_offered_whenever_the_server_keeps_the_copies(tmp_path):
             result = apply_rollout(before, after, target)
         finally:
             if (target / "ro").is_dir():
-                (target / "ro").chmod(0o755)  # (so tmp_path can be removed)
+                lock(target / "ro", False)  # (so tmp_path can be removed)
         return result, not _fully_applied(base, "sel", result)
 
     def missing(base, target):
@@ -173,7 +183,7 @@ def test_the_retry_is_offered_whenever_the_server_keeps_the_copies(tmp_path):
 
     def read_only(base, target):
         (target / "ro").mkdir()
-        (target / "ro").chmod(stat.S_IRUSR | stat.S_IXUSR)
+        lock(target / "ro", True)
 
     def link_out(base, target):
         (base / "outside").mkdir()
@@ -391,7 +401,7 @@ def test_links_in_a_conversations_folder_are_marked_and_one_that_cannot_open_say
     a = _user("links")
     p = _project(a)
     ws = Path(p["workspace"])
-    (ws / "notas.txt").write_text("notas\n")
+    (ws / "notas.txt").write_bytes(b"notas\n")  # (LF on every OS: the tab shows the file as it is)
     os.symlink("notas.txt", ws / "a_dentro")
     os.symlink("../compartido/comun.md", ws / "b_fuera")
     os.symlink(shared / "comun.md", ws / "c_absoluto")

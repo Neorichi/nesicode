@@ -175,8 +175,8 @@ def test_search_history_line_numbers_are_read_file_offsets(tmp_path):
     out = ws.root / ARCHIVE / "outputs"
     out.mkdir(parents=True)
     progress = "".join(f"\rDownloading {p}%" for p in range(0, 101, 10))  # curl/pip progress bars: bare \r
-    (out / "1-bash-pip-c1.txt").write_text(f"exit code: 0\n{progress}\nSTAGING_API_KEY=sk-live-AAAABBBBCCCC1234\n"
-                                           "salto\x0cde página y separador\nOTRO_VALOR=42\n")
+    (out / "1-bash-pip-c1.txt").write_bytes(f"exit code: 0\n{progress}\nSTAGING_API_KEY=sk-live-AAAABBBBCCCC1234\n"
+                                            "salto\x0cde página y separador\nOTRO_VALOR=42\n".encode("utf-8"))
     for query in ("STAGING_API_KEY", "OTRO_VALOR", "valor otro"):  # (the last one has no exact match: ranked)
         hit = ctxm.search_history(ws, {"query": query}, ARCHIVE)
         rel, n = re.search(r"^(\S+?):(\d+):", hit, re.M).groups()
