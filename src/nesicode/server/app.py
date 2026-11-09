@@ -2528,7 +2528,7 @@ def harness_restore(project_id: int, version: int, user: dict = Depends(current_
 
 # ---------------------------------------------------------------------- chat
 THREAD_COLS = "t.id, t.project_id, t.title, t.isolated, t.exec_mode, t.allowed_tools, t.created_at, t.updated_at"
-MAX_ATTACHMENT = 25 * 1024 * 1024
+MAX_ATTACHMENT = 50 * 1024 * 1024  # per file dropped into the chat (an APK, a dataset…); the project upload takes 200 MB
 
 
 class ThreadCreate(BaseModel):
@@ -3011,7 +3011,7 @@ async def upload_attachments(thread_id: int, files: list[UploadFile] = File(...)
     for up in files[:20]:
         data = await up.read(MAX_ATTACHMENT + 1)
         if len(data) > MAX_ATTACHMENT:
-            raise HTTPException(413, f"{up.filename}: máximo 25 MB por archivo")
+            raise HTTPException(413, f"{up.filename}: máximo {MAX_ATTACHMENT // (1024 * 1024)} MB por archivo")
         blobs.append((up.filename, data))
     return await asyncio.to_thread(_store_attachments, root, blobs)
 

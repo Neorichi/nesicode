@@ -77,7 +77,7 @@ const ERROR_PATTERNS: [RegExp, (...m: string[]) => string][] = [
   [/^No se pudieron obtener los modelos: (.*)$/s, (e) => `Couldn't fetch the models: ${translateError(e)}`],
   [/^git clone falló: (.*)$/s, (e) => `git clone failed: ${e}`],
   [/^Ruta peligrosa en el ZIP: (.+)$/s, (p) => `Unsafe path in the ZIP: ${p}`],
-  [/^(.+): máximo 25 MB por archivo$/s, (f) => `${f}: 25 MB max per file`],
+  [/^(.+): máximo (\d+) MB por archivo$/s, (f, n) => `${f}: ${n} MB max per file`],
   [/^Adjunto no válido: (.+)$/s, (p) => `Invalid attachment: ${p}`],
   [/^El adjunto ya no existe: (.+)$/s, (p) => `The attachment no longer exists: ${p}`],
   [/^límite diario alcanzado \((\d+)\)$/, (n) => `daily limit reached (${n})`],
