@@ -2,7 +2,7 @@ import { Component, useState, type ReactNode } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { api, money, statusLabel, type RunEvent } from '../api'
 import { t, translateError, useLang } from '../i18n'
-import { compactionErrorText, compactReason, interruptedSaved, retryGroups, retryText, unknownEventNote } from '../logic'
+import { compactionErrorText, compactReason, interruptedSaved, retryGroups, retryText, splitExit, unknownEventNote } from '../logic'
 import Markdown from './Markdown'
 import { downloadFile, showImage } from './ImageViewer'
 
@@ -64,12 +64,16 @@ function ToolBlock({ call, result }: { call: RunEvent; result?: RunEvent }) {
   const err = result?.is_error
   const name = String(call.name ?? '')
   const args = call.args ?? {}
+  // (a terminal result's "exit code: 0" is for the model; the user sees the code only when the command failed)
+  const out = result ? splitExit(name, result.output) : null
+  const failed = out?.code != null && out.code !== 0
   return (
     <div className={`tool ${err ? 'tool-err' : ''}`}>
       <button className="tool-head" onClick={() => setOpen((v) => !v)}>
         <span className={`tool-dot ${pending ? 'pending' : err ? 'err' : 'ok'}`} />
         <span className="tool-name">{TOOL_LABEL()[name] ?? mcpLabel(name) ?? name}</span>
         <code className="tool-arg">{argSummary(name, args)}</code>
+        {failed && <span className="pill warn" title={t('El comando terminó con un código distinto de 0')}>{t('código {n}', { n: out!.code! })}</span>}
         <span className="chev">{open ? '▾' : '▸'}</span>
       </button>
       {open && (
@@ -79,7 +83,9 @@ function ToolBlock({ call, result }: { call: RunEvent; result?: RunEvent }) {
           ) : (
             name !== 'bash' && <pre className="code dim">{JSON.stringify(args, null, 2)}</pre>
           )}
-          {result && <pre className={`code ${err ? 'err' : ''}`}>{result.output}</pre>}
+          {result && (out!.body.trim()
+            ? <pre className={`code ${err ? 'err' : ''}`}>{out!.body}</pre>
+            : <div className="muted small">{t('(sin salida)')}</div>)}
         </div>
       )}
     </div>

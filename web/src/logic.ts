@@ -503,3 +503,12 @@ export function previewSections(p: ImportPreview): { title: string; items: Previ
     { title: 'Telegram', items: telegram },
   ].filter((s) => s.items.length)
 }
+
+/** A terminal result starts with "exit code: N" — for the model, which needs to know whether the command worked. The
+ * user sees the output alone, and the code only when the command failed. */
+export function splitExit(name: string, output: unknown): { code: number | null; body: string } {
+  const text = typeof output === 'string' ? output : output == null ? '' : String(output)
+  if (name !== 'bash') return { code: null, body: text }
+  const m = /^exit code: (-?\d+)\r?\n?/.exec(text)
+  return m ? { code: Number(m[1]), body: text.slice(m[0].length) } : { code: null, body: text }
+}
