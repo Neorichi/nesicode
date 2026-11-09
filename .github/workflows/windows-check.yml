@@ -5,7 +5,8 @@ name: windows-check
 on:
   workflow_dispatch:
   push:
-    branches: ['windows-*']
+    branches: [main, 'windows-*']
+    tags: ['v*']
 
 jobs:
   tests:
