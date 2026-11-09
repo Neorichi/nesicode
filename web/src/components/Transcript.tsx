@@ -1,6 +1,6 @@
 import { Component, useState, type ReactNode } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { api, money, statusLabel, type RunEvent } from '../api'
+import { api, costSuffix, statusLabel, type RunEvent } from '../api'
 import { t, translateError, useLang } from '../i18n'
 import { compactionErrorText, compactReason, interruptedSaved, retryGroups, retryText, splitExit, unknownEventNote } from '../logic'
 import Markdown from './Markdown'
@@ -403,7 +403,7 @@ export default function Transcript({
       {!running && (
         <div className="run-meta">
           {statusLabel(status)}
-          {done && ` · ${t('{n} pasos', { n: num(done.steps) })} · ${money(done.usage?.cost_usd)}`}
+          {done && ` · ${t('{n} pasos', { n: num(done.steps) })}${costSuffix(done.usage?.cost_usd)}`}
         </div>
       )}
     </div>

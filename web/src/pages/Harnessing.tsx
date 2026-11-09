@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { ACTIVE, api, ApiError, isAbort, money, relTime, statusLabel, STREAM_LOST, streamRun, type Run, type RunEvent } from '../api'
+import { ACTIVE, api, ApiError, costSuffix, isAbort, relTime, statusLabel, STREAM_LOST, streamRun, type Run, type RunEvent } from '../api'
 import { useApp, useProject } from '../App'
 import ApplyReport from '../components/ApplyReport'
 import Diff from '../components/Diff'
@@ -344,7 +344,7 @@ function RunDetail({ runId }: { runId: number }) {
         <div className="muted small">
           #{run.id} · {run.params.mode === 'sequential' ? t('secuencial') : t('paralelo')} · k={run.params.k} · harness v{run.harness_version} ·{' '}
           <b>{statusLabel(run.status)}</b>
-          {res.usage && ` · ${money(res.usage.cost_usd)}`}
+          {res.usage && costSuffix(res.usage.cost_usd)}
         </div>
         <div className="task-text">{run.task}</div>
         {run.params.source && (

@@ -137,6 +137,11 @@ export function money(usd?: number): string {
   return usd < 0.01 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`
 }
 
+/** " · $0.05" after a run's steps — nothing when there is no cost to show (free or local models, odd values). */
+export function costSuffix(usd?: number): string {
+  return typeof usd === 'number' && Number.isFinite(usd) && usd > 0 ? ` · ${money(usd)}` : ''
+}
+
 const HIDDEN_GRACE_MS = 5000 // a tab hidden this long gives its stream connection back (browsers allow ~6 per host)
 const MAX_STREAM_FAILURES = 6
 /** onEnd status when the stream gave up reconnecting (server unreachable), as opposed to the run's final status. */

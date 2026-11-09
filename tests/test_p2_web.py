@@ -497,10 +497,13 @@ def test_an_odd_done_or_cost_never_blanks_the_chat(tmp_path):
       import {{ money }} from {json.dumps(str(SRC / 'api.ts'))}
       out.page = html(<Transcript events={{[{{ type: 'assistant', text: 'hola' }}, {{ type: 'done', status: 'done', usage: {{ cost_usd: '0.5' }} }}] as any}} status="done" />)
       out.ok = html(<Transcript events={{[{{ type: 'done', status: 'done', steps: 3, usage: {{ cost_usd: 0.0123 }} }}] as any}} status="done" />)
+      out.free = html(<Transcript events={{[{{ type: 'done', status: 'done', steps: 3, usage: {{ cost_usd: 0 }} }}] as any}} status="done" />)
       out.money = [0.5, 0.001, undefined, null, '0.5', NaN, Infinity].map((x) => money(x as any))
     """)
-    assert "hola" in out["page"] and "? pasos · —" in out["page"] and "undefined" not in out["page"]
+    # (an odd or missing cost shows no price at all, like a free run)
+    assert "hola" in out["page"] and "? pasos" in out["page"] and "$" not in out["page"] and "undefined" not in out["page"]
     assert "3 pasos · $0.01" in out["ok"]
+    assert "3 pasos" in out["free"] and "$" not in out["free"]  # a free run (or a local model): no «$0.0000»
     assert out["money"] == ["$0.50", "$0.0010", "—", "—", "—", "—", "—"]
 
 
