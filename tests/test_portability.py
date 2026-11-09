@@ -212,3 +212,27 @@ def test_a_conversation_started_before_the_upgrade_shows_and_applies_only_its_ow
     assert _changes(base, cage) == (["src/new.py"], [], [])
     assert apply_cage(base, cage, project)["added"] == ["src/new.py"]
     assert (project / "src" / "app.py").read_bytes() == b"v2, edited in the project meanwhile\n"
+
+
+def test_another_conversations_archive_is_refused_however_its_path_is_spelled(tmp_path):
+    """Each chat sees only its own archive (.nesicode/chats/<id>), also in a project folder they share: on Windows a
+    path spelled with '\\' — or, there and on macOS, in other case — is the same folder and must be refused too."""
+    from nesicode.agent import Agent
+    from nesicode.harness import base_harness
+    from nesicode.llm import ToolCall, Usage
+
+    ws = Workspace(tmp_path / "ws")
+    (ws.root / ".nesicode" / "chats" / "5").mkdir(parents=True)
+    (ws.root / ".nesicode" / "chats" / "5" / "history.md").write_text("secreto\n", encoding="utf-8")
+    agent = Agent(model="mock/demo", harness=base_harness(), workspace=ws, archive=".nesicode/chats/4")
+    other = [".nesicode/chats/5/history.md", ".NESICODE/Chats/5/history.md"]
+    if os.name == "nt":
+        other += [".nesicode\\chats\\5\\history.md", ".nesicode/chats\\5/history.md", ".Nesicode\\\\Chats\\5"]
+    for path in other:
+        assert agent._other_chat_archive({"path": path}) == ".nesicode/chats/5", path
+    assert agent._other_chat_archive({"command": "cat .nesicode/chats/*/history.md"}) == ".nesicode/chats/*"
+    for own in (".nesicode/chats/4/context/history.md", ".nesicode/context/x.md", "src/chats/5.py"):
+        assert agent._other_chat_archive({"path": own}) is None, own
+    path = ".nesicode\\chats\\5\\history.md" if os.name == "nt" else ".NESICODE/Chats/5/history.md"
+    r = agent._call_tool(ToolCall("x", "read_file", {"path": path}), Usage())
+    assert r.is_error and "another conversation" in r.content and "secreto" not in r.content

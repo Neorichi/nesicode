@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -55,6 +56,10 @@ MASK_NOTE_REASONING = ("[harness] Your reasoning from earlier steps was cleared 
 THINKING_CAP = 32_000  # chars of one reply's reasoning kept in the event log (its END: the conclusions sit there)
 TRAIL_MARK = "[PREVIOUS TURN — STEPS]"  # heads the step trail of the previous turn in the history (see _trim_answer)
 WRITE_TOOLS = {"write_file", "edit_file", "generate_image", "share_file"}
+# A path into a conversation's archive: on Windows '\' separates folders too, and there (as on macOS) the disk ignores
+# case: .NESICODE\Chats\5 is .nesicode/chats/5.
+_CHAT_ARCHIVE_RX = re.compile(
+    r"\.nesicode[\\/]+chats[\\/]+([^\\/\s'\"]+)" if os.name == "nt" else r"\.nesicode/chats/([^/\s'\"]+)", re.I)
 _WRITES_RX = re.compile(r"(?<![0-9&>])>>?\s*[\w./~$\"'-]|\btee\b|\bsed\s+-i|\b(?:mv|cp|rm|mkdir|touch|patch)\s|"
                         r"\bgit\s+(?:commit|apply|am|merge|rebase|checkout|restore)\b")
 
@@ -822,7 +827,7 @@ class Agent:
         """Paths into another conversation's archive (.nesicode/chats/<other>) are refused."""
         for key in ("path", "command", "pattern"):
             v = str((args or {}).get(key, ""))
-            for m in re.finditer(r"\.nesicode/chats/([^/\s'\"]+)", v):
+            for m in _CHAT_ARCHIVE_RX.finditer(v):
                 if f".nesicode/chats/{m.group(1)}" != self.archive:
                     return f".nesicode/chats/{m.group(1)}"
         return None
