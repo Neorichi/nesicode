@@ -152,6 +152,31 @@ def test_stop_and_timeout_end_an_orphan_the_running_command_left(tmp_path, how):
         _kill(pid)
 
 
+def test_an_interrupted_wait_never_leaves_the_command_or_its_orphan_running(tmp_path, monkeypatch):
+    """A raw KeyboardInterrupt (a second Ctrl+C in the CLI) while a command runs: nothing it started survives."""
+    ws = Workspace(tmp_path / "ws")
+    _scripts(ws)
+    real_wait = subprocess.Popen.wait
+
+    def wait(self, timeout=None):
+        if (ws.root / "bg.pid").exists() and (ws.root / "bg.pid").read_text().strip():
+            raise KeyboardInterrupt
+        return real_wait(self, timeout=timeout)
+
+    monkeypatch.setattr(subprocess.Popen, "wait", wait)
+    py = _python(ws)
+    t0 = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        ws.run(f"{py} start.py; {py} sleep.py", timeout=60)
+    monkeypatch.undo()
+    pid = _read_pid(ws.root / "bg.pid")
+    try:
+        assert time.monotonic() - t0 < 20
+        assert _wait_dead(pid), "the orphan outlived the interrupt"
+    finally:
+        _kill(pid)
+
+
 @pytest.mark.skipif(not NT, reason="Windows job objects")
 def test_a_command_job_is_let_go_and_closed_when_nothing_is_left(tmp_path):
     ws = Workspace(tmp_path / "ws")

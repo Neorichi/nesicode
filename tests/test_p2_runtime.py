@@ -40,6 +40,17 @@ def _until(cond, timeout=10.0, step=0.05) -> bool:
 
 
 def _alive(pid: int) -> bool:
+    if os.name == "nt":  # os.kill(pid, 0) is TerminateProcess there: it would kill the process it asks about
+        import _winapi
+
+        try:
+            handle = _winapi.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        except OSError as exc:
+            return exc.winerror == 5  # access denied: it exists (not ours); 87 (invalid parameter): no such process
+        try:
+            return _winapi.GetExitCodeProcess(handle) == 259  # STILL_ACTIVE (else it has exited, its handle still held)
+        finally:
+            _winapi.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1338,7 +1349,6 @@ def test_a_node_mcp_server_found_on_path_starts_without_the_servers_secrets(tmp_
 
 
 # ====================================================================== Q4 — a hung MCP server
-@POSIX  # (_alive: os.kill(pid, 0) would kill the process on Windows)
 def test_a_hung_mcp_server_costs_one_timeout_per_backoff_window(mcp_script, mgr, tmp_path, fast_kill):
     pidfile = tmp_path / "mute.pid"
     mute = _stdio("lento", mcp_script, "mute", str(pidfile))
@@ -1416,7 +1426,6 @@ def test_the_agent_is_told_which_connectors_could_not_start(env, models, mcp_scr
 
 
 # ====================================================================== Q11 — MCP servers never outlive the app
-@POSIX
 def test_shutdown_all_stops_every_mcp_server_at_once(mcp_script, tmp_path, monkeypatch):
     import nesicode.connectors as conn
 
