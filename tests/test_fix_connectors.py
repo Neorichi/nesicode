@@ -252,6 +252,17 @@ def mgr():
 
 
 def _alive(pid: int) -> bool:
+    if os.name == "nt":  # os.kill(pid, 0) is TerminateProcess there: it would kill the process it asks about
+        import _winapi
+
+        try:
+            handle = _winapi.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        except OSError as exc:
+            return exc.winerror == 5  # access denied: it exists (not ours); 87 (invalid parameter): no such process
+        try:
+            return _winapi.GetExitCodeProcess(handle) == 259  # STILL_ACTIVE (else it has exited, its handle still held)
+        finally:
+            _winapi.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -276,7 +287,9 @@ def test_mcp_crashed_stdio_server_is_noticed_and_restarted(mcp_server, mgr):
     assert mgr.status(1, cfg) == "error"  # not 'running' any more
     pid2 = mgr.call(1, cfg, "pid", {}).text  # the next call reconnects by itself
     assert pid2 != pid1 and mgr.status(1, cfg) == "running"
-    os.kill(int(pid2), signal.SIGKILL)  # dies while idle (npx killed, Chrome crashed): noticed without a call
+    # dies while idle (npx killed, Chrome crashed): noticed without a call (Windows has no SIGKILL: os.kill is a
+    # TerminateProcess there, as hard)
+    os.kill(int(pid2), getattr(signal, "SIGKILL", signal.SIGTERM))
     _until(lambda: mgr.status(1, cfg) == "error", 5)
     assert mgr.call(1, cfg, "pid", {}).text not in (pid1, pid2)
 

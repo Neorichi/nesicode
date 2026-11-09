@@ -45,6 +45,7 @@ from .jobs import (
 )
 from .config_io import KEY_RX
 from .limits import endpoint_problem, vetted
+from ..harnessing.engine import remove_tree  # (read-only files too: git's objects on Windows)
 
 try:  # raised when the project lock stays taken (apply/«Aplicar» while a shared conversation works)
     from .jobs import ProjectBusy
@@ -2004,7 +2005,7 @@ def create_project(body: ProjectCreate, user: dict = Depends(current_user)):
             pin = git_pin(url)  # …not even if the name resolves differently when git looks it up again
         except HTTPException:
             db.execute("DELETE FROM projects WHERE id=?", (pid,))
-            shutil.rmtree(project_root(p), ignore_errors=True)
+            remove_tree(project_root(p))
             raise
         # No redirects (they could lead to a private address) and no stored credentials of the server's account.
         # Multi-user: links in a cloned repo could point at other users' files; check them out as plain files.
@@ -2013,7 +2014,7 @@ def create_project(body: ProjectCreate, user: dict = Depends(current_user)):
         ok, err = run_git(cmd)
         if not ok:
             db.execute("DELETE FROM projects WHERE id=?", (pid,))
-            shutil.rmtree(project_root(p), ignore_errors=True)
+            remove_tree(project_root(p))
             for path, label in ((str(ws), "<proyecto>"), (str(settings.data_dir), "<datos>")):
                 err = err.replace(path, label)  # git's messages name the server's own folders
             raise HTTPException(422, f"git clone falló: {err[-500:]}")
@@ -2143,7 +2144,7 @@ def delete_project(project_id: int, user: dict = Depends(current_user)):
     thread_ids = [t["id"] for t in db.all("SELECT id FROM threads WHERE project_id=?", (project_id,))]
     db.execute("DELETE FROM projects WHERE id=?", (project_id,))
     _forget_telegram_targets(user["id"], project_id, thread_ids)
-    shutil.rmtree(project_root(p), ignore_errors=True)
+    remove_tree(project_root(p))
     return {"ok": True}
 
 
@@ -2611,7 +2612,7 @@ def create_thread(project_id: int, body: ThreadCreate, user: dict = Depends(curr
             # no conversation without its cage: a half-made one would start from an empty manifest, so every file would
             # count as its own change and «Aplicar» would copy the stale copy back over the project
             db.execute("DELETE FROM threads WHERE id=?", (tid,))
-            shutil.rmtree(thread_dir(p, tid), ignore_errors=True)
+            remove_tree(thread_dir(p, tid))
             msg = str(exc)
             for path, label in ((str(project_root(p)), "<proyecto>"), (str(project_ws(p)), "<proyecto>"),
                                 (str(settings.data_dir), "<datos>")):
@@ -2695,7 +2696,7 @@ def delete_thread(thread_id: int, user: dict = Depends(current_user)):
         db.execute("UPDATE runs SET thread_id=NULL WHERE id=? AND status IN ('queued', 'running')", (rid,))
     db.execute("DELETE FROM threads WHERE id=?", (thread_id,))
     _forget_telegram_targets(user["id"], thread_ids=[thread_id])
-    shutil.rmtree(thread_dir(p, thread_id), ignore_errors=True)
+    remove_tree(thread_dir(p, thread_id))
     if not t["isolated"]:  # a conversation that shared the project folder kept its archive there
         _drop_shared_archive(project_ws(p), thread_id)
     return {"ok": True}
@@ -2722,7 +2723,7 @@ def _drop_shared_archive(ws: Path, thread_id: int) -> None:
         return
     chain = [ws / ".nesicode", ws / ".nesicode" / "chats", ws / ".nesicode" / "chats" / name]  # (no dir fds: Windows)
     if not any(c.is_symlink() for c in chain) and chain[-1].is_dir():
-        shutil.rmtree(chain[-1], ignore_errors=True)
+        remove_tree(chain[-1])
 
 
 # ---- the conversation's cage: its files, its own changes, applying them to the project

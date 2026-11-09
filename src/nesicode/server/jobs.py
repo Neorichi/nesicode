@@ -1706,8 +1706,11 @@ class Jobs:
 
         def stopped(result: dict | None = None) -> None:
             # Stop — even during the last rollouts, the selection or the reflection: from here on nothing is applied,
-            # adopted or learned (what was already applied stays recorded in the result)
+            # adopted or learned (what was already applied stays recorded in the result). Nothing can be applied later
+            # either: its copies go BEFORE it shows 'cancelled' (a whole copy of the project each; deleting them takes
+            # a while on Windows, and a run that looks finished must not still be writing its folder)
             emit({"type": "cancelled"})
+            _drop_copies(rd)
             self._finish(run_id, "cancelled", job=job,
                          **({"result": json.dumps(result, ensure_ascii=False)} if result else {}))
 
