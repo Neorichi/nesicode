@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Nesicode for Chrome",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "Lets your Nesicode agent use this Chrome: only the tabs it opens (in the \"Nesicode\" group) or that you share.",
   "permissions": ["tabs", "tabGroups", "scripting", "storage", "alarms"],
   "host_permissions": ["<all_urls>"],
