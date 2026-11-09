@@ -40,6 +40,17 @@ def _until(cond, timeout=10.0, step=0.05) -> bool:
 
 
 def _alive(pid: int) -> bool:
+    if os.name == "nt":  # os.kill(pid, 0) is TerminateProcess there: it would kill the process it asks about
+        import _winapi
+
+        try:
+            handle = _winapi.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        except OSError as exc:
+            return exc.winerror == 5  # access denied: it exists (not ours); 87 (invalid parameter): no such process
+        try:
+            return _winapi.GetExitCodeProcess(handle) == 259  # STILL_ACTIVE (else it has exited, its handle still held)
+        finally:
+            _winapi.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -869,7 +880,7 @@ def test_auto_apply_is_three_way_and_drops_the_copies(env, monkeypatch, tmp_path
     if meanwhile == "file":
         assert (proj / "NESICODE_RESULT.md").read_text() == "lo escribió el usuario mientras tanto\n"
     else:
-        assert os.readlink(proj / "NESICODE_RESULT.md") == str(victim)
+        assert os.readlink(proj / "NESICODE_RESULT.md").removeprefix("\\\\?\\") == str(victim)  # (Windows: \\?\C:\…)
     rd = run_dir(p, rid)
     assert not (rd / "source").exists() and not list(rd.glob("rollouts/*/ws"))  # applied: no copy is kept
     assert list(rd.glob("rollouts/*/trajectory.txt"))
@@ -1296,9 +1307,11 @@ def test_toolchains_still_start_with_that_environment(tool):
     """What local MCP servers are launched with (npx …, uvx …) still finds and runs its toolchain."""
     from nesicode.connectors import server_env
 
-    if not shutil.which(tool):
+    if not (exe := shutil.which(tool)):
         pytest.skip(f"{tool} is not installed")
-    r = subprocess.run([tool, "--version"], env=server_env({"npm_config_update_notifier": "false"}),
+    # started the way the MCP stdio client starts it: the command found on the PATH first (on Windows `npx` is npx.cmd,
+    # which CreateProcess never finds by its bare name; a .cmd runs in cmd.exe, which needs ComSpec, PATHEXT, SystemRoot)
+    r = subprocess.run([exe, "--version"], env=server_env({"npm_config_update_notifier": "false"}),
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 0 and (r.stdout or r.stderr).strip(), r
 
@@ -1309,13 +1322,17 @@ def _env_names(m, cfg) -> set[str]:
 
 
 SECRETS = {"OPENAI_API_KEY": "sk-FAKE", "NESICODE_DESKTOP_TOKEN": "FAKE-desktop", "SOME_SECRET": "s", "GH_TOKEN": "g"}
+# What a server needs to find its toolchain and its home: Windows has no HOME (USERPROFILE is the home there), and a
+# .cmd launcher (npx.cmd) needs cmd.exe to run at all
+NEEDED = ({"PATH", "USERPROFILE", "SYSTEMROOT", "COMSPEC", "PATHEXT", "APPDATA", "LOCALAPPDATA", "TEMP"} if os.name == "nt"
+          else {"PATH", "HOME"})
 
 
 def test_a_python_mcp_server_starts_without_the_servers_secrets(mcp_script, mgr, monkeypatch):
     for k, v in SECRETS.items():
         monkeypatch.setenv(k, v)
     names = _env_names(mgr, _stdio("py", mcp_script, CONNECTOR_TOKEN="suyo"))
-    assert not set(SECRETS) & names and {"PATH", "HOME", "CONNECTOR_TOKEN"} <= names
+    assert not set(SECRETS) & names and NEEDED | {"CONNECTOR_TOKEN"} <= names
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node is not installed")
@@ -1328,11 +1345,10 @@ def test_a_node_mcp_server_found_on_path_starts_without_the_servers_secrets(tmp_
     script.write_text(NODE_SERVER)
     cfg = ConnectorConfig(name="nodo", kind="stdio", command="node", args=[str(script)], env={"CONNECTOR_TOKEN": "suyo"})
     names = _env_names(mgr, cfg)  # `node` itself is found through the PATH it inherits
-    assert not set(SECRETS) & names and {"PATH", "HOME", "CONNECTOR_TOKEN"} <= names
+    assert not set(SECRETS) & names and NEEDED | {"CONNECTOR_TOKEN"} <= names
 
 
 # ====================================================================== Q4 — a hung MCP server
-@POSIX  # (_alive: os.kill(pid, 0) would kill the process on Windows)
 def test_a_hung_mcp_server_costs_one_timeout_per_backoff_window(mcp_script, mgr, tmp_path, fast_kill):
     pidfile = tmp_path / "mute.pid"
     mute = _stdio("lento", mcp_script, "mute", str(pidfile))
@@ -1410,7 +1426,6 @@ def test_the_agent_is_told_which_connectors_could_not_start(env, models, mcp_scr
 
 
 # ====================================================================== Q11 — MCP servers never outlive the app
-@POSIX
 def test_shutdown_all_stops_every_mcp_server_at_once(mcp_script, tmp_path, monkeypatch):
     import nesicode.connectors as conn
 

@@ -38,13 +38,14 @@ from .vault import Vault
 from . import auth
 from .db import DB, loads
 from ..agent.vision import image_mime
-from ..agent.workspace import ATTACHMENTS_DIR, apply_cage, manifest
+from ..agent.workspace import ATTACHMENTS_DIR, apply_cage, manifest, manifest_paths
 from .jobs import (
     FINAL, Jobs, create_cage, current_harness, merge_harness, project_root, project_ws, run_dir, save_harness_version,
     thread_dir, thread_ws, user_root,
 )
 from .config_io import KEY_RX
 from .limits import endpoint_problem, vetted
+from ..harnessing.engine import remove_tree  # (read-only files too: git's objects on Windows)
 
 try:  # raised when the project lock stays taken (apply/«Aplicar» while a shared conversation works)
     from .jobs import ProjectBusy
@@ -1942,7 +1943,9 @@ def git_env(environ: dict | None = None, windows: bool | None = None) -> dict[st
 def run_git(cmd: list[str], timeout: int = 300) -> tuple[bool, str]:
     """(ok, stderr) of a git command run with git_env()."""
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=git_env())
+        # (git writes UTF-8: the locale's code page — cp1252 on Windows — garbled its messages, or failed on them)
+        proc = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout,
+                              env=git_env())
         return proc.returncode == 0, proc.stderr
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
@@ -2002,7 +2005,7 @@ def create_project(body: ProjectCreate, user: dict = Depends(current_user)):
             pin = git_pin(url)  # …not even if the name resolves differently when git looks it up again
         except HTTPException:
             db.execute("DELETE FROM projects WHERE id=?", (pid,))
-            shutil.rmtree(project_root(p), ignore_errors=True)
+            remove_tree(project_root(p))
             raise
         # No redirects (they could lead to a private address) and no stored credentials of the server's account.
         # Multi-user: links in a cloned repo could point at other users' files; check them out as plain files.
@@ -2011,7 +2014,7 @@ def create_project(body: ProjectCreate, user: dict = Depends(current_user)):
         ok, err = run_git(cmd)
         if not ok:
             db.execute("DELETE FROM projects WHERE id=?", (pid,))
-            shutil.rmtree(project_root(p), ignore_errors=True)
+            remove_tree(project_root(p))
             for path, label in ((str(ws), "<proyecto>"), (str(settings.data_dir), "<datos>")):
                 err = err.replace(path, label)  # git's messages name the server's own folders
             raise HTTPException(422, f"git clone falló: {err[-500:]}")
@@ -2141,7 +2144,7 @@ def delete_project(project_id: int, user: dict = Depends(current_user)):
     thread_ids = [t["id"] for t in db.all("SELECT id FROM threads WHERE project_id=?", (project_id,))]
     db.execute("DELETE FROM projects WHERE id=?", (project_id,))
     _forget_telegram_targets(user["id"], project_id, thread_ids)
-    shutil.rmtree(project_root(p), ignore_errors=True)
+    remove_tree(project_root(p))
     return {"ok": True}
 
 
@@ -2309,7 +2312,7 @@ def resolved_rel(root: Path, path: str) -> tuple[Path, str]:
         raise HTTPException(404, "Fichero no encontrado") from exc
     if f == root or root not in f.parents:
         raise HTTPException(404, "Fichero no encontrado")
-    return root, str(f.relative_to(root))
+    return root, f.relative_to(root).as_posix()
 
 
 def _sorted_entries(path) -> list:
@@ -2609,7 +2612,7 @@ def create_thread(project_id: int, body: ThreadCreate, user: dict = Depends(curr
             # no conversation without its cage: a half-made one would start from an empty manifest, so every file would
             # count as its own change and «Aplicar» would copy the stale copy back over the project
             db.execute("DELETE FROM threads WHERE id=?", (tid,))
-            shutil.rmtree(thread_dir(p, tid), ignore_errors=True)
+            remove_tree(thread_dir(p, tid))
             msg = str(exc)
             for path, label in ((str(project_root(p)), "<proyecto>"), (str(project_ws(p)), "<proyecto>"),
                                 (str(settings.data_dir), "<datos>")):
@@ -2693,7 +2696,7 @@ def delete_thread(thread_id: int, user: dict = Depends(current_user)):
         db.execute("UPDATE runs SET thread_id=NULL WHERE id=? AND status IN ('queued', 'running')", (rid,))
     db.execute("DELETE FROM threads WHERE id=?", (thread_id,))
     _forget_telegram_targets(user["id"], thread_ids=[thread_id])
-    shutil.rmtree(thread_dir(p, thread_id), ignore_errors=True)
+    remove_tree(thread_dir(p, thread_id))
     if not t["isolated"]:  # a conversation that shared the project folder kept its archive there
         _drop_shared_archive(project_ws(p), thread_id)
     return {"ok": True}
@@ -2720,7 +2723,7 @@ def _drop_shared_archive(ws: Path, thread_id: int) -> None:
         return
     chain = [ws / ".nesicode", ws / ".nesicode" / "chats", ws / ".nesicode" / "chats" / name]  # (no dir fds: Windows)
     if not any(c.is_symlink() for c in chain) and chain[-1].is_dir():
-        shutil.rmtree(chain[-1], ignore_errors=True)
+        remove_tree(chain[-1])
 
 
 # ---- the conversation's cage: its files, its own changes, applying them to the project
@@ -2759,7 +2762,7 @@ def _inline_local_images(body: bytes, page: Path, root: Path) -> bytes:
             return m.group(0)
         try:
             target = (page.parent / ref.split("?")[0]).resolve()
-            rel = str(target.relative_to(root))  # never outside the conversation's workspace
+            rel = target.relative_to(root).as_posix()  # never outside the conversation's workspace
         except (ValueError, OSError):
             return m.group(0)
         mime = image_mime(target.name)
@@ -2981,7 +2984,7 @@ def thread_apply(thread_id: int, user: dict = Depends(current_user)):
         raise HTTPException(422, "Esta conversación ya trabaja directamente sobre el proyecto")
     if db.one("SELECT id FROM runs WHERE thread_id=? AND status IN ('queued', 'running')", (thread_id,)):
         raise HTTPException(409, "Espera a que termine la respuesta en curso")
-    cage, target, base = thread_ws(p, t), project_ws(p), loads(t["manifest"], {})
+    cage, target, base = thread_ws(p, t), project_ws(p), manifest_paths(loads(t["manifest"], {}))
     with project_lock(p["id"]):
         added, modified, removed = cage_change_sets(base, cage)
         prepare_targets(target, added + modified, removed)

@@ -117,7 +117,9 @@ launch) and every MCP server the app started.
   Ad-hoc signed (no Apple Developer ID): the first time, right-click → Open.
 - **Windows**: `packaging/windows/build.ps1` (on Windows, with Inno Setup 6) → `dist\Nesicode-<version>-windows-x64-setup.exe`,
   a per-user install with no admin rights. On Windows there is no OS cage unless you use Docker; the agent uses
-  Git for Windows' bash if installed, or PowerShell.
+  Git for Windows' bash if installed, or PowerShell. Each of its commands runs in a job object of its own, so Stop,
+  a timeout and the end of the reply end everything the command started, also what it left running in the
+  background (as process groups do on macOS/Linux); local MCP servers (`npx`, `uvx`…) get the same from the MCP SDK.
 - **GitHub Actions** (`.github/workflows/desktop.yml`): builds both (Mac Apple Silicon + Windows) on demand from
   the Actions tab or when a `v*` tag is pushed, and attaches them to the release.
 - From source: `uv sync --extra desktop && uv run nesicode desktop`.

@@ -290,11 +290,15 @@ def test_openai_429_honours_retry_after(srv):
 def test_openai_never_sleeps_after_the_last_attempt(srv):
     s = srv(default=respond(503, {"error": {"message": "busy"}}, {"retry-after-ms": "300"}))
     _, conv = oa_conv(s, max_attempts=2)
-    t0 = time.monotonic()
     with pytest.raises(LLMError, match="HTTP 503"):
         conv.step()
-    elapsed = time.monotonic() - t0
-    assert len(s.requests) == 2 and 0.3 <= elapsed < 0.6  # one wait (between the attempts), none after the last
+    done = time.monotonic()
+    # One wait (between the attempts), none after the last. Timed from the requests the server saw, so what an attempt
+    # costs before its request leaves (a new HTTP client each time: slower on a Windows runner) never decides it.
+    tick = 0.016  # time.monotonic()'s resolution on Windows before Python 3.13 (15.6 ms)
+    assert len(s.requests) == 2
+    first, last = (r["t"] for r in s.requests)
+    assert last - first >= 0.3 - tick and done - last < 0.3 - tick
 
 
 def test_retry_after_parsing():

@@ -84,11 +84,11 @@ def _fernet() -> Fernet:
     if not secret:
         path: Path = settings.data_dir / ".secret_key"
         if path.exists():
-            secret = path.read_text().strip()
+            secret = path.read_text(encoding="utf-8").strip()
         else:
             settings.data_dir.mkdir(parents=True, exist_ok=True)
             secret = secrets.token_urlsafe(48)
-            path.write_text(secret)
+            path.write_text(secret, encoding="utf-8")
             path.chmod(0o600)
     key = base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest())
     return Fernet(key)

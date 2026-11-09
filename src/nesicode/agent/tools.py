@@ -12,7 +12,8 @@ from typing import Callable
 from ..harness import Harness, skills, sub_agents
 from ..llm import ToolSpec
 from .workspace import (
-    IGNORE_DIRS, ToolError, Workspace, _walk, codec_note, decode_text, encode_text, shell_name, shown, text_codec,
+    IGNORE_DIRS, OUTSIDE_HINT, ToolError, Workspace, _walk, codec_note, decode_text, encode_text, link_text,
+    sandbox_mode, shell_name, shown, text_codec,
 )
 
 MAX_READ_LINES = 2000
@@ -77,7 +78,7 @@ def list_dir(ws: Workspace, args: dict) -> str:
             try:
                 if e.is_symlink():  # shown, never followed: it may point out of the workspace
                     try:
-                        target = os.readlink(e.name, dir_fd=d) if isinstance(d, int) else os.readlink(e.path)
+                        target = link_text(os.readlink(e.name, dir_fd=d) if isinstance(d, int) else os.readlink(e.path))
                         lines.append(f"{pad}{e.name} -> {target}")
                     except OSError:
                         lines.append(f"{pad}{e.name} -> ?")
@@ -524,7 +525,24 @@ def bash(ws: Workspace, args: dict) -> str:
         command = PIPE_TRAP + command  # same line: bash's "line N" in error messages stays the agent's line N
     code, out = ws.run(command, _int(args, "timeout", 120))
     out = out if len(out) <= 30_000 else out[:15_000] + "\n... (output truncated) ...\n" + out[-15_000:]
+    if code != 0 and _refused_by_sandbox(command, out):
+        out += "\n[sandbox] That is out of your reach: you only see this workspace, not the user's other folders or " \
+               "apps, and no other command will get you there. " + OUTSIDE_HINT
     return f"exit code: {code}\n{out}"
+
+
+_HOME_REF = re.compile(r"(~|\$HOME\b|\$\{HOME\}|/Users/|/home/|\b(?:Downloads|Documents|Desktop|Escritorio|Descargas|Documentos)\b)")
+_APP_LAUNCH = re.compile(r"(?:^|[;&|(\s])(?:open|osascript)\s")
+
+
+def _refused_by_sandbox(command: str, out: str) -> bool:
+    """A failed command that tried to reach the user's folders or launch an app while the OS sandbox is on."""
+    if sandbox_mode() not in ("macos", "docker"):
+        return False
+    low = out.lower()
+    # (the cage's HOME is a private folder of its own: ~/Downloads there simply does not exist)
+    denied = "operation not permitted" in low or "no such file or directory" in low
+    return bool(_APP_LAUNCH.search(command)) or (denied and bool(_HOME_REF.search(command)))
 
 
 SCHEMAS = {

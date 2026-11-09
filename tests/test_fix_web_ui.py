@@ -25,18 +25,20 @@ pytestmark = pytest.mark.skipif(not NODE or not ESBUILD.is_dir(), reason="needs 
 
 def run_ts(tmp_path: Path, body: str, head: str = ""):
     """Bundle `body` (TypeScript, with `L` = web/src/logic.ts) for node, run it, return what it printed as JSON.
-    `head`: imports that must run first (e.g. browser fakes)."""
+    `head`: imports that must run first (e.g. browser fakes). What esbuild reads and what node prints are UTF-8 both
+    ways, never the locale's code page (cp1252 on Windows turned «válido» into «vÃ¡lido»)."""
     entry = tmp_path / "entry.ts"
     entry.write_text(f"{head}\nimport * as L from {json.dumps(str(WEB / 'src' / 'logic.ts'))}\n"
-                     f"const out: Record<string, unknown> = {{}}\n{body}\nconsole.log(JSON.stringify(out))\n")
+                     f"const out: Record<string, unknown> = {{}}\n{body}\nconsole.log(JSON.stringify(out))\n",
+                     encoding="utf-8")
     bundle = tmp_path / "bundle.cjs"
     build = tmp_path / "build.cjs"
     build.write_text(
         f"require({json.dumps(str(ESBUILD))}).buildSync({{entryPoints: [{json.dumps(str(entry))}], bundle: true, "
         f"platform: 'node', format: 'cjs', outfile: {json.dumps(str(bundle))}, logLevel: 'error', "
-        f"nodePaths: [{json.dumps(str(WEB / 'node_modules'))}]}})\n")
+        f"nodePaths: [{json.dumps(str(WEB / 'node_modules'))}]}})\n", encoding="utf-8")
     for args in ([NODE, str(build)], [NODE, str(bundle)]):
-        p = subprocess.run(args, capture_output=True, text=True, timeout=60, cwd=tmp_path)
+        p = subprocess.run(args, capture_output=True, encoding="utf-8", timeout=60, cwd=tmp_path)
         assert p.returncode == 0, p.stderr
     return json.loads(p.stdout.strip().splitlines()[-1])
 
@@ -270,7 +272,7 @@ def test_run_stream_resumes_after_drops_and_hidden_tabs_and_is_followed_again_af
     unreachable ends in one 'stream-lost', and the page then follows the run again unless a reload says it is over
     (before the review fix a failed reload left the chat 'running' forever once the server came back)."""
     fakes = tmp_path / "fakes.ts"
-    fakes.write_text(STREAM_FAKES)
+    fakes.write_text(STREAM_FAKES, encoding="utf-8")
     head = (f"import * as F from {json.dumps(str(fakes))}\n"
             f"import * as A from {json.dumps(str(WEB / 'src' / 'api.ts'))}")
     out = run_ts(tmp_path, """

@@ -556,6 +556,8 @@ def test_cron_in_the_repeated_hour_does_not_refire_every_tick(alice, project, fr
     assert db.one("SELECT COUNT(*) AS n FROM runs WHERE bot_id=?", (b["id"],))["n"] == 1 and fired == 0
 
 
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="no time.tzset() on Windows: a process can't switch its own "
+                    "local time zone to Europe/Madrid there (the C runtime's TZ only knows US daylight-saving rules)")
 def test_cron_local_time_zone_too():
     import os
 

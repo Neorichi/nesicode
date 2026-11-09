@@ -1,4 +1,5 @@
 import json
+import os
 
 import pytest
 
@@ -276,7 +277,7 @@ def test_layer2_checkpoint_md_and_search(tmp_path):
     # archive files are named per run (<YYYYmmdd-HHMMSS>-compact-N.md) so a later run never overwrites them
     import re
     assert comp and re.fullmatch(r"\.nesicode/context/\d{8}-\d{6}(-\d+)?-compact-1\.md", comp[0]["path"])
-    md = (ws.root / comp[0]["path"]).read_text()
+    md = (ws.root / comp[0]["path"]).read_text(encoding="utf-8")
     assert md.startswith("# Compactación 1") and "transcript-1.md" in md
     from nesicode.agent.context import search_history
     assert "transcript-1.md" in search_history(ws, {"query": "ACTION"})
@@ -488,9 +489,13 @@ def test_bot_unattended_rules(monkeypatch):
     assert botmod.bot_denies("readonly", "bash") and botmod.bot_denies("readonly", "write_file")
     assert botmod.bot_denies("readonly", "mcp__office__word_write")
     assert not botmod.bot_denies("readonly", "read_file") and not botmod.bot_denies("readonly", "http_fetch")
-    assert not botmod.bot_denies("ask", "bash")
-    monkeypatch.setattr(botmod.os, "name", "nt")
-    assert botmod.bot_denies("auto", "bash")  # Windows: no sandbox → no commands for bots
+    if os.name != "nt":  # (here a bot's commands follow its policy; Windows' own rule is checked below as well)
+        assert not botmod.bot_denies("ask", "bash") and not botmod.bot_denies("auto", "bash")
+        monkeypatch.setattr(botmod.os, "name", "nt")
+    # Windows: no sandbox → no terminal commands for bots, whatever the policy; every other tool follows the policy
+    assert all("Windows" in botmod.bot_denies(policy, "bash") for policy in ("ask", "auto", "readonly"))
+    assert not botmod.bot_denies("ask", "write_file") and not botmod.bot_denies("auto", "mcp__office__word_write")
+    assert botmod.bot_denies("readonly", "write_file") and not botmod.bot_denies("readonly", "read_file")
 
 
 def test_same_tool_error_three_times_stops_the_loop(tmp_path):

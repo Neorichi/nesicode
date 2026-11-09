@@ -106,7 +106,7 @@ def test_walkers_never_follow_symlinks_out_of_the_cage(tmp_path):
     (outside / "deep").mkdir()
     (outside / "deep" / "more.txt").write_text("SECRET too\n")
     ws = Workspace(tmp_path / "ws")
-    (ws.root / "app.py").write_text("print('hi')\n")
+    (ws.root / "app.py").write_bytes(b"print('hi')\n")  # (12 bytes on every OS: no CRLF)
     os.symlink(outside / "secret.env", ws.root / "notes.txt")  # what a caged `ln -s` can do
     os.symlink(outside, ws.root / "otherdir")
 
@@ -526,7 +526,7 @@ def test_read_file_offsets_and_line_numbers(tmp_path):
     assert read_file(ws, {"path": "ten.txt", "offset": 50}) == "(no lines at offset 50: the file has 10 lines)"
     (ws.root / "empty.txt").write_text("")
     assert read_file(ws, {"path": "empty.txt"}) == "(empty file)"
-    (ws.root / "ff.py").write_text("a = 1\n\x0c\nb = ' '\nc = 3\nTARGET = 5\n")
+    (ws.root / "ff.py").write_bytes("a = 1\n\x0c\nb = ' '\nc = 3\nTARGET = 5\n".encode("utf-8"))  # (as is)
     assert search(ws, {"pattern": "TARGET"}) == "ff.py:5: TARGET = 5"  # what grep -n says
     assert "     5\tTARGET = 5" in read_file(ws, {"path": "ff.py"})
 
@@ -628,9 +628,9 @@ def test_search_stops_on_cancel_and_globs_like_ripgrep(tmp_path):
     (ws.root / "main.py").write_text("useThing()\n")
     (ws.root / "src" / "util.py").write_text("useThing()\n")
     assert sorted(h.split(":")[0] for h in search(ws, {"pattern": "useThing", "glob": "*.{ts,tsx}"}).splitlines()) == \
-        ["App.tsx", os.path.join("src", "api.ts")]
+        ["App.tsx", "src/api.ts"]
     assert sorted(h.split(":")[0] for h in search(ws, {"pattern": "useThing", "glob": "**/*.py"}).splitlines()) == \
-        ["main.py", os.path.join("src", "util.py")]
+        ["main.py", "src/util.py"]
     (ws.root / "huge.sql").write_text("useThing()\n" + "x" * 2_100_000)
     out = search(ws, {"pattern": "useThing"})
     assert "huge.sql" in out and "not searched" in out  # never skipped silently
@@ -727,10 +727,10 @@ def test_a_folder_replaced_by_a_link_is_never_listed(tmp_path, monkeypatch):
     real = os.listdir
     monkeypatch.setattr(os, "listdir", lambda p=".": (listed.append(os.fspath(p)), real(p))[1])
     ch = changes_since(base, cage, proj)
-    assert ch["removed"] == [os.path.join("a", "b.txt")] and ch["added"] == ["a"]
+    assert ch["removed"] == ["a/b.txt"] and ch["added"] == ["a"]
     assert not any(os.path.realpath(p).startswith(str(outside.resolve())) for p in listed), listed
     d = diff_workspaces(proj, cage, max_chars=0)
-    assert d["removed"] == [os.path.join("a", "b.txt")]
+    assert d["removed"] == ["a/b.txt"]
     monkeypatch.setattr(os, "listdir", real)
     res = apply_cage(base, cage, proj)
     assert (outside / "b.txt").read_text() == "someone else's\n" and not (proj / "a" / "b.txt").exists()
@@ -761,7 +761,7 @@ def test_apply_never_writes_or_links_outside_the_project(tmp_path):
     assert (victim / "secret.py").read_text() == "SECRET\n" and (victim / ".env").read_text() == "OPENAI_API_KEY=sk-victim\n"
     assert not (proj / "pwn").is_symlink() and (proj / "pwn").read_text() == "replaced through the link\n"
     assert not os.path.lexists(proj / "abs_link")
-    assert any(s.startswith("abs_link:") for s in res["skipped"]) and any(s.startswith(os.path.join("d", ".env")) for s in res["skipped"])
+    assert any(s.startswith("abs_link:") for s in res["skipped"]) and any(s.startswith("d/.env") for s in res["skipped"])
 
 
 def _case_insensitive(d: Path) -> bool:
@@ -784,14 +784,14 @@ def test_case_only_rename_does_not_delete_the_file(tmp_path):
     base = manifest(cage)
     os.rename(cage / "src" / "button.tsx", cage / "src" / "Button.tsx")
     ch = changes_since(base, cage, proj)
-    assert ch["added"] == [os.path.join("src", "Button.tsx")] and ch["removed"] == [os.path.join("src", "button.tsx")]
+    assert ch["added"] == ["src/Button.tsx"] and ch["removed"] == ["src/button.tsx"]
     apply_cage(base, cage, proj)  # chat 'Aplicar'
     assert os.listdir(proj / "src") == ["Button.tsx"]
     assert (proj / "src" / "Button.tsx").read_text() == "export const Button = 1\n"
     proj2 = tmp_path / "project2"
     copy_workspace(snap, proj2)
     d = apply_changes(snap, cage, proj2)  # harnessing apply
-    assert d["removed"] == [os.path.join("src", "button.tsx")] and os.listdir(proj2 / "src") == ["Button.tsx"]
+    assert d["removed"] == ["src/button.tsx"] and os.listdir(proj2 / "src") == ["Button.tsx"]
 
 
 # ------------------------------------------------------------------ #14 / #22 / harness#12 hooks
