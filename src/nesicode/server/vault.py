@@ -42,13 +42,13 @@ def _master_key() -> bytes:
         else:
             path = Path(os.environ.get("NESICODE_VAULT_KEY_FILE", "~/.nesicode/vault.key")).expanduser()
             if path.exists():
-                key = base64.b64decode(path.read_text().strip())
+                key = base64.b64decode(path.read_text(encoding="utf-8").strip())
             else:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.parent.chmod(0o700)
                 key = AESGCM.generate_key(bit_length=256)
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "w") as f:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(base64.b64encode(key).decode())
         if len(key) != 32:
             raise RuntimeError("vault master key must be 32 bytes (base64)")

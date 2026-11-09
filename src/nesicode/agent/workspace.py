@@ -395,6 +395,26 @@ def _read_beneath(root: Path, p: Path | str, limit: int | None = None) -> bytes:
         return f.read() if limit is None else f.read(limit)
 
 
+_NT_DRIVE = re.compile(r"[A-Za-z]:\\")
+
+
+def link_text(target: str, windows: bool | None = None) -> str:
+    """A link's target as it was written: Windows reads an absolute one back in its NT form (\\\\?\\C:\\x for C:\\x,
+    \\\\?\\UNC\\server\\share for \\\\server\\share), which is no path to show or to judge (the realpath of the
+    project has no such prefix). Other NT forms (\\\\?\\Volume{…}) stay as they are: they have no shorter spelling."""
+    if (os.name == "nt" if windows is None else windows) and target.startswith("\\\\?\\"):
+        if target[4:8].upper() == "UNC\\":
+            return "\\\\" + target[8:]
+        if _NT_DRIVE.match(target, 4):
+            return target[4:]
+    return target
+
+
+def readlink(p: Path | str) -> str:
+    """os.readlink, as the link was written (see link_text)."""
+    return link_text(os.readlink(p))
+
+
 def _why(exc: OSError) -> str:
     if exc.errno in (errno.ELOOP, errno.EMLINK):
         return "it is a symbolic link (links are not followed; use the path it points to)"
@@ -646,7 +666,7 @@ def manifest(root: Path) -> dict[str, str]:
     root = Path(root)
     out = {MANIFEST_KEY: MANIFEST_VERSION}
     for p, e in _scan(root):
-        rel = str(p.relative_to(root))
+        rel = p.relative_to(root).as_posix()  # paths are reported with '/' everywhere (the API, the UI, the agent)
         try:
             if e.is_symlink():
                 out[rel] = "symlink:" + os.readlink(p)
@@ -661,7 +681,17 @@ def _is_hash(v: str) -> bool:
     return len(v) == 64 and ":" not in v
 
 
+def manifest_paths(base: dict[str, str], windows: bool | None = None) -> dict[str, str]:
+    """A stored manifest with its paths spelled as manifest() spells them now: on Windows, manifests of earlier versions
+    wrote 'src\\app.py' (a '\\' is never part of a name there). Without this every file in a folder looked new — and a
+    conversation's «Aplicar» copied its old copy over the project's newer one."""
+    if not (os.name == "nt" if windows is None else windows) or not any("\\" in k for k in base):
+        return base
+    return {k.replace("\\", "/"): v for k, v in base.items()}
+
+
 def _changes(base: dict[str, str], root: Path) -> tuple[list[str], list[str], list[str]]:
+    base = manifest_paths(base)
     legacy = base.get(MANIFEST_KEY) != MANIFEST_VERSION
     base = {k: v for k, v in base.items() if k != MANIFEST_KEY}
     now = manifest(root)
@@ -684,7 +714,7 @@ def _side(root: Path, rel: str) -> tuple[str, str]:
         return "missing", ""
     if stat.S_ISLNK(st.st_mode):
         try:
-            return "link", os.readlink(Path(root, rel))
+            return "link", readlink(Path(root, rel))
         except OSError:
             return "binary", ""
     if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_DIFF_FILE:
@@ -761,7 +791,7 @@ def _escaping_links(target: Path, rels: list[str]) -> dict[str, str]:
     for rel in rels:
         try:
             if stat.S_ISLNK(os.lstat(Path(target, rel)).st_mode):
-                links[rel] = os.readlink(Path(target, rel))
+                links[rel] = readlink(Path(target, rel))
         except OSError:
             continue
     root, out = os.path.realpath(target), {}
@@ -795,7 +825,7 @@ def _copy_entry(src_root: Path, dst_root: Path, rel: str, dst_rel: str | None = 
     st = os.lstat(src)
     parts = _parts(dst_root, rel)
     if stat.S_ISLNK(st.st_mode):
-        link = os.readlink(src)
+        link = readlink(src)  # (Windows: C:\x, not \\?\C:\x, which no path of the project starts with)
         # Judged in dst_root as it is now — which holds for good only for a target without a '..' after a folder name
         # (_up_after_down): its leading '..' climb the real folders it is written in, the rest only goes down, through
         # links that are inside too. One that goes down and back up (`a -> y/z/../../x`) follows those folders where
@@ -929,7 +959,8 @@ class Workspace:
         return p
 
     def rel(self, p: Path) -> str:
-        return str(p.relative_to(self.root)) or "."
+        """p relative to the root, with '/' on every OS: the agent, the API and the UI read and match these paths."""
+        return p.relative_to(self.root).as_posix() or "."
 
     def contains(self, p: Path | str) -> bool:
         return _within(os.path.realpath(p), str(self.root))
@@ -1401,7 +1432,7 @@ def _tree(root: Path) -> dict[str, os.stat_result]:
         except OSError:
             continue
         if stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
-            out[str(p.relative_to(root))] = st
+            out[p.relative_to(root).as_posix()] = st
     return out
 
 

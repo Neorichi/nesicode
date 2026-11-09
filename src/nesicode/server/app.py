@@ -38,7 +38,7 @@ from .vault import Vault
 from . import auth
 from .db import DB, loads
 from ..agent.vision import image_mime
-from ..agent.workspace import ATTACHMENTS_DIR, apply_cage, manifest
+from ..agent.workspace import ATTACHMENTS_DIR, apply_cage, manifest, manifest_paths
 from .jobs import (
     FINAL, Jobs, create_cage, current_harness, merge_harness, project_root, project_ws, run_dir, save_harness_version,
     thread_dir, thread_ws, user_root,
@@ -1942,7 +1942,9 @@ def git_env(environ: dict | None = None, windows: bool | None = None) -> dict[st
 def run_git(cmd: list[str], timeout: int = 300) -> tuple[bool, str]:
     """(ok, stderr) of a git command run with git_env()."""
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=git_env())
+        # (git writes UTF-8: the locale's code page — cp1252 on Windows — garbled its messages, or failed on them)
+        proc = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout,
+                              env=git_env())
         return proc.returncode == 0, proc.stderr
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
@@ -2309,7 +2311,7 @@ def resolved_rel(root: Path, path: str) -> tuple[Path, str]:
         raise HTTPException(404, "Fichero no encontrado") from exc
     if f == root or root not in f.parents:
         raise HTTPException(404, "Fichero no encontrado")
-    return root, str(f.relative_to(root))
+    return root, f.relative_to(root).as_posix()
 
 
 def _sorted_entries(path) -> list:
@@ -2759,7 +2761,7 @@ def _inline_local_images(body: bytes, page: Path, root: Path) -> bytes:
             return m.group(0)
         try:
             target = (page.parent / ref.split("?")[0]).resolve()
-            rel = str(target.relative_to(root))  # never outside the conversation's workspace
+            rel = target.relative_to(root).as_posix()  # never outside the conversation's workspace
         except (ValueError, OSError):
             return m.group(0)
         mime = image_mime(target.name)
@@ -2981,7 +2983,7 @@ def thread_apply(thread_id: int, user: dict = Depends(current_user)):
         raise HTTPException(422, "Esta conversación ya trabaja directamente sobre el proyecto")
     if db.one("SELECT id FROM runs WHERE thread_id=? AND status IN ('queued', 'running')", (thread_id,)):
         raise HTTPException(409, "Espera a que termine la respuesta en curso")
-    cage, target, base = thread_ws(p, t), project_ws(p), loads(t["manifest"], {})
+    cage, target, base = thread_ws(p, t), project_ws(p), manifest_paths(loads(t["manifest"], {}))
     with project_lock(p["id"]):
         added, modified, removed = cage_change_sets(base, cage)
         prepare_targets(target, added + modified, removed)

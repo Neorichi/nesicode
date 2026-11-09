@@ -201,7 +201,7 @@ def test_apply_never_writes_through_a_project_link_that_leads_out_of_it(tmp_path
     assert r.json()["changes"]["conflicts"] == [{"path": "a.txt", "reason": "changed", "side_file": "a.txt.nesicode-new"}]
     assert [(outside / n).read_text() for n in ("guide.md", "victim.txt")] == ["outside\n", "outside\n"]
     assert not (ws / "GUIDE.md").is_symlink() and (ws / "GUIDE.md").read_text() == "from the run\n"
-    assert os.readlink(ws / "a.txt") == str(outside / "victim.txt")
+    assert os.readlink(ws / "a.txt").removeprefix("\\\\?\\") == str(outside / "victim.txt")  # (Windows: \\?\C:\…)
     assert (ws / "a.txt.nesicode-new").read_text() == "from the run\n"
 
 
