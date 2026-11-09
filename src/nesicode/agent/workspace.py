@@ -1066,9 +1066,13 @@ class Workspace:
             argv = shell_argv(command)
             if mode == "macos":
                 argv = ["sandbox-exec", "-p", macos_profile(self.root, self.home, _listening_ports())] + argv
+        # Windows: started suspended, put in its own job, then let go (see _WinJob): not even its first child can start
+        # outside the job
+        suspend = os.name == "nt" and _WinJob.ready()
         try:
             group = (
-                {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+                {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                 | (_CREATE_SUSPENDED if suspend else 0)}
                 if os.name == "nt" else {"start_new_session": True}
             )
             proc = subprocess.Popen(
@@ -1077,6 +1081,15 @@ class Workspace:
             )
         except OSError as exc:
             raise ToolError(f"could not start command: {exc}") from exc
+        job = None
+        if suspend:
+            try:
+                job = _WinJob.adopt(proc)
+            except OSError as exc:  # it could not be let go: it never ran
+                proc.kill()
+                proc.wait()
+                proc.stdout.close()
+                raise ToolError(f"could not start command: {exc}") from exc
         try:
             if container:
                 _CONTAINERS.add(container)
@@ -1098,7 +1111,7 @@ class Workspace:
                 elif time.monotonic() >= deadline:
                     why = "timeout"
                 if why:
-                    _kill_tree(proc, container)
+                    _kill_tree(proc, container, job)
                     try:
                         proc.wait(timeout=5)
                     except subprocess.TimeoutExpired:
@@ -1110,14 +1123,14 @@ class Workspace:
         except BaseException:
             # A raw KeyboardInterrupt (a second Ctrl+C, library use without the CLI's handler) or anything else that
             # aborts the wait: the command and whatever it started must not outlive us as orphans.
-            _kill_tree(proc, container)
+            _kill_tree(proc, container, job)
             if container:
                 _CONTAINERS.discard(container)
             raise
         if container:
             _CONTAINERS.discard(container)
         if not why:
-            self._track_background(proc)
+            self._track_background(proc, job)
         text = out.text()
         if mode == "macos":
             text = _XCRUN_NOISE.sub("", text)
@@ -1131,14 +1144,22 @@ class Workspace:
         return proc.returncode if proc.returncode is not None else -1, text
 
     # ------------------------------------------------------------ background processes (`cmd &`)
-    def _track_background(self, proc: subprocess.Popen) -> None:
+    def _track_background(self, proc: subprocess.Popen, job: _WinJob | None = None) -> None:
+        group: int | _WinJob
         if os.name == "nt":
-            return
-        try:
-            os.killpg(proc.pid, 0)  # members left in the command's process group?
-        except OSError:
-            return
-        if self._bg.add(proc.pid):  # decided under the lock, so a watcher that is just exiting can't miss this group
+            if job is None:
+                return  # (no job: Windows refused one) nothing can find them once their parent is gone
+            if not job.active():  # processes left in the command's job?
+                job.close()
+                return
+            group = job
+        else:
+            try:
+                os.killpg(proc.pid, 0)  # members left in the command's process group?
+            except OSError:
+                return
+            group = proc.pid
+        if self._bg.add(group):  # decided under the lock, so a watcher that is just exiting can't miss this group
             self._watcher = threading.Thread(target=_watch_background, args=(weakref.ref(self), self._bg), daemon=True)
             self._watcher.start()
 
@@ -1164,19 +1185,155 @@ def docker_argv(root: Path, command: str, name: str) -> list[str]:
     ]
 
 
-def _kill_tree(proc: subprocess.Popen, container: str | None = None) -> None:
+def _kill_tree(proc: subprocess.Popen, container: str | None = None, job: _WinJob | None = None) -> None:
     if container:
         try:
-            subprocess.run(["docker", "kill", container], capture_output=True, timeout=20)
+            subprocess.run(["docker", "kill", container], capture_output=True, timeout=20, **_NO_WINDOW)
         except (OSError, subprocess.SubprocessError):
             pass
     try:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=20)
+            if job is not None and job.kill():
+                return  # every process the command started, also those whose parent is gone
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=20, **_NO_WINDOW)
         else:
             os.killpg(proc.pid, signal.SIGKILL)
     except (OSError, subprocess.SubprocessError):
         pass
+
+
+# Helpers started from the desktop app (a window, no console) must not flash a console window of their own.
+_NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+_CREATE_SUSPENDED = 0x00000004
+
+
+class _WinJob:
+    """Windows has no process groups: a command runs in a job object instead (started suspended and let go once it is
+    in its job, so not even its first child starts outside). Stop, a timeout and the run's end kill everything in the
+    job, also what outlived the command (`server &`, Start-Process): taskkill /T only finds the children of a live
+    process, and a background process's parent — the shell — is gone by then. The job kills what is left when its
+    last handle closes (KILL_ON_JOB_CLOSE), so nothing a command started outlives Nesicode, even when Nesicode itself
+    is killed. No breakaway: Python's launchers (a venv's python.exe, py.exe) put their interpreter in a job of their
+    own that lets children go silently, and they would leave ours too if it allowed it (they stop at the first job
+    up the chain that does not)."""
+
+    _api: tuple | None = None
+    _api_failed = False
+    _api_lock = threading.Lock()
+
+    def __init__(self, handle: int):
+        self._handle: int | None = handle
+        self._lock = threading.Lock()
+
+    @classmethod
+    def _load(cls) -> tuple | None:
+        with cls._api_lock:
+            if cls._api is None and not cls._api_failed:
+                try:
+                    cls._api = _win_job_api()
+                except Exception as exc:  # noqa: BLE001 - commands still run (their tree killed with taskkill)
+                    cls._api_failed = True
+                    print("nesicode: Windows job objects are not available:", exc)
+            return cls._api
+
+    @classmethod
+    def ready(cls) -> bool:
+        return os.name == "nt" and cls._load() is not None
+
+    @classmethod
+    def adopt(cls, proc: subprocess.Popen) -> _WinJob | None:
+        """Put a command started suspended in a new job, then let it run. None: Windows refused the job (the command
+        runs all the same; its tree is then killed with taskkill /T). OSError: it could not be let go (it never ran)."""
+        ctypes, k32, ntdll, extended, _ = cls._load()
+        process = k32.OpenProcess(0x0800 | 0x0100 | 0x0001, False, proc.pid)  # SUSPEND_RESUME | SET_QUOTA | TERMINATE
+        if not process:
+            raise ctypes.WinError(ctypes.get_last_error())
+        job = None
+        try:
+            job = k32.CreateJobObjectW(None, None)
+            info = extended()
+            info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if job and not (k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))  # extended limits
+                            and k32.AssignProcessToJobObject(job, process)):
+                k32.CloseHandle(job)  # (it holds no process)
+                job = None
+        except Exception as exc:  # noqa: BLE001 - no job then (the command still runs, killed with taskkill /T)
+            print("nesicode: could not put a command in a job object:", exc)
+            if job:
+                k32.CloseHandle(job)
+            job = None
+        finally:
+            status = ntdll.NtResumeProcess(process)
+            k32.CloseHandle(process)
+        if status != 0:
+            if job:
+                k32.CloseHandle(job)  # KILL_ON_JOB_CLOSE: the suspended command goes with it
+            raise OSError(f"could not resume the command (NTSTATUS {status & 0xFFFFFFFF:#010x})")
+        return cls(job) if job else None
+
+    def active(self) -> int:
+        """How many processes of the command are still running (1 when it cannot be told: kept until killed)."""
+        ctypes, k32, _, _, accounting = self._api
+        with self._lock:
+            if not self._handle:
+                return 0
+            acct = accounting()
+            if not k32.QueryInformationJobObject(self._handle, 1, ctypes.byref(acct), ctypes.sizeof(acct), None):
+                return 1
+            return int(acct.ActiveProcesses)
+
+    def kill(self) -> bool:
+        """Kill every process in the job and let the job go. False if Windows refused (or it was gone already)."""
+        _, k32, _, _, _ = self._api
+        with self._lock:
+            handle, self._handle = self._handle, None
+        if not handle:
+            return False
+        ok = bool(k32.TerminateJobObject(handle, 1))
+        k32.CloseHandle(handle)  # (KILL_ON_JOB_CLOSE: what TerminateJobObject missed goes now)
+        return ok
+
+    close = kill  # a job with nothing left: closing it is all there is to do
+
+
+def _win_job_api() -> tuple:
+    """kernel32's job object functions and structures (Windows only), set up once."""
+    import ctypes
+    from ctypes import wintypes as w
+
+    class Basic(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", w.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", w.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", w.DWORD), ("SchedulingClass", w.DWORD)]
+
+    class Extended(ctypes.Structure):  # JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        _fields_ = [("BasicLimitInformation", Basic), ("IoInfo", ctypes.c_uint64 * 6),
+                    ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    class Accounting(ctypes.Structure):  # JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+        _fields_ = [("TotalUserTime", ctypes.c_int64), ("TotalKernelTime", ctypes.c_int64),
+                    ("ThisPeriodTotalUserTime", ctypes.c_int64), ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+                    ("TotalPageFaultCount", w.DWORD), ("TotalProcesses", w.DWORD),
+                    ("ActiveProcesses", w.DWORD), ("TotalTerminatedProcesses", w.DWORD)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # (own instances: argtypes never clash with other users')
+    ntdll = ctypes.WinDLL("ntdll")
+    for name, res, args in (
+        ("OpenProcess", w.HANDLE, (w.DWORD, w.BOOL, w.DWORD)),
+        ("CloseHandle", w.BOOL, (w.HANDLE,)),
+        ("CreateJobObjectW", w.HANDLE, (w.LPVOID, w.LPCWSTR)),
+        ("SetInformationJobObject", w.BOOL, (w.HANDLE, ctypes.c_int, w.LPVOID, w.DWORD)),
+        ("QueryInformationJobObject", w.BOOL, (w.HANDLE, ctypes.c_int, w.LPVOID, w.DWORD, w.LPDWORD)),
+        ("AssignProcessToJobObject", w.BOOL, (w.HANDLE, w.HANDLE)),
+        ("TerminateJobObject", w.BOOL, (w.HANDLE, w.UINT)),
+    ):
+        fn = getattr(k32, name)
+        fn.restype, fn.argtypes = res, args
+    # (NtResumeProcess: the one call that lets a whole suspended process go — subprocess keeps no thread handle)
+    ntdll.NtResumeProcess.restype, ntdll.NtResumeProcess.argtypes = ctypes.c_long, (w.HANDLE,)
+    return ctypes, k32, ntdll, Extended, Accounting
 
 
 class _Capture:
@@ -1231,14 +1388,14 @@ class _Capture:
 
 
 class _Background:
-    """Process groups a workspace's commands left running."""
+    """Process groups (Windows: jobs, see _WinJob) a workspace's commands left running."""
 
     def __init__(self):
-        self.groups: set[int] = set()
+        self.groups: set[int | _WinJob] = set()
         self.lock = threading.Lock()
         self.watched = False  # a watcher thread is running (or about to) for these groups
 
-    def add(self, pgid: int) -> bool:
+    def add(self, pgid: int | _WinJob) -> bool:
         """Track a group; True when the caller must start a watcher (none is running)."""
         with self.lock:
             self.groups.add(pgid)
@@ -1250,6 +1407,11 @@ class _Background:
         is, the watcher stops, and the next add() starts a new one (both under the lock: no group is left unwatched)."""
         with self.lock:
             for g in list(self.groups):
+                if isinstance(g, _WinJob):
+                    if not g.active():  # every process in it has ended
+                        g.close()
+                        self.groups.discard(g)
+                    continue
                 try:
                     os.killpg(g, 0)
                 except (ProcessLookupError, PermissionError):  # gone, or the id now belongs to another user's process
@@ -1263,6 +1425,9 @@ class _Background:
         with self.lock:
             groups, self.groups = self.groups, set()
         for g in groups:
+            if isinstance(g, _WinJob):
+                g.kill()
+                continue
             try:
                 os.killpg(g, signal.SIGKILL)
             except OSError:
@@ -1286,7 +1451,7 @@ def _watch_background(ws_ref, bg: _Background) -> None:
 def _kill_containers() -> None:
     for name in list(_CONTAINERS):
         try:
-            subprocess.run(["docker", "kill", name], capture_output=True, timeout=20)
+            subprocess.run(["docker", "kill", name], capture_output=True, timeout=20, **_NO_WINDOW)
         except (OSError, subprocess.SubprocessError):
             pass
 
