@@ -630,10 +630,11 @@ class TelegramBridge:
                          daemon=True, name="nesi-tg-bot").start()
 
     def _bots(self, chat_id: int) -> None:
-        rows = self.db.all("SELECT id, name, enabled FROM bots WHERE user_id=? ORDER BY name", (self.user_id,))
+        rows = self.db.all("SELECT id, name, enabled, completed_at FROM bots WHERE user_id=? ORDER BY name", (self.user_id,))
         if not rows:
             return self.send(chat_id, "No tienes bots. Créalos en la app (Bots) o pídeselo al agente: «hazme un bot que…».")
-        buttons = [[{"text": ("▶ " if r["enabled"] else "⏸ ") + r["name"][:50], "callback_data": f"b:{r['id']}"}] for r in rows]
+        mark = lambda r: "▶ " if r["enabled"] else "✅ " if r["completed_at"] else "⏸ "  # noqa: E731 (✅ = its task is done)
+        buttons = [[{"text": mark(r) + r["name"][:50], "callback_data": f"b:{r['id']}"}] for r in rows]
         self.send(chat_id, "🤖 Tus bots — pulsa uno para lanzarlo ahora, o escribe /bot <nombre> <instrucción>:", buttons)
 
     def _bot_command(self, chat_id: int, rest: str) -> None:

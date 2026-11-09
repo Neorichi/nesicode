@@ -1415,7 +1415,8 @@ class Jobs:
             "Create a Nesicode bot: a standing instruction the agent runs on its own on a schedule (cron/interval), when "
             "a web page changes (url), from Telegram (/bot <name>) or by hand. Use it when the user asks for something "
             "recurring or automatic ('every morning…', 'tell me when…'). The user approves it before it is created. "
-            "Write `instructions` as a complete, self-contained brief (what to check, how to report, what counts as news). "
+            "Write `instructions` as a complete, self-contained brief (what to check, how to report, what counts as news; "
+            "for a goal with an end, that it switches itself off with bot_finish once it is reached). "
             "policy: ask (default: asks the user before writing files, running commands or using connectors), readonly, auto.",
             {"type": "object", "properties": {
                 "name": {"type": "string"}, "description": {"type": "string"}, "instructions": {"type": "string"},

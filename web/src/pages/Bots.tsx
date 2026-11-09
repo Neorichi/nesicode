@@ -14,6 +14,7 @@ export type Bot = {
   id: number; project_id: number; project: string; name: string; description: string; instructions: string; model: string
   policy: 'ask' | 'readonly' | 'auto'; max_steps: number; daily_cap: number; notify: 'telegram' | 'none'; thread_id: number | null
   enabled: boolean; paused_reason: string; fail_streak: number; next_at: number | null; last_run_at: number | null
+  completed_at?: number | null // it switched itself off: its goal was reached (paused_reason says what was achieved)
   last_run?: { id: number; status: string; trigger: string } | null; webhook: boolean; triggers: Trigger[]
   memory?: { key: string; value: string; updated_at: number }[]; runs?: RunRow[]; windows?: boolean
 }
@@ -142,7 +143,7 @@ export default function BotsPage() {
               <span>{b.notify === 'telegram' ? '✈ Telegram' : t('sin avisos')}</span>
             </div>
             <div className="bot-meta small">
-              {b.enabled ? <span>{t('Próxima')}: <b>{when(b.next_at)}</b></span> : <span className="warn">⏸ {b.paused_reason || t('En pausa')}</span>}
+              {b.enabled ? <span>{t('Próxima')}: <b>{when(b.next_at)}</b></span> : <PausedNote b={b} />}
               {b.last_run && <span>{t('Última')}: <StatusDot s={b.last_run.status} /> {when(b.last_run_at)}</span>}
             </div>
             <div className="row wrap">
@@ -155,6 +156,12 @@ export default function BotsPage() {
       </div>
     </div>
   )
+}
+
+/** Why a bot is off: its task is done (it switched itself off), or it is paused (by the user, or after failures). */
+export function PausedNote({ b }: { b: Pick<Bot, 'paused_reason' | 'completed_at'> }) {
+  if (b.completed_at) return <span className="done">✅ {t('Tarea cumplida')}{b.paused_reason ? `: ${b.paused_reason}` : ''}</span>
+  return <span className="warn">⏸ {b.paused_reason || t('En pausa')}</span>
 }
 
 function StatusDot({ s }: { s: string }) {
@@ -440,7 +447,7 @@ export function BotDetail() {
         </div>
       </header>
       {error && <div className="error-box">{error}</div>}
-      {!b.enabled && <div className="hint-box">⏸ {b.paused_reason || t('En pausa')}</div>}
+      {!b.enabled && <div className="hint-box"><PausedNote b={b} /></div>}
 
       <div className="card">
         <div className="bot-meta">

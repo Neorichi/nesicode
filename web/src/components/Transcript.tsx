@@ -305,6 +305,8 @@ function EventRow({ e, result, decision, retries, current, runId, status }: RowP
       return <div className="retry-note muted">⚠ {compactionErrorText(e.text)}</div>
     case 'notify':
       return <div className="auto-note">📣 {e.sent ? t('Aviso enviado por Telegram') : t('Aviso')}: {e.text}</div>
+    case 'bot_finished':
+      return <div className="auto-note">✅ {t('Tarea cumplida: el bot se ha desactivado')} — {e.text}</div>
     case 'bot_created':
       return <div className="auto-note">🤖 {t('Bot creado')}: <Link to={`/bots/${e.bot_id}`}><b>{e.name}</b></Link> — {t('gestiónalo en la página Bots')}</div>
     case 'connector_error':

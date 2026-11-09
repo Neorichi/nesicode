@@ -236,6 +236,9 @@ MIGRATIONS = [
     # folders of the user's the agent may READ (never change) in this project's chat and bot runs: a JSON list of
     # canonical absolute paths, validated by server/read_dirs.py; [] = none (the default)
     ("projects", "read_dirs", "TEXT NOT NULL DEFAULT '[]'"),
+    # when the bot switched itself off because its goal was reached (bot_finish; its reason is in paused_reason);
+    # NULL = it did not. Switching the bot on again clears both.
+    ("bots", "completed_at", "REAL"),
 ]
 
 

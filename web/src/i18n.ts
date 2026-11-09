@@ -777,6 +777,8 @@ const EN: Record<string, string> = {
   'sin avisos': 'no notifications',
   'Próxima': 'Next',
   'En pausa': 'Paused',
+  'Tarea cumplida': 'Task done',
+  'Tarea cumplida: el bot se ha desactivado': 'Task done: the bot switched itself off',
   'Última': 'Last',
   'Ejecutar ahora': 'Run now',
   'Abrir': 'Open',

@@ -381,7 +381,7 @@ export function triggerWords(c: { usage?: string; trigger_words?: unknown }): st
  */
 export const KNOWN_EVENTS = new Set([
   'start', 'assistant', 'thinking', 'tool_call', 'tool_result', 'error', 'cancelled', 'done', 'llm_retry', 'context',
-  'context_learned', 'masked', 'compacted', 'compaction_error', 'image', 'file', 'notify', 'bot_created',
+  'context_learned', 'masked', 'compacted', 'compaction_error', 'image', 'file', 'notify', 'bot_created', 'bot_finished',
   'connector_error', 'auto_harness', 'auto_harness_skipped', 'auto_harness_error', 'approval_request',
   'approval_result', 'phase', 'stage', 'rollout', 'selected', 'applied', 'adopted', 'adopt_skipped', 'lesson',
 ])

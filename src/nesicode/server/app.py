@@ -1066,8 +1066,8 @@ def _bot_view(b: dict, full: bool = False) -> dict:
     nxt = min((t["next_at"] for t in trig if t["next_at"] and t["kind"] in ("cron", "interval", "once", "url") and t["enabled"]),
               default=None)
     out = {**{k: b[k] for k in ("id", "project_id", "name", "description", "instructions", "model", "policy", "max_steps",
-                               "daily_cap", "notify", "thread_id", "fail_streak", "paused_reason", "last_run_at",
-                               "created_at", "updated_at")},
+                               "daily_cap", "notify", "thread_id", "fail_streak", "paused_reason", "completed_at",
+                               "last_run_at", "created_at", "updated_at")},
            "enabled": bool(b["enabled"]), "project": project["name"] if project else "", "next_at": nxt if b["enabled"] else None,
            "last_run": last, "webhook": any(t["kind"] == "webhook" for t in trig),
            "triggers": [{k: t[k] for k in ("id", "kind", "spec", "tz", "prompt", "next_at", "last_at", "enabled")}
@@ -1226,7 +1226,9 @@ def draft_bot(body: BotDraft, user: dict = Depends(current_user)):
     prompt = (
         "Turn the user's request into a JSON bot configuration for Nesicode. Reply with ONLY a JSON object:\n"
         '{"name": short name, "description": one line, "instructions": complete self-contained brief for an unattended '
-        'agent (what to check, how to report, when to stay silent by answering NOTHING_NEW), written in the user\'s language, '
+        'agent (what to check, how to report, when to stay silent by answering NOTHING_NEW, and — if the goal has an end, '
+        'like "tell me when X happens" — to switch itself off with bot_finish once it is reached and reported), written in '
+        'the user\'s language, '
         '"triggers": [' + cron + ' | {"kind": "interval", "spec": "30" (minutes) or "2h"} '
         '| {"kind": "url", "spec": "https://…", "config": {"every": 30}}] (empty list if it should only run on demand), '
         '"policy": "readonly" if it only needs to read/fetch/report, else "ask"}\n\nUser request:\n' + body.description
