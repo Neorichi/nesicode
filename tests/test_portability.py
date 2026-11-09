@@ -1,10 +1,12 @@
-"""Portability guards: what makes the product behave differently on Windows than on macOS, caught on any OS.
+r"""Portability guards: what made the product behave differently on Windows than on macOS, checked on any OS.
 
-Python reads and writes text in the locale's code page unless told otherwise — cp1252 on a Windows machine set up in
-Spanish or English, UTF-8 on macOS and Linux. A file written without naming its encoding is UTF-8 on a Mac and cp1252
-on Windows (an «ó» or a «—» comes back as «Ã³», or the write fails with UnicodeEncodeError), and so is the output of a
-subprocess decoded with `text=True`. So every text read or write in src/ names its encoding; this test fails on the
-first one that does not, wherever it runs."""
+Text: Python reads and writes text in the locale's code page unless told otherwise (cp1252 on a Windows machine set up
+in Spanish or English, UTF-8 on macOS and Linux), so a file written without naming its encoding, or a subprocess's
+output decoded with `text=True`, turns «ó» into «Ã³» or fails with UnicodeEncodeError there. Every text read or write in
+src/ names its encoding: the AST guard below fails on the first one that does not, wherever it runs.
+
+Paths: workspace paths are spelled with '/' for the agent, the API and the UI on every OS, and a link's target is shown
+as it was written (Windows reads an absolute one back as \\?\C:\…)."""
 
 import ast
 import os
@@ -153,7 +155,8 @@ def test_workspace_paths_in_tool_outputs_use_slashes(tmp_path):
     ws = Workspace(tmp_path / "ws")
     assert ws.rel(ws.root / "sub" / "dir" / "f.txt") == "sub/dir/f.txt" and ws.rel(ws.root) == "."
     assert write_file(ws, {"path": "sub/dir/f.txt", "content": "hola\n"}) == "created sub/dir/f.txt (5 chars)"
-    assert edit_file(ws, {"path": "sub/dir/f.txt", "old": "hola", "new": "adiós"}) == "edited sub/dir/f.txt (1 replacement(s))"
+    edited = edit_file(ws, {"path": "sub/dir/f.txt", "old": "hola", "new": "adiós"})
+    assert edited == "edited sub/dir/f.txt (1 replacement(s))"
     assert search(ws, {"pattern": "adiós"}) == "sub/dir/f.txt:1: adiós"
     assert search(ws, {"pattern": "adi", "glob": "sub/**/*.txt"}).startswith("sub/dir/f.txt:1: ")
     assert "sub/dir/f.txt" in manifest(ws.root)
