@@ -148,7 +148,7 @@ def _adopt_login_path() -> None:
     shell = os.environ.get("SHELL") or ("/bin/zsh" if sys.platform == "darwin" else "/bin/bash")
     try:
         out = subprocess.run([shell, "-ilc", "printf '__NESI_PATH__%s' \"$PATH\""], capture_output=True,
-                             text=True, timeout=10).stdout
+                             encoding="utf-8", errors="surrogateescape", timeout=10).stdout
     except Exception:
         return
     if "__NESI_PATH__" in out:

@@ -12,7 +12,8 @@ from typing import Callable
 from ..harness import Harness, skills, sub_agents
 from ..llm import ToolSpec
 from .workspace import (
-    IGNORE_DIRS, ToolError, Workspace, _walk, codec_note, decode_text, encode_text, shell_name, shown, text_codec,
+    IGNORE_DIRS, ToolError, Workspace, _walk, codec_note, decode_text, encode_text, link_text, shell_name, shown,
+    text_codec,
 )
 
 MAX_READ_LINES = 2000
@@ -77,7 +78,7 @@ def list_dir(ws: Workspace, args: dict) -> str:
             try:
                 if e.is_symlink():  # shown, never followed: it may point out of the workspace
                     try:
-                        target = os.readlink(e.name, dir_fd=d) if isinstance(d, int) else os.readlink(e.path)
+                        target = link_text(os.readlink(e.name, dir_fd=d) if isinstance(d, int) else os.readlink(e.path))
                         lines.append(f"{pad}{e.name} -> {target}")
                     except OSError:
                         lines.append(f"{pad}{e.name} -> ?")

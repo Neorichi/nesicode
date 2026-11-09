@@ -869,7 +869,7 @@ def test_auto_apply_is_three_way_and_drops_the_copies(env, monkeypatch, tmp_path
     if meanwhile == "file":
         assert (proj / "NESICODE_RESULT.md").read_text() == "lo escribió el usuario mientras tanto\n"
     else:
-        assert os.readlink(proj / "NESICODE_RESULT.md") == str(victim)
+        assert os.readlink(proj / "NESICODE_RESULT.md").removeprefix("\\\\?\\") == str(victim)  # (Windows: \\?\C:\…)
     rd = run_dir(p, rid)
     assert not (rd / "source").exists() and not list(rd.glob("rollouts/*/ws"))  # applied: no copy is kept
     assert list(rd.glob("rollouts/*/trajectory.txt"))
