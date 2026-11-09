@@ -1,6 +1,9 @@
 import os
 import tempfile
 
+# (nesicode refuses to load under pytest without this: see config.py — a test run from outside this folder skips this
+# file and would otherwise open the real data dir as the real local account)
+os.environ["NESICODE_TEST_ISOLATED"] = "1"
 os.environ["NESICODE_NO_DOTENV"] = "1"  # never read the developer's real .env (keys, models)
 for _k in [k for k in os.environ if k.endswith("_API_KEY")]:
     del os.environ[_k]

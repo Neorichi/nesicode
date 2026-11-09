@@ -73,6 +73,15 @@ def app_data_dir() -> Path:
     return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "nesicode"
 
 
+# Under pytest, never the real data dir, vault key or .env: tests run through tests/conftest.py, which isolates all of
+# them and sets NESICODE_TEST_ISOLATED. A test file run from elsewhere skips that conftest, and once opened ./data (the
+# dev server's database) as the local account — its fixtures deleted that account's bots. Refuse before touching anything.
+if "pytest" in sys.modules and os.environ.get("NESICODE_TEST_ISOLATED") != "1":
+    raise RuntimeError(
+        "nesicode imported under pytest without tests/conftest.py: refusing to open the real data dir, keys and .env. "
+        "Run the test from the repo's tests folder, or put a copy of tests/conftest.py next to it."
+    )
+
 IS_DESKTOP = getattr(sys, "frozen", False) or os.environ.get("NESICODE_DESKTOP") == "1"
 if IS_DESKTOP:
     os.environ.setdefault("NESICODE_DATA_DIR", str(app_data_dir() / "data"))
