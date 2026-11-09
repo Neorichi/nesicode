@@ -512,3 +512,9 @@ export function splitExit(name: string, output: unknown): { code: number | null;
   const m = /^exit code: (-?\d+)\r?\n?/.exec(text)
   return m ? { code: Number(m[1]), body: text.slice(m[0].length) } : { code: null, body: text }
 }
+
+/** Ctrl+T (or ⌘T): a new conversation in the current project. The desktop app gets it; a browser keeps the shortcut
+ * for its own tabs (page scripts cannot take it there). */
+export function isNewChatShortcut(e: { key: string; ctrlKey: boolean; metaKey: boolean; shiftKey: boolean; altKey: boolean }): boolean {
+  return (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 't'
+}

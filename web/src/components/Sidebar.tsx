@@ -4,6 +4,7 @@ import { api, relTime, switchLang, type Thread } from '../api'
 import { t, useLang } from '../i18n'
 import { useApp } from '../App'
 import { forgetDraft } from '../drafts'
+import { isNewChatShortcut } from '../logic'
 
 const PAGE = 100 // conversations shown before «Ver más»
 
@@ -57,6 +58,18 @@ export default function Sidebar({ onNavigate }: { onNavigate: () => void }) {
   const loaded = threadsPid === pid
   const [limit, setLimit] = useState(PAGE)
   useEffect(() => setLimit(PAGE), [pid])
+  // Ctrl+T / ⌘T opens a new conversation in this project (see isNewChatShortcut)
+  useEffect(() => {
+    if (!project) return
+    const onKey = (e: KeyboardEvent) => {
+      if (!isNewChatShortcut(e)) return
+      e.preventDefault()
+      navigate(`/p/${project.id}`)
+      onNavigate()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [project?.id, navigate, onNavigate])
   const [userMenu, setUserMenu] = useState(false)
   const [error, setError] = useState('')
   const [lang] = useLang()
