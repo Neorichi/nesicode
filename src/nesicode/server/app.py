@@ -130,6 +130,12 @@ def _upgrade_shipped_harness() -> None:
 
 # (first: the next upgrade recognises an untouched older base harness by today's hooks and tool guidance)
 _upgrade_shipped_harness()
+try:  # «Chrome» (the separate DevTools Chrome from early galleries) → «Chrome aparte (DevTools)»
+    from ..connectors import rename_legacy_labels
+
+    rename_legacy_labels(db)
+except Exception as exc:  # never keeps the app from starting
+    print("nesicode: could not rename old connector labels:", exc)
 
 
 def _upgrade_base_harness() -> None:

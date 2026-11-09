@@ -161,11 +161,19 @@ def _phrase_re(words: list[str]) -> re.Pattern:
                                      for w in words) + " ")
 
 
+def _browser_word(name: str) -> bool:
+    """Words that mean the user's own Chrome (the extension): «abre chrome» is their browser, never a second one."""
+    return _norm(name) in {_norm(a) for a in ALIASES["browser"]}
+
+
 def trigger_words(name: str = "", label: str = "", template: str = "") -> list[str]:
     """The words that switch an 'only when I ask' connector on (for the UI / the agent's suggestion)."""
     custom = template not in ALIASES
     whole = label.split("(")[0]
-    phrases = [whole, name] if custom else list(ALIASES[template]) + [name]
+    # A gallery connector's name is its id: for the separate DevTools Chrome that is 'chrome', a word of the user's
+    # own Chrome (the extension) — it must not switch the separate one on (its aliases name it well enough).
+    own = [] if template != "browser" and _browser_word(name) else [name]
+    phrases = [whole, name] if custom else list(ALIASES[template]) + own
     if custom:  # plus each distinctive word of its label and name ('Confluence empresa' → 'confluence')
         for src in (label, name):
             words = [w for w in _norm(src).split() if w not in _GENERIC]
@@ -201,6 +209,19 @@ def mentioned(text: str, *, name: str = "", label: str = "", template: str = "")
 
 def catalog_entry(template_id: str) -> dict | None:
     return next((c for c in CATALOG if c["id"] == template_id), None)
+
+
+# Labels that gallery connectors installed by early versions still carry, and today's: «Chrome» next to the
+# «Tu Chrome (extensión)» card read as the same browser twice.
+LEGACY_LABELS = {("chrome", "Chrome"): "Chrome aparte (DevTools)"}
+
+
+def rename_legacy_labels(db) -> int:
+    """Give gallery connectors that still carry an old default label today's (a label the user chose is kept)."""
+    n = 0
+    for (template, old), new in LEGACY_LABELS.items():
+        n += db.execute("UPDATE user_connectors SET label=? WHERE template=? AND label=?", (new, template, old)).rowcount
+    return n
 
 
 def missing_requirements(entry: dict) -> list[str]:
