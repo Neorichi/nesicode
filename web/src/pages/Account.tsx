@@ -116,10 +116,10 @@ export default function Account() {
             </label>
             <label>
               {t('Máximo al día')}
-              <NumberSetting min={1} max={50} value={prefs.auto_harness_daily} onCommit={(n) => update({ auto_harness_daily: n })} />
+              <NumberSetting min={0} max={50} value={prefs.auto_harness_daily} onCommit={(n) => update({ auto_harness_daily: n })} />
               {t('ejecuciones')}
             </label>
-            <div className="muted small">{t('También se lanza si agota el límite de pasos. Nunca dos a la vez en el mismo proyecto.')}</div>
+            <div className="muted small">{t('También se lanza si agota el límite de pasos. Nunca dos a la vez en el mismo proyecto.')} {t('0 = sin límite diario.')}</div>
           </div>
         )}
       </div>

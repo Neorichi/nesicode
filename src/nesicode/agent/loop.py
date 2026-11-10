@@ -184,7 +184,7 @@ class Agent:
         workspace: Workspace,
         emit: Emit | None = None,
         user_keys: dict[str, str] | None = None,
-        max_steps: int = 60,
+        max_steps: int = 60,  # 0 = no step cap: run until the model gives a final answer, is cancelled, or fills context
         effort: str = "high",
         role: str = "executor",
         cancel: threading.Event | None = None,
@@ -1236,7 +1236,7 @@ class Agent:
                 if self.cancel.is_set():
                     raise Cancelled()
                 conv = self._after_step(conv, provider, model, system, options, turn, results)
-                if steps >= self.max_steps and not self._nudged:
+                if self.max_steps and steps >= self.max_steps and not self._nudged:  # max_steps == 0: no step cap
                     self._add_user(conv, FINAL_NUDGE)
                     self._nudged = True
         except Cancelled:

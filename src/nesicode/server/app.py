@@ -1850,7 +1850,7 @@ class ProjectCreate(BaseModel):
     executor_model: str = ""
     improver_model: str = ""
     check_command: str = Field(default="", max_length=1000)
-    max_steps: int = Field(default=60, ge=5, le=300)
+    max_steps: int = Field(default=60, ge=0, le=300)  # 0 = sin límite: el agente sigue hasta terminar la tarea
     git_url: str = Field(default="", max_length=500)
     vision_model: str = Field(default="", max_length=200)
     image_model: str = Field(default="", max_length=200)
@@ -1866,7 +1866,7 @@ class ProjectPatch(BaseModel):
     executor_model: str | None = None
     improver_model: str | None = None
     check_command: str | None = Field(default=None, max_length=1000)
-    max_steps: int | None = Field(default=None, ge=5, le=300)
+    max_steps: int | None = Field(default=None, ge=0, le=300)  # 0 = sin límite
     vision_model: str | None = Field(default=None, max_length=200)
     image_model: str | None = Field(default=None, max_length=200)
     transcribe_model: str | None = Field(default=None, max_length=200)
@@ -2559,7 +2559,7 @@ class UserSettings(BaseModel):
     exec_mode: str | None = Field(default=None, pattern="^(auto|ask_bash|ask_all)$")
     share_workspace: bool | None = None
     auto_harness: bool | None = None
-    auto_harness_daily: int | None = Field(default=None, ge=1, le=50)
+    auto_harness_daily: int | None = Field(default=None, ge=0, le=50)  # 0 = sin límite diario
     auto_harness_min_steps: int | None = Field(default=None, ge=3, le=300)
     auto_harness_min_errors: int | None = Field(default=None, ge=1, le=50)
     browser_usage: str | None = Field(default=None, pattern="^(mention|auto|ask)$")

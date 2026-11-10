@@ -180,6 +180,31 @@ def test_absolutize_mcp_paths(tmp_path):
     assert out["output_path"] == "/abs/x.pptx" and out["count"] == 3
 
 
+def test_max_steps_zero_has_no_step_cap(tmp_path, monkeypatch):
+    """max_steps=0 means «sin límite»: the run only ends when the model gives a final answer (objetivo cumplido),
+    not after a fixed number of steps. A positive cap still stops the run as before."""
+    from nesicode.llm import ToolCall
+    from nesicode.llm.mock import MockConversation
+
+    FINISH_AT = 8  # the scripted model calls a tool 8 times, then answers — more than the small cap below
+
+    def step(self, on_event=None):
+        n = self.steps  # _reply() increments it, mirroring the real executor
+        if n < FINISH_AT:
+            return self._reply(f"paso {n}", [ToolCall(f"c{n}", "list_dir", {"path": "."})], on_event)
+        return self._reply("Hecho: objetivo cumplido.", on_event=on_event)
+
+    monkeypatch.setattr(MockConversation, "step", step)
+    # a small cap stops the run early, as max_steps
+    capped = Agent(model="mock/demo", harness=base_harness(), workspace=Workspace(tmp_path / "cap"),
+                   max_steps=3).run("hazlo")
+    assert capped.status == "max_steps" and capped.steps <= 5
+    # 0 = no cap: it runs every step the model needs and ends naturally as done
+    free = Agent(model="mock/demo", harness=base_harness(), workspace=Workspace(tmp_path / "free"),
+                 max_steps=0).run("hazlo")
+    assert free.status == "done" and free.steps >= FINISH_AT
+
+
 def test_context_compaction(tmp_path):
     events = []
     a = Agent(model="mock/demo", harness=base_harness(), workspace=Workspace(tmp_path / "ws"),

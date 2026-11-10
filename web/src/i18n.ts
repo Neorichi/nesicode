@@ -464,6 +464,7 @@ const EN: Record<string, string> = {
   'Los proyectos del mismo dominio comparten lecciones.': 'Projects in the same domain share lessons.',
   'Comando de verificación': 'Check command',
   'Máximo de pasos por respuesta': 'Max steps per answer',
+  '0 = sin límite: el agente sigue hasta terminar la tarea.': '0 = no limit: the agent keeps going until the task is done.',
   'Modelos por función': 'Models by role',
   'Chat': 'Chat',
   'el agente que trabaja en las conversaciones': 'the agent that works in conversations',
@@ -574,6 +575,7 @@ const EN: Record<string, string> = {
   'ejecuciones': 'runs',
   'También se lanza si agota el límite de pasos. Nunca dos a la vez en el mismo proyecto.':
     'It also triggers when the step limit is hit. Never two at once in the same project.',
+  '0 = sin límite diario.': '0 = no daily limit.',
   'Proveedores y API keys': 'Providers and API keys',
   'Se gestionan en': 'Managed in',
   'Son de tu cuenta y valen para todos tus proyectos; las keys van a la bóveda cifrada.':

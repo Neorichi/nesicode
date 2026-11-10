@@ -854,6 +854,39 @@ def test_auto_improve_never_reruns_a_gated_conversation(alice):
         alice.put("/api/me/settings", json={"auto_harness": False})
 
 
+def test_auto_improve_daily_cap_zero_is_unlimited(alice, monkeypatch):
+    """auto_harness_daily = 0 means «sin límite»: the per-day cap no longer blocks a relaunch, however many ran today."""
+    from nesicode.agent.loop import AgentResult
+    from nesicode.server.app import db, jobs
+
+    p = _project(alice)
+    t = alice.post(f"/api/projects/{p['id']}/threads", json={}).json()
+    run = alice.post(f"/api/threads/{t['id']}/messages", json={"text": "hola"}).json()
+    _wait_run(alice, run["id"])
+    row = db.one("SELECT * FROM runs WHERE id=?", (run["id"],))
+    proj = db.one("SELECT * FROM projects WHERE id=?", (p["id"],))
+    thr = db.one("SELECT * FROM threads WHERE id=?", (t["id"],))
+    # two auto-harness runs already in the last 24h (enough to trip any positive cap)
+    for _ in range(2):
+        db.insert("INSERT INTO runs (project_id, thread_id, kind, task, status, params, created_at) VALUES (?,?,?,?,?,?,?)",
+                  (p["id"], t["id"], "harness", "x", "done", json.dumps({"source": {"auto": True}}), time.time()))
+    monkeypatch.setattr(jobs, "improve_from_chat", lambda run, project, *, auto, reason="": 999)
+    res = AgentResult("hecho", "max_steps", 61, Usage(), [])
+    try:
+        # a positive cap of 2, with two already today → blocked
+        alice.put("/api/me/settings", json={"auto_harness": True, "auto_harness_min_steps": 3, "auto_harness_daily": 2})
+        ev = []
+        jobs._auto_improve(row, proj, thr, res, ev.append)
+        assert [x["type"] for x in ev] == ["auto_harness_skipped"] and "límite diario" in ev[0]["why"]
+        # 0 = sin límite → it relaunches despite the two earlier runs
+        alice.put("/api/me/settings", json={"auto_harness": True, "auto_harness_min_steps": 3, "auto_harness_daily": 0})
+        ev2 = []
+        jobs._auto_improve(row, proj, thr, res, ev2.append)
+        assert [x["type"] for x in ev2] == ["auto_harness"] and ev2[0]["run_id"] == 999
+    finally:
+        alice.put("/api/me/settings", json={"auto_harness": False})
+
+
 # jobs-runtime#5 (+ #19: a cancelled run keeps no copy of the project)
 def test_stop_during_the_last_stage_applies_adopts_and_learns_nothing(alice, monkeypatch):
     from nesicode.harnessing.engine import HarnessingRun

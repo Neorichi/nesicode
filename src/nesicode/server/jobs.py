@@ -1342,7 +1342,8 @@ class Jobs:
             steps, system_base = project["max_steps"], None
             if bot and self.bots:
                 tools.update(self.bots.agent_tools(bot, run_id))
-                steps = min(steps, bot["max_steps"])
+                caps = [n for n in (steps, bot["max_steps"]) if n]  # 0 = sin límite; el tope del bot sigue acotando
+                steps = min(caps) if caps else 0
                 system_base = (harness.get("system_prompt.md", "").strip() + "\n\n"
                                + self.bots.system_section(bot, run.get("trigger") or "", run_id=run_id))
             agent = Agent(
@@ -1630,14 +1631,15 @@ class Jobs:
             emit({"type": "auto_harness_skipped", "reason": reason, "why": "ya hay un harnessing en curso en este proyecto"})
             return
         cap = int(prefs.get("auto_harness_daily", 3))
-        today = self.db.one(
-            "SELECT COUNT(*) AS n FROM runs r JOIN projects p ON p.id=r.project_id WHERE p.user_id=? AND r.kind='harness' "
-            "AND r.created_at>? AND r.params LIKE '%\"auto\": true%'",
-            (project["user_id"], time.time() - 86400),
-        )["n"]
-        if today >= cap:
-            emit({"type": "auto_harness_skipped", "reason": reason, "why": f"límite diario alcanzado ({cap})"})
-            return
+        if cap:  # cap == 0: sin límite diario
+            today = self.db.one(
+                "SELECT COUNT(*) AS n FROM runs r JOIN projects p ON p.id=r.project_id WHERE p.user_id=? AND r.kind='harness' "
+                "AND r.created_at>? AND r.params LIKE '%\"auto\": true%'",
+                (project["user_id"], time.time() - 86400),
+            )["n"]
+            if today >= cap:
+                emit({"type": "auto_harness_skipped", "reason": reason, "why": f"límite diario alcanzado ({cap})"})
+                return
         rid = self.improve_from_chat(run, project, auto=True, reason=reason)
         emit({"type": "auto_harness", "run_id": rid, "reason": reason})
 

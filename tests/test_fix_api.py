@@ -612,6 +612,16 @@ def stuck_step(monkeypatch):
     return inside
 
 
+def test_project_max_steps_accepts_zero_as_unlimited():
+    c = _user("steps")
+    p = _project(c, max_steps=0)  # «sin límite» is a valid choice on create
+    assert p["max_steps"] == 0
+    p2 = _project(c)
+    assert c.patch(f"/api/projects/{p2['id']}", json={"max_steps": 0}).status_code == 200
+    assert db.one("SELECT max_steps FROM projects WHERE id=?", (p2["id"],))["max_steps"] == 0
+    assert c.patch(f"/api/projects/{p2['id']}", json={"max_steps": -1}).status_code == 422  # still bounded below
+
+
 def test_deleting_a_conversation_mid_reply_never_touches_the_next_run(stuck_step, monkeypatch):
     monkeypatch.setattr(appmod, "THREAD_DELETE_GRACE", 0.2)
     a = _user("del")

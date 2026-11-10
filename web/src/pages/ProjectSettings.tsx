@@ -97,7 +97,9 @@ export default function ProjectSettings() {
           <span className="small muted">{t('Los proyectos del mismo dominio comparten lecciones.')}</span>
         </label>
         <label>{t('Comando de verificación')}<input value={form.check_command} onChange={(e) => set('check_command')(e.target.value)} placeholder="uvx --quiet pytest -q" /></label>
-        <label>{t('Máximo de pasos por respuesta')}<input type="number" min={5} max={300} value={form.max_steps} onChange={(e) => set('max_steps')(Number(e.target.value))} /></label>
+        <label>{t('Máximo de pasos por respuesta')}<input type="number" min={0} max={300} value={form.max_steps} onChange={(e) => set('max_steps')(Number(e.target.value))} />
+          <span className="small muted">{t('0 = sin límite: el agente sigue hasta terminar la tarea.')}</span>
+        </label>
         {error && <div className="error-box">{error}</div>}
         {msg && <div className="ok-box">{msg}</div>}
         <button className="btn primary">{t('Guardar')}</button>
