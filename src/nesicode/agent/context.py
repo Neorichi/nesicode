@@ -189,10 +189,22 @@ def _cut_read(text: str, rel: str, limit: int, args: dict) -> str | None:
                 f"or bash (e.g. cut/fold) on {rel}]{tail}")
     if first_hidden is None:
         first_hidden = shown[-1] + 1
-    page = max(1, shown[-1] - shown[0] + 1)
+    # The call that reads on gets as many of the lines not shown as come back whole (an output is cut only past
+    # `limit`): a rest that fits is read in one call, not in pages the size of this one.
+    budget = limit - sum(len(n) + 1 for n in notes)
+    rest = lines[len(kept):]
+    if known and not more and sum(len(ln) + 1 for ln in rest) - 1 <= budget:
+        nxt = f"The rest fits in one call: read_file(path=\"{path}\", offset={first_hidden}) reads to the end"
+    else:
+        fits, size = 0, 60  # (read_file's own "... (N more lines; use offset=K)" after them)
+        for ln in rest:
+            size += len(ln) + 1
+            if size > budget:
+                break
+            fits += 1
+        nxt = f"Continue with read_file(path=\"{path}\", offset={first_hidden}, limit={max(1, fits)})"
     return ("\n".join(kept) + f"\n[... read_file output cut by the inline limit ({limit:,} chars): showing lines {shown[0]}–{shown[-1]} "
-            f"{of}; lines {first_hidden}{upto} are NOT shown. Continue with read_file(path=\"{path}\", "
-            f"offset={first_hidden}, limit={page}); full output saved to {rel}]{tail}")
+            f"{of}; lines {first_hidden}{upto} are NOT shown. {nxt}; full output saved to {rel}]{tail}")
 
 
 def _cut_middle(text: str, rel: str, limit: int) -> str:

@@ -7,6 +7,8 @@
 A pre_tool `match` is tried on every string argument on its own (so `$` anchors the end of a command) and
 on the JSON of all arguments (rules written against key names keep working). post_tool rules apply to a
 tool's output, error messages included (`finish`), so a hint can follow a recurring error signature.
+A truncate rule for every tool ("*") never cuts read_file below the per-call budget it keeps to itself
+(SELF_BOUNDED); a rule that names read_file applies as written.
 
 Hooks act inside the loop, so the model cannot skip them, and they cost nothing in
 always-on prompt budget. They are data, never code, so a proposed harness cannot run
@@ -18,10 +20,27 @@ from __future__ import annotations
 import json
 import re
 
+from .context import INLINE_MAX
+
+# Outputs already cut to a budget of their own: the loop stops a read_file at a line boundary within ~5% of the window
+# (INLINE_MAX chars at most), ends it with a note on where to read on, and saves the whole output. The shipped
+# 20,000-char rule for every tool cut those pages to ~19.4k chars on a 128k window instead of 24k: more round trips
+# for a long file. (+600: the note.)
+SELF_BOUNDED = {"read_file": INLINE_MAX + 600}
+
 
 def _applies(rule: dict, tool: str) -> bool:
     t = rule.get("tool", "*")
     return t == "*" or t == tool or (isinstance(t, list) and tool in t)
+
+
+def _max_chars(rule: dict, tool: str) -> int:
+    """The chars a truncate rule cuts `tool`'s output to."""
+    try:
+        limit = max(1, int(rule.get("max_chars") or 20000))
+    except (TypeError, ValueError):
+        limit = 20000
+    return max(limit, SELF_BOUNDED.get(tool, 0)) if rule.get("tool", "*") == "*" else limit
 
 
 def truncate(output: str, limit: int) -> str:
@@ -93,12 +112,13 @@ class Hooks:
                 if not rule.get("match") or self._search(rule["match"], [output]):
                     output = f"{output}\n[hint] {rule.get('message', '')}"
             elif action == "truncate":
-                try:
-                    limit = max(1, int(rule.get("max_chars") or 20000))
-                except (TypeError, ValueError):
-                    limit = 20000
-                output = truncate(output, limit)
+                output = truncate(output, _max_chars(rule, tool))
         return output
+
+    def truncate_limit(self, tool: str) -> int | None:
+        """The chars `tool`'s output is cut to by the truncate rules (the strictest that applies), or None."""
+        return min((_max_chars(r, tool) for r in self.post if r.get("action") == "truncate" and _applies(r, tool)),
+                   default=None)
 
     def finish(self, tool: str, output: str, warnings: list[str]) -> str:
         """The text the model gets back from a tool call, success or error: pre_tool warnings first, then

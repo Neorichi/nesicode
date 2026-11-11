@@ -486,7 +486,7 @@ def test_truncate_hook_cuts_for_every_positive_max_chars():
     assert hooks.after("bash", "abc") == "a" and hooks.after("bash", "x") == "x"
     assert len(hooks.finish("bash", "Error: " + "y" * 500, ["careful"])) == 1
     hooks = Hooks({"post_tool": [{"tool": "*", "action": "truncate", "max_chars": 20_000}]})  # the base harness rule
-    out = hooks.after("read_file", "z" * 20_010)
+    out = hooks.after("bash", "z" * 20_010)
     assert len(out) <= 20_000 and "chars trimmed by hook" in out
 
 

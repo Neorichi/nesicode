@@ -527,7 +527,7 @@ def test_read_file_offsets_and_line_numbers(tmp_path):
     (ws.root / "empty.txt").write_text("")
     assert read_file(ws, {"path": "empty.txt"}) == "(empty file)"
     (ws.root / "ff.py").write_bytes("a = 1\n\x0c\nb = ' '\nc = 3\nTARGET = 5\n".encode("utf-8"))  # (as is)
-    assert search(ws, {"pattern": "TARGET"}) == "ff.py:5: TARGET = 5"  # what grep -n says
+    assert search(ws, {"pattern": "TARGET"}) == "ff.py:5:TARGET = 5"  # what grep -n says
     assert "     5\tTARGET = 5" in read_file(ws, {"path": "ff.py"})
 
 
@@ -559,7 +559,8 @@ def test_tool_arguments_are_parsed_strictly(tmp_path):
     assert list_dir(ws, {"path": ".", "depth": None})
     with pytest.raises(ToolError, match="2 times"):
         edit_file(ws, {"path": "f.py", "old": "a = 1", "new": "a = 2", "replace_all": "false"})
-    assert edit_file(ws, {"path": "f.py", "old": "a = 1", "new": "a = 2", "replace_all": "true"}).endswith("(2 replacement(s))")
+    assert edit_file(ws, {"path": "f.py", "old": "a = 1", "new": "a = 2", "replace_all": "true"}).startswith(
+        "edited f.py (2 replacement(s))")
     with pytest.raises(ToolError, match="content"):
         write_file(ws, {"path": "f.py"})
     assert (ws.root / "f.py").read_text() == "a = 2\na = 2\n"
@@ -579,7 +580,7 @@ def test_search_is_linear_on_minified_lines(tmp_path):
     assert search(ws, {"pattern": "function.*import"}) == "no matches"
     assert time.monotonic() - t0 < 8
     hit = search(ws, {"pattern": "return 1"})
-    assert hit.startswith("dist/bundle.min.js:1: ") and len(hit) < 300
+    assert hit.startswith("dist/bundle.min.js:1:") and len(hit) < 600  # the stretch around the match
 
 
 def test_search_windows_have_no_fake_line_ends(tmp_path):
@@ -595,7 +596,7 @@ def test_search_windows_have_no_fake_line_ends(tmp_path):
     for pat in ("foo$", r"foo\b", "foo(?!bar)"):
         assert search(ws, {"pattern": pat}) == "no matches", pat
     for pat in ("foobar", "baz$", "foo.*", "x+foo"):
-        assert search(ws, {"pattern": pat}).startswith("min.js:1: "), pat
+        assert search(ws, {"pattern": pat}).startswith("min.js:1:"), pat
     rnd = random.Random(7)
     for _ in range(60):
         text = "".join(rnd.choice("abc ") for _ in range(rnd.randint(SEARCH_WINDOW + 1, 3 * SEARCH_WINDOW)))
@@ -646,7 +647,7 @@ def test_fifos_and_device_links_never_hang(tmp_path):
     base = manifest(ws.root)
     os.mkfifo(ws.root / "test.pipe")
     os.symlink("/dev/zero", ws.root / "zeros.txt")
-    assert _finishes(lambda: search(ws, {"pattern": "hello"})) == "a.txt:1: hello"
+    assert _finishes(lambda: search(ws, {"pattern": "hello"})) == "a.txt:1:hello"
     assert _finishes(lambda: manifest(ws.root))
     assert _finishes(lambda: changes_since(base, ws.root, tmp_path / "proj"))["removed"] == []
     assert _finishes(lambda: list_dir(ws, {}))
@@ -821,7 +822,7 @@ def test_hooks_match_each_argument_and_survive_bad_rules():
     assert hooks.before("bash", {"command": "ls"})[0] == "no ls"
     assert hooks.before("bash", {"command": "ls -la"})[0] is None
     assert hooks.before("write_file", {"path": "secret.txt", "content": "x"}) == (None, ["careful"])  # JSON rules still work
-    assert len(hooks.after("read_file", "x" * 1000)) < 60
+    assert len(hooks.after("bash", "x" * 1000)) < 60
 
 
 def test_hooks_apply_to_error_results():

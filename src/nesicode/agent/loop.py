@@ -1308,14 +1308,8 @@ class Agent:
     def _inline_limit(self, tool: str) -> int:
         """~5% of the window, and below any harness hook that would cut the output again in the middle."""
         n = ctxm.inline_limit(self.context_limit)
-        for rule in self.hooks.post:
-            t = rule.get("tool", "*")
-            if rule.get("action") == "truncate" and (t == "*" or t == tool or (isinstance(t, list) and tool in t)):
-                try:
-                    n = min(n, max(2_000, int(rule.get("max_chars") or 20_000) - 600))
-                except (TypeError, ValueError):
-                    pass
-        return n
+        cap = self.hooks.truncate_limit(tool)
+        return n if cap is None else min(n, max(2_000, cap - 600))
 
     def _delegate(self, args: dict, usage: Usage) -> str:
         name = str(args.get("agent", ""))

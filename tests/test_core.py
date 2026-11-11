@@ -71,7 +71,7 @@ def test_hooks_block_append_truncate():
     assert hooks.before("bash", {"command": "rm -rf / "})[0] == "no"
     assert hooks.before("bash", {"command": "ls"})[0] is None
     assert "[hint] install deps" in hooks.after("bash", "ModuleNotFoundError: x")
-    assert "trimmed by hook" in hooks.after("read_file", "x" * 500)
+    assert "trimmed by hook" in hooks.after("bash", "x" * 500)
 
 
 def test_agent_blocked_command_is_reported(tmp_path):

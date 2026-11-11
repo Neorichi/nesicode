@@ -653,10 +653,10 @@ def test_read_file_description_states_the_per_call_budget(tmp_path):
         return next(s.description for s in a.tool_specs() if s.name == "read_file")
     assert "about 4,000 characters" in desc(16_384) and "stops at a line boundary" in desc(32_768)
     assert "offset" in desc(32_768)
-    assert "about 19,400 characters" in desc(131_072)  # below the base harness's 20k truncate hook
+    assert "about 24,000 characters" in desc(131_072)  # the base harness's 20k hook for every tool spares read_file
     hooks = lambda rules: dict(base_harness(), **{"plugins/hooks.json": json.dumps(rules)})  # noqa: E731
     assert "about 24,000 characters" in desc(131_072, hooks({}))
-    assert "about 4,400 characters" in desc(131_072, hooks({"post_tool": [{"tool": "*", "action": "truncate",
+    assert "about 4,400 characters" in desc(131_072, hooks({"post_tool": [{"tool": "read_file", "action": "truncate",
                                                                           "max_chars": 5_000}]}))
 
 

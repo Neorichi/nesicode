@@ -28,6 +28,12 @@ SEARCH_MAX_FILE = 2_000_000
 SEARCH_BUDGET = 20.0  # seconds; a search over a huge tree returns what it found so far
 SEARCH_WINDOW, SEARCH_OVERLAP = 4_000, 400  # long (minified) lines are matched in windows: bounded backtracking
 SEARCH_HITS = 200
+SEARCH_LINE = 500  # chars of a hit's line shown (a longer, minified one: the stretch around the match)
+SEARCH_SPAN = 5  # lines of a multi-line match shown; a longer match shows its first 3 and its last
+EDIT_CONTEXT = 4  # lines edit_file shows before and after each change
+EDIT_SHOWN = 3  # changes of a replace_all shown
+EDIT_VIEW = 1_500  # chars of that view, at most
+EDIT_LINE = 200  # chars of one line in it
 
 
 def _str(args: dict, key: str, required: bool = True, default: str = "") -> str:
@@ -541,6 +547,66 @@ def _lines_of(text: str, needle: str, limit: int = 8) -> list[int]:
     return out
 
 
+def _clip(line: str, at: int, width: int) -> str:
+    """`line` as it is, or, when longer than `width` (a minified line), the `width` chars around column `at` with …
+    where it was cut."""
+    if len(line) <= width:
+        return line
+    start = max(0, min(at - width // 5, len(line) - width))
+    return ("…" if start else "") + line[start : start + width] + ("…" if start + width < len(line) else "")
+
+
+def _changes(text: str, old: str, new: str, limit: int) -> list[tuple[int, int, int]]:
+    """(first line, last line, column), 0-based, in the edited text, of the first `limit` replacements of `old` by
+    `new` in `text` (str.replace's: left to right, never overlapping)."""
+    out: list[tuple[int, int, int]] = []
+    grow = new.count("\n") - old.count("\n")
+    inner = new[:-1].count("\n")  # (a newline that ends `new` ends its last line)
+    line, last, at = 0, 0, text.find(old)
+    while at >= 0 and len(out) < limit:
+        line += text.count("\n", last, at)
+        last = at
+        a = line + len(out) * grow
+        out.append((a, a + inner, at - text.rfind("\n", 0, at) - 1))
+        at = text.find(old, at + len(old))
+    return out
+
+
+def _edit_view(text: str, changes: list[tuple[int, int, int]], count: int) -> str:
+    """The edited file around each change, numbered as read_file shows it (Claude Code's Edit does the same): an
+    indentation slip or a line left in the wrong place shows at once, not only when the tests fail (or never).
+    EDIT_CONTEXT lines before and after each change; a view over EDIT_VIEW chars leaves out its middle, never its two
+    ends."""
+    lines = _lines(shown(text))
+    if not lines:
+        return "(the file is now empty)"
+    rows: list[tuple[int | None, str]] = []  # (line index, or None for a note; the text shown)
+    end = -1
+    for a, b, col in changes:
+        lo, hi = max(end + 1, a - EDIT_CONTEXT), min(len(lines) - 1, b + EDIT_CONTEXT)
+        if rows and lo > end + 1:
+            rows.append((None, "..."))
+        rows += [(i, f"{i + 1:>6}\t{_clip(lines[i], col if i == a else 0, EDIT_LINE)}") for i in range(lo, hi + 1)]
+        end = max(end, hi)
+    if count > len(changes):
+        rows.append((None, f"... ({count - len(changes)} more replacement(s) not shown)"))
+    if sum(len(s) + 1 for _, s in rows) > EDIT_VIEW:
+        head, tail, size = [], [], 60  # (the note on what is left out)
+        for r in rows:
+            if size + len(r[1]) + 1 > EDIT_VIEW * 3 // 5:
+                break
+            head.append(r)
+            size += len(r[1]) + 1
+        for r in reversed(rows[len(head) :]):
+            if size + len(r[1]) + 1 > EDIT_VIEW:
+                break
+            tail.insert(0, r)
+            size += len(r[1]) + 1
+        gone = [i for i, _ in rows[len(head) : len(rows) - len(tail)] if i is not None]
+        rows = head + [(None, f"... (lines {gone[0] + 1}–{gone[-1] + 1} not shown)" if gone else "...")] + tail
+    return "\n".join(s for _, s in rows)
+
+
 def edit_file(ws: Workspace, args: dict) -> str:
     args = _edit_args(args)
     where = _str(args, "path")
@@ -579,6 +645,7 @@ def edit_file(ws: Workspace, args: dict) -> str:
         raise ToolError(f"`old` occurs {count} times in {rel} (lines {', '.join(map(str, at))}"
                         f"{', …' if count > len(at) else ''}): add surrounding lines to make it unique, or set "
                         "replace_all=true")
+    changes = _changes(text, old, new, min(count, EDIT_SHOWN))  # (count is 1 unless replace_all)
     text = text.replace(old, new) if replace_all else text.replace(old, new, 1)
     try:
         out = encode_text(text, codec)
@@ -587,7 +654,7 @@ def edit_file(ws: Workspace, args: dict) -> str:
                         "use characters that encoding has, or convert the file with a script") from None
     ws.write_bytes(p, out)
     _stamp(ws, p)
-    return f"edited {rel} ({count if replace_all else 1} replacement(s))" + (
+    return f"edited {rel} ({count} replacement(s)). The changed part now reads:\n{_edit_view(text, changes, count)}" + (
         "\n(note: the file had changed on disk since you last read it — a command, the user or another process; `old` "
         "still matched, but read it again before relying on what you remember of it)" if stale else "")
 
@@ -1177,19 +1244,13 @@ def _skipped_note(skipped: list) -> str:
     return f"\n(not searched: {'; '.join(parts)}. Pass one as `path` to search it.)" if parts else ""
 
 
-def _excerpt(lines: list[str], a: int, b: int, col: int) -> str:
-    """A hit as the model reads it: the line, or the stretch around the match on a long (minified) line; a match over
-    several lines shows its first and last line."""
-    def one(line: str, at: int) -> str:
-        s = line.strip()
-        if len(s) <= 240:
-            return s
-        at = max(0, at - 80)
-        return ("…" if at else "") + line[at : at + 240].strip() + "…"
-
-    if b == a:
-        return one(lines[a], col)
-    return one(lines[a], col) + (" ⏎ " if b == a + 1 else " ⏎ … ⏎ ") + one(lines[b], 0)
+def _hit(rel: str, lines: list[str], a: int, b: int, col: int) -> str:
+    """A match as ripgrep prints it: `path:line:content`, the line exactly as the file has it (indentation included:
+    it ends up in edit_file's `old`), one row per line of a multi-line match. A very long (minified) line shows the
+    stretch around the match; a match over more than SEARCH_SPAN lines, its first 3 and its last."""
+    rows = list(range(a, b + 1)) if b - a < SEARCH_SPAN else [a, a + 1, a + 2, None, b]
+    return "\n".join(f"... (lines {a + 4}–{b} of this match not shown)" if i is None
+                     else f"{rel}:{i + 1}:{_clip(lines[i], col if i == a else 0, SEARCH_LINE)}" for i in rows)
 
 
 def search(ws: Workspace, args: dict) -> str:
@@ -1235,7 +1296,7 @@ def search(ws: Workspace, args: dict) -> str:
             except ValueError:
                 continue  # binary
             for a, b, col, _ in matcher.find(lines, SEARCH_HITS - len(hits), rel):
-                hits.append(f"{rel}:{a + 1}{f'-{b + 1}' if b > a else ''}: {_excerpt(lines, a, b, col)}")
+                hits.append(_hit(rel, lines, a, b, col))
             if len(hits) >= SEARCH_HITS:
                 return "\n".join(hits) + f"\n... (truncated at {SEARCH_HITS} matches)"
     out = "\n".join(hits) or "no matches"
@@ -1384,8 +1445,9 @@ SCHEMAS = {
         }, "required": ["path", "old", "new"]},
     ),
     "search": ToolSpec(
-        "search", "Regex search over file contents, one line at a time. Returns path:line: text. Dependency/VCS dirs "
-        "and what the .gitignore ignores are skipped (pass one as `path` to search it).",
+        "search", "Regex search over file contents, one line at a time. Returns path:line:content, the line exactly "
+        "as in the file (indentation included), like ripgrep. Dependency/VCS dirs and what the .gitignore ignores are "
+        "skipped (pass one as `path` to search it).",
         {"type": "object", "properties": {
             "pattern": {"type": "string", "description": "Python regular expression."},
             "path": {"type": "string", "description": "File or directory (default '.')."},

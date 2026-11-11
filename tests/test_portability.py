@@ -156,9 +156,9 @@ def test_workspace_paths_in_tool_outputs_use_slashes(tmp_path):
     assert ws.rel(ws.root / "sub" / "dir" / "f.txt") == "sub/dir/f.txt" and ws.rel(ws.root) == "."
     assert write_file(ws, {"path": "sub/dir/f.txt", "content": "hola\n"}) == "created sub/dir/f.txt (5 chars)"
     edited = edit_file(ws, {"path": "sub/dir/f.txt", "old": "hola", "new": "adiós"})
-    assert edited == "edited sub/dir/f.txt (1 replacement(s))"
-    assert search(ws, {"pattern": "adiós"}) == "sub/dir/f.txt:1: adiós"
-    assert search(ws, {"pattern": "adi", "glob": "sub/**/*.txt"}).startswith("sub/dir/f.txt:1: ")
+    assert edited.startswith("edited sub/dir/f.txt (1 replacement(s))")
+    assert search(ws, {"pattern": "adiós"}) == "sub/dir/f.txt:1:adiós"
+    assert search(ws, {"pattern": "adi", "glob": "sub/**/*.txt"}).startswith("sub/dir/f.txt:1:")
     assert "sub/dir/f.txt" in manifest(ws.root)
     before = tmp_path / "before"
     before.mkdir()

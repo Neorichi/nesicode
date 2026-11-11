@@ -162,7 +162,7 @@ def test_search_never_says_no_matches_for_what_it_did_not_search(tmp_path):
     (ws.root / "h.py").write_text("x = 1\ndef handler(event):\n    return None\n")
     for args in ({"pattern": r"def handler\(event\):\n\s+return None"}, {"pattern": r"(?s)def handler.*?return None"},
                  {"pattern": r"handler\(event\):\s+return", "multiline": True}):
-        assert search(ws, args).startswith("h.py:2-3: def handler(event): ⏎ return None"), args
+        assert search(ws, args) == "h.py:2:def handler(event):\nh.py:3:    return None", args
     out = search(ws, {"pattern": r"handler\(event\):\s+return"})
     assert out.startswith("no matches") and "multiline=true" in out
 
@@ -313,8 +313,8 @@ def test_edit_file_never_deletes_because_new_was_lost(tmp_path):
         assert "edit_file takes `path`, `old`" in str(e.value), args
     assert f.read_text() == "def a():\n    return compute_total(items)\n"
     # Claude Code's names are the same parameters
-    assert edit_file(ws, {"path": "f.py", "old_string": "compute_total(items)", "new_string": "total(items)"}) == \
-        "edited f.py (1 replacement(s))"
+    assert edit_file(ws, {"path": "f.py", "old_string": "compute_total(items)", "new_string": "total(items)"}) \
+        .startswith("edited f.py (1 replacement(s))")
     assert edit_file(ws, {"path": "f.py", "old": "total(", "new_string": "sum(", "replace_all": True}).startswith("edited")
     assert f.read_text() == "def a():\n    return sum(items)\n"
     with pytest.raises(ToolError, match="both `new` and `new_string`"):
