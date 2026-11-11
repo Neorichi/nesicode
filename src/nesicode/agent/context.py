@@ -21,7 +21,7 @@ import os
 import re
 import time
 
-from .tools import _lines, _match, _nested_repeat, _search_regex
+from .tools import _lines, _Matcher, _nested_repeat, _search_regex
 from .workspace import ToolError, Workspace, _walk
 
 MASK_AT = 0.49          # layer 1 trigger (share of the context window)
@@ -648,7 +648,9 @@ def git_state(ws: Workspace, budget: int = 4_000) -> str:
         code, out = ws.run("git status --short | head -40; echo '---'; git diff --stat | tail -15", timeout=20)
     except Exception:
         return ""
-    return f"## Git state (fresh)\n```\n{out.strip()[:budget]}\n```" if code == 0 and out.strip() else ""
+    head = ("## Git state (fresh; it also lists uncommitted changes made before this run, possibly the user's own "
+            "work: never revert or discard those)")
+    return f"{head}\n```\n{out.strip()[:budget]}\n```" if code == 0 and out.strip() else ""
 
 
 # ------------------------------------------------------------------ files on disk
@@ -695,7 +697,7 @@ def search_history(ws: Workspace, args: dict, archive: str = ".nesicode") -> str
     except re.error:  # not a regex: the text as typed
         rx = re.compile(re.escape(query), re.I)
     else:
-        if _nested_repeat(query):  # `(a+)+$`, `(\w+\s?)*x`: exponential on one short line, with the GIL held
+        if _nested_repeat(rx.pattern):  # `(a+)+$`, `(\w+\s?)*x`: exponential on one short line
             rx = re.compile(re.escape(query), re.I)
             note = ("(searched as plain text: as a regex it repeats a group made only of repetitions, which can take "
                     "exponential time; use plain keywords or a simpler regex)\n")
@@ -788,19 +790,20 @@ def _search(ws, files, rx, budget: _Budget | None = None) -> str:
     hidden = False
     deadline = budget.deadline if budget is not None else float("inf")
     cancel = budget.cancel if budget is not None else None
-    for rel, lines in _read_all(ws, files, budget):
-        for i, line in enumerate(lines, 1):
-            # (every line that is not short: an allowed regex such as `(.*)token` costs ~50 ms on a 4,000-char line,
-            # and 256 of them kept Stop waiting ~12 s)
-            if budget is not None and (i % 256 == 0 or len(line) > 500) and budget.over():
-                break
-            m = _match(rx, line, deadline, cancel)  # long lines in windows: the backtracking of one call stays bounded
-            if m:
-                shown = _excerpt(line, m.start(), m.end())
+    # The search tool's matcher: a pattern it cannot prove harmless runs in a child process that is killed at the
+    # deadline or on Stop (re holds the GIL while it backtracks, so in this process one query could freeze the server).
+    with _Matcher(rx, False, deadline, cancel) as matcher:
+        for rel, lines in _read_all(ws, files, budget):
+            for first, _last, start, end in matcher.find(lines, 80 - len(hits), rel):
+                shown = _excerpt(lines[first], start, end)
                 hidden = hidden or "<redacted" in shown
-                hits.append(f"{rel}:{i}: {shown}")
-                if len(hits) >= 80:
-                    return "\n".join(hits) + "\n... (more matches; refine the query)" + (_REDACTED_HINT if hidden else "")
+                hits.append(f"{rel}:{first + 1}: {shown}")
+            if len(hits) >= 80:
+                return "\n".join(hits) + "\n... (more matches; refine the query)" + (_REDACTED_HINT if hidden else "")
+            if matcher.why:
+                if budget is not None:
+                    budget.over()  # (its note under the results says why they are partial)
+                break
     return "\n".join(hits) + (_REDACTED_HINT if hidden and hits else "")
 
 

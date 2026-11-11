@@ -856,6 +856,10 @@ const EN: Record<string, string> = {
   'Avisar': 'Notify',
   'Programar seguimiento': 'Schedule follow-up',
   'Terminar tarea': 'Finish task',
+  'Parar proceso': 'Stop process',
+  'Nesicode: regla de seguridad (no descartar cambios sin confirmar ni hacer commits que no se pidan)':
+    'Nesicode: safety rule (never discard uncommitted changes or make commits nobody asked for)',
+  'Nesicode: regla de seguridad (no escribir credenciales ni iniciar sesión)': 'Nesicode: safety rule (never type credentials or sign in)',
   'Resumen diario de noticias': 'Daily news digest',
   'Vigilar una web': 'Watch a web page',
   'Informe semanal en Word': 'Weekly Word report',

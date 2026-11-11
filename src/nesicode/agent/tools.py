@@ -1281,7 +1281,13 @@ def bash(ws: Workspace, args: dict) -> str:
                 "apps, and no other command will get you there. " + OUTSIDE_HINT)
     elif _refused_in_read_dirs(command, out, dirs):
         out += READ_ONLY_NOTE
+    if "Operation not permitted" in out and _KILL_CMD.search(command):
+        out += ("\n[sandbox] A process that an earlier command started cannot be signalled from this one: stop it "
+                "with the stop_process tool (no arguments lists them).")
     return f"exit code: {code}\n{out}"
+
+
+_KILL_CMD = re.compile(r"(?:^|[;&|(\s])(?:kill|pkill|killall)\b")
 
 
 _HOME_REF = re.compile(r"(~|\$HOME\b|\$\{HOME\}|/Users/|/home/)")

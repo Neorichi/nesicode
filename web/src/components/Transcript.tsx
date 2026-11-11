@@ -37,6 +37,7 @@ const TOOL_LABEL = (): Record<string, string> => ({
   bot_schedule_once: t('Programar seguimiento'),
   bot_finish: t('Terminar tarea'),
   show_image: t('Mostrar imagen'),
+  stop_process: t('Parar proceso'),
 })
 
 function mcpLabel(name: string): string | null {
