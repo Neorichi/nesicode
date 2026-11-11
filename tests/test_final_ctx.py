@@ -438,7 +438,7 @@ def test_a_subagent_out_of_steps_is_marked_partial(tmp_path, fake):
             if "step budget" in json.dumps(rec["messages"][-1]):
                 return Turn("Resumen parcial del revisor.", [], "end_turn", Usage(0, 5))
             n = sum(1 for r in prov.log if r["role"] == "subagent")
-            return Turn(f"paso {n}", [ToolCall(f"s{n}", "list_dir", {"path": "."})], "tool_use", Usage(0, 5))
+            return Turn(f"paso {n}", [ToolCall(f"s{n}", "bash", {"command": f"echo paso {n}"})], "tool_use", Usage(0, 5))
         if any(m["role"] == "tool" for m in rec["messages"]):
             return Turn("Fin.", [], "end_turn", Usage(0, 5))
         return Turn("Delego.", [ToolCall("d1", "delegate", {"agent": "reviewer", "task": "revisa"})], "tool_use", Usage(0, 5))

@@ -24,14 +24,60 @@ from .workspace import HARNESS_DIR, Cancelled, ToolError, Workspace, sandbox_mod
 
 Emit = Callable[[dict], None]
 
+# The requests for the final answer (the next reply ends the run). The one sent is kept (Agent._nudge): a compaction
+# before that reply repeats the same words — a run with no step cap is never told it used up a step budget.
 FINAL_NUDGE = (
-    "You have used your whole step budget. Do not call any more tools. "
+    "[harness] You have used your whole step budget. Do not call any more tools. "
     "Reply now with your final summary: what you changed, what you verified, and what is left."
 )
 CONTEXT_FULL_NUDGE = (
-    "The context window is full and cannot be compacted any further. Do not call any more tools. "
+    "[harness] The context window is full and cannot be compacted any further. Do not call any more tools. "
     "Reply now with your final summary: what you changed, what you verified, and what is left (the user can say "
     "'continue' to pick the work up again from the archived history)."
+)
+STUCK_NUDGE = (
+    "[harness] {why}, so this run stops here. Do not call any more tools. Reply now with your final summary: what you "
+    "changed, what you verified, what is left and what is blocking you (the user can say 'continue' to pick the work up "
+    "again from the archived history)."
+)
+# What the user reads when the harness ended the run (appended to the final answer, and a 'stopped' event): why, and
+# that «continúa» picks the work up again.
+STOP_NOTES = {
+    "context_full": "[El contexto del modelo está lleno y no se puede compactar más: el trabajo se detuvo aquí. Escribe "
+                    "«continúa» para seguir desde el historial guardado.]",
+    "stuck": "[El agente se había atascado (repetía las mismas acciones sin avanzar, o no podía ejecutar ninguna): el "
+             "trabajo se detuvo aquí. Escribe «continúa» para seguir.]",
+}
+# A reply with no answer in it (no visible text, no tool call: reasoning only, a call the server could not parse…) is
+# asked for again, then the run fails — it never ends as "done", nor with an earlier step's words as its answer.
+EMPTY_RETRIES = 2
+EMPTY_NOTE = "[harness] Your reply came back empty (no text and no tool call) and was discarded."
+EMPTY_NEXT = "If the work is done, write your final answer for the user now; otherwise make the next tool call."
+NO_TOOLS_NOTE = "[harness] Your reply called tools, but no more tools can run in this run: it was discarded."
+EMPTY_REPLIES = ("El modelo devolvió varias respuestas vacías seguidas (sin texto ni llamadas a herramientas), así que "
+                 "el trabajo se detuvo aquí sin una respuesta final. Escribe «continúa» para reintentar.")
+# Loop detection (a run with no step cap must still end when it goes nowhere): the same call with the same result and
+# nothing changed in between is named from the REPEAT_NOTE_AT-th time within the last REPEAT_WINDOW calls, and stops
+# the run at REPEAT_STOP_AT; so do STUCK_ROUNDS rounds in a row in which no call could run (cut off by the output
+# limit, refused, switched off, no such tool) or replies cut while calling a tool.
+REPEAT_WINDOW = 30
+REPEAT_NOTE_AT = 3
+REPEAT_STOP_AT = 6
+STUCK_ROUNDS = 4
+REPEAT_NOTE = (
+    "\n\n[harness] You have now made this exact call ({call}) {n} times and got the same {what} each time, with nothing "
+    "changed in between, so repeating it will not change anything. Use what it returned, change the call or your "
+    "approach, or — if you are blocked or waiting for something outside your control — say so in your final answer. At "
+    "{stop} identical calls the run is stopped."
+)
+READ_ONLY_TOOLS = {"read_file", "list_dir", "search", "search_history", "load_skill", "view_image"}
+# Backend tools (connectors, the vision and image models) that fail the same call the same way 3 times in a row are
+# switched off for the run; the workspace tools never are (a stale edit or a wrong path is the model's to fix).
+BACKEND_TOOLS = {"view_image", "generate_image"}
+TOOL_OFF = (
+    "Error: `{tool}` is disabled for this run: it kept failing the same way, or failed in a way retrying cannot fix (its "
+    "backend looks broken or misconfigured). Do not call it again: carry on with your other tools, and in your final "
+    "answer tell the user what failed (the error below) so they can fix it.\nLast error: {error}"
 )
 CONTINUE_NOTE = (
     "[harness] Your previous reply was cut off by the output limit ({cap:,} tokens per reply). Continue exactly where it "
@@ -85,6 +131,10 @@ _CHAT_ARCHIVE_RX = re.compile(
     r"\.nesicode[\\/]+chats[\\/]+([^\\/\s'\"]+)" if os.name == "nt" else r"\.nesicode/chats/([^/\s'\"]+)", re.I)
 _WRITES_RX = re.compile(r"(?<![0-9&>])>>?\s*[\w./~$\"'-]|\btee\b|\bsed\s+-i|\b(?:mv|cp|rm|mkdir|touch|patch)\s|"
                         r"\bgit\s+(?:commit|apply|am|merge|rebase|checkout|restore)\b")
+# What changes between two runs of the same command with the same result: durations, clock times, object addresses
+# (a test suite re-run with nothing changed reports "3 failed in 0.51s", then "in 0.62s").
+_VOLATILE_RX = re.compile(r"\b\d+(?:\.\d+)?\s?(?:ms|s|secs?|seconds?|min)\b|\b\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?\b|"
+                          r"\b0x[0-9a-fA-F]{6,}\b")
 
 
 @dataclass
@@ -95,6 +145,9 @@ class AgentResult:
     usage: Usage
     events: list[dict] = field(default_factory=list)
     error: str = ""
+    # Why the harness ended the run: "" (the model answered, or the run was stopped, refused or failed), "step_cap",
+    # "context_full", "stuck" (those three end as max_steps, with a final summary) or "empty_replies" (an error).
+    stop_reason: str = ""
 
     @property
     def delivered(self) -> bool:
@@ -211,7 +264,12 @@ class Agent:
         self.role = role
         self.cancel = cancel or threading.Event()
         self.ws.cancel = self.cancel  # running commands are killed as soon as the user presses Stop
-        self._fail_streak: dict[str, tuple[int, str]] = {}
+        # backend tool -> (failures in a row of the same call, that call + error normalised, the last error)
+        self._fail_streak: dict[str, tuple[int, int, str]] = {}
+        self._refused: set[str] = set()  # calls the harness refused (never ran): not failures of the tool
+        self._recent: list[tuple] = []  # loop detection: (tool, arguments, result, changes so far) of the latest calls
+        self._changes = 0  # calls so far that may have changed something (see _repeats)
+        self._rejected_rounds = 0  # tool rounds in a row in which no call could run
         # Called before a tool runs; returns (allowed, reason). None = everything is allowed (auto mode).
         self.approve = approve
         self.depth = depth
@@ -263,7 +321,9 @@ class Agent:
         self._judge = False
         self._compact_off = False
         self._limit_errors = 0
-        self._nudged = False
+        self._nudge = ""  # the request for the final answer that was sent (FINAL_NUDGE, CONTEXT_FULL_NUDGE, STUCK_NUDGE)
+        self._stop_reason = ""  # ...and why (AgentResult.stop_reason)
+        self._unanswered = 0  # replies in a row with no answer in them (see EMPTY_RETRIES)
         self._cut_streak = 0
         self._continuations = 0
         self._parts: list[str] = []
@@ -410,6 +470,27 @@ class Agent:
         add = getattr(conv, "add_note", None)
         (add if callable(add) else conv.add_user)(text)
         self._conv_chars += len(text) + 16
+
+    @property
+    def _nudged(self) -> bool:
+        """The final answer was asked for: the next reply ends the run."""
+        return bool(self._nudge)
+
+    def _ask_again(self, conv, turn, reply_chars: int) -> None:
+        """A reply with no answer in it is taken back out of the history and asked for again, with a note. Taken back:
+        some APIs reject an empty assistant message, and the note then rides with the tool results instead of opening a
+        user turn (which would make interleaved-thinking templates drop the reasoning of this tool loop). A conversation
+        that cannot take it back keeps it, and its calls are answered as not run."""
+        if _take_back(conv):
+            self._conv_chars -= reply_chars
+        elif turn.tool_calls:
+            self._add_results(conv, [ToolResult(c.id, "Not run: no more tools can run in this run.", True)
+                                     for c in turn.tool_calls])
+        if turn.tool_calls:  # (only after the final answer was asked for)
+            note = NO_TOOLS_NOTE
+        else:
+            note = EMPTY_NOTE if self._nudged else f"{EMPTY_NOTE} {EMPTY_NEXT}"
+        self._add_note(conv, f"{note}\n{self._nudge}" if self._nudged else note)
 
     def _add_assistant(self, conv, text: str) -> None:
         conv.add_assistant_text(text)
@@ -560,7 +641,7 @@ class Agent:
             return new
         freed = conv.mask_tool_results(keep_last, marker, keep_chars=keep_chars, apply=True)
         self._conv_chars -= freed
-        if freed:
+        if freed and not self._nudged:  # (once the final answer was asked for, that request stays the last word)
             n = cleared[0]
             what = (f"{n} earlier tool output{'s' if n != 1 else ''}"
                     + (" and your reasoning from those steps were" if freed > cleared[1] else (" were" if n != 1 else " was")))
@@ -618,7 +699,7 @@ class Agent:
             conv, task = self._first_conversation(provider, model, system, options, self._task_full or task)
             self._task = task
             if self._nudged:
-                self._add_user(conv, FINAL_NUDGE)
+                self._add_note(conv, self._nudge)
         after = self._est()
         self._last_compact_after = after
         self._steps_at_compact = self._steps
@@ -844,7 +925,7 @@ class Agent:
                          "kept); it ended with:\n«…" + "".join(self._parts)[-1_500:] + "»\nContinue it exactly where it "
                          "stopped — no recap, no repetition.")
         elif self._nudged:
-            lines.append(FINAL_NUDGE)
+            lines.append(self._nudge)
         else:
             lines.append("Continue the task from the Next Step without asking for confirmation and without redoing completed "
                          "actions. If something was only partly seen, read just the missing part.")
@@ -871,19 +952,25 @@ class Agent:
         self.emit({"type": f"{kind}_delta", "text": delta}, persist=False)
 
     def _call_tool(self, call: ToolCall, usage: Usage) -> ToolResult:
-        """Run a tool; after 3 failures in a row of the same tool, stop offering it for this run (no retry loops)."""
-        streak, last = self._fail_streak.get(call.name, (0, ""))
-        if streak >= 3:
-            return ToolResult(call.id, f"Error: `{call.name}` failed {streak} times in a row with the same error and is now "
-                                       "disabled for this run. Stop retrying it: explain the error to the user and how to fix it.\n"
-                                       f"Last error: {last[:500]}", True)
-        res = self._call_tool_inner(call, usage)
-        if not res.is_error:
-            self._fail_streak.pop(call.name, None)
-        else:
-            sig = re.sub(r"\d+", "#", res.content[:160])  # same failure, whatever the arguments
-            n = streak + 1 if sig == re.sub(r"\d+", "#", last[:160]) else 1
-            self._fail_streak[call.name] = (3 if "NOT RETRYABLE" in res.content else n, res.content)
+        """Run a tool. Calls the harness refuses (unreadable arguments, a hook block, the user's denial, another chat's
+        archive) never ran: they go in self._refused and are no failure of the tool. A backend tool (a connector, the
+        vision or image model) that fails the same call the same way 3 times in a row is switched off for this run: a
+        broken backend is not retried forever. The workspace tools never are; a model repeating the same failing call
+        is caught by the loop detection (_repeats)."""
+        self._refused.discard(call.id)
+        streak, sig, last = self._fail_streak.get(call.name, (0, None, ""))
+        if streak >= 3 or "NOT RETRYABLE" in last:
+            self._refused.add(call.id)
+            return ToolResult(call.id, TOOL_OFF.format(tool=call.name, error=last[:500]), True)
+        res, refused = self._call_tool_inner(call, usage)
+        if refused:
+            self._refused.add(call.id)
+        elif call.name in self.extra_tools or call.name in BACKEND_TOOLS:
+            if not res.is_error:
+                self._fail_streak.pop(call.name, None)
+            else:  # the same call failing the same way (ids, counters and line numbers aside)
+                now = hash(re.sub(r"\d+", "#", f"{_args_text(call)}\n{res.content[:160]}"))
+                self._fail_streak[call.name] = (streak + 1 if now == sig else 1, now, res.content)
         return res
 
     def _cut_call(self, call: ToolCall, cap: int) -> ToolResult:
@@ -918,24 +1005,52 @@ class Agent:
         else:
             self._ro_streak += 1
 
-    def _call_tool_inner(self, call: ToolCall, usage: Usage) -> ToolResult:
+    def _repeats(self, call: ToolCall, res: ToolResult) -> int:
+        """Loop detection: how many times, within the last REPEAT_WINDOW calls, this exact call got this same result with
+        nothing changed in between (this one included). A new call that may change something (anything but a read)
+        starts a new stretch, so re-running the tests after an edit is no repetition; a call that only repeats an
+        earlier one changes nothing new, so a write-then-test loop still counts."""
+        rel = (self._saved.get(call.id) or ("", ""))[1]
+        out = res.content.replace(rel, "") if rel else res.content  # (a saved copy's name differs on every call)
+        key = (call.name, hash(_args_text(call)), hash(_VOLATILE_RX.sub("#", out)))
+        if not res.is_error and call.name not in READ_ONLY_TOOLS and key not in {r[:3] for r in self._recent}:
+            self._changes += 1
+        entry = (*key, self._changes)
+        self._recent.append(entry)
+        del self._recent[:-REPEAT_WINDOW]
+        return self._recent.count(entry)
+
+    def _stuck(self, repeats: int, call: ToolCall | None) -> str:
+        """Why this run is going nowhere (it then ends with a final summary), or ""."""
+        if repeats >= REPEAT_STOP_AT and call is not None:
+            return (f"You have made the same `{call.name}` call {repeats} times with the same result and nothing "
+                    "changed in between")
+        if self._rejected_rounds >= STUCK_ROUNDS:
+            return (f"None of your tool calls could run in the last {self._rejected_rounds} rounds (cut off by the output "
+                    "limit, refused or switched off)")
+        if self._cut_streak >= STUCK_ROUNDS:
+            return f"Your last {self._cut_streak} replies were cut off by the output limit in the middle of a tool call"
+        return ""
+
+    def _call_tool_inner(self, call: ToolCall, usage: Usage) -> tuple[ToolResult, bool]:
+        """(result, refused): refused = the harness did not let it run (its arguments, a hook, the user, the archive)."""
         # Errors go through the hooks too (pre_tool warnings + post_tool rules), so a hint keyed to an error fires
         if call.parse_error:
-            return ToolResult(call.id, self.hooks.finish(call.name, f"Tool call rejected: {call.parse_error}", []), True)
+            return ToolResult(call.id, self.hooks.finish(call.name, f"Tool call rejected: {call.parse_error}", []), True), True
         block, warnings = self.hooks.before(call.name, call.arguments)
         if block:
-            return ToolResult(call.id, self.hooks.finish(call.name, block, warnings), True)
+            return ToolResult(call.id, self.hooks.finish(call.name, block, warnings), True), True
         if self.approve is not None:
             allowed, reason = self.approve(call)
             if not allowed:
                 return ToolResult(call.id, self.hooks.finish(
                     call.name, f"The user did not allow this {call.name} call ({reason}). Do not retry the same call; "
-                    "choose another approach or ask the user what to do.", warnings), True)
+                    "choose another approach or ask the user what to do.", warnings), True), True
         other = self._other_chat_archive(call.arguments)
         if other:
             return ToolResult(call.id, self.hooks.finish(
                 call.name, f"Error: {other} belongs to another conversation; each chat only sees its own history.",
-                warnings), True)
+                warnings), True), True
         try:
             if call.name in BASIC_TOOLS:
                 out = BASIC_TOOLS[call.name](self.ws, call.arguments)
@@ -980,14 +1095,16 @@ class Agent:
                 out = f"Shared `{rel}` with the user as a download."
             elif call.name == "delegate" and self.depth == 0:
                 out = self._delegate(call.arguments, usage)
-            else:
-                raise ToolError(f"unknown tool {call.name!r}")
+            else:  # (a tool it does not have never runs either)
+                return ToolResult(call.id, self.hooks.finish(call.name, f"Error: unknown tool {call.name!r}", warnings),
+                                  True), True
         except ToolError as exc:
             self._errors.add(call.id)
-            return ToolResult(call.id, self.hooks.finish(call.name, f"Error: {exc}", warnings), True)
+            return ToolResult(call.id, self.hooks.finish(call.name, f"Error: {exc}", warnings), True), False
         except Exception as exc:  # a tool bug must not kill the run
             self._errors.add(call.id)
-            return ToolResult(call.id, self.hooks.finish(call.name, f"Error: {type(exc).__name__}: {exc}", warnings), True)
+            error = f"Error: {type(exc).__name__}: {exc}"
+            return ToolResult(call.id, self.hooks.finish(call.name, error, warnings), True), False
         if warnings:
             out = "\n".join(f"[hook] {w}" for w in warnings) + "\n" + out
         if len(out) > ctxm.SAVE_OVER:
@@ -1001,7 +1118,7 @@ class Agent:
                 self._saved[call.id] = (call.name, rel, desc, reread)
             except Exception:
                 pass
-        return ToolResult(call.id, self.hooks.after(call.name, out))
+        return ToolResult(call.id, self.hooks.after(call.name, out)), False
 
     def _inline_limit(self, tool: str) -> int:
         """~5% of the window, and below any harness hook that would cut the output again in the middle."""
@@ -1057,6 +1174,9 @@ class Agent:
         # Only a finished sub-agent answered: a stopped one's text is just what it said at its last step (never its
         # findings), and a refusal is not "nothing found". The result says what happened (persisted, so the next turn's
         # trail and digest say it too).
+        if res.stop_reason == "empty_replies":
+            raise ToolError("the subagent's model kept returning empty replies (no text and no tool call), so it gave no "
+                            "answer: do that part yourself, or delegate it again with a narrower task")
         if res.status == "error":
             raise ToolError(f"subagent failed: {res.error}")
         if res.status == "cancelled":
@@ -1065,18 +1185,26 @@ class Agent:
                             + (f" (what it said last, not an answer: «{said}»)" if said else ""))
         if res.status == "refusal":
             raise ToolError("the subagent's model refused the task (refusal / content filter): it did not do it")
-        if res.status == "max_steps":  # (its step budget, or its context, ran out: both end a run as max_steps)
-            return (f"[partial: the subagent stopped before finishing — its step budget or its context ran out after "
-                    f"{res.steps} step(s); its answer may be incomplete]\n" + (res.final_text or "(it returned nothing)"))
+        if res.status == "max_steps":
+            why = {"context_full": "its context window filled up",
+                   "stuck": "it was repeating itself without making progress"}.get(res.stop_reason, "its step budget ran out")
+            return (f"[partial: the subagent stopped before finishing — {why} after {res.steps} step(s); its answer may "
+                    "be incomplete]\n" + (res.final_text or "(it returned nothing)"))
         return res.final_text or "(subagent returned nothing)"
 
     # ------------------------------------------------------------------ the loop
-    def _finish(self, status: str, final_text: str, steps: int, usage: Usage, turn=None) -> AgentResult:
+    def _finish(self, status: str, final_text: str, steps: int, usage: Usage, turn=None,
+                stop_reason: str = "") -> AgentResult:
         if turn is not None:
             self._display = max(self._display, turn.usage.input_tokens + _visible(turn) // 4)
+        note = "" if self.depth else STOP_NOTES.get(stop_reason, "")  # (a sub-agent's parent is told by _delegate)
+        if note:
+            final_text = (final_text.rstrip() + "\n\n" if final_text.strip() else "") + note
+            self.emit({"type": "stopped", "reason": stop_reason, "text": note})
         ctx = {"used": self._display, "limit": self.context_limit}
-        self.emit({"type": "done", "status": status, "steps": steps, "usage": usage.to_dict(), "context": ctx})
-        return AgentResult(final_text, status, steps, usage, self.events)
+        self.emit({"type": "done", "status": status, "steps": steps, "usage": usage.to_dict(), "context": ctx,
+                   **({"stop_reason": stop_reason} if stop_reason else {})})
+        return AgentResult(final_text, status, steps, usage, self.events, stop_reason=stop_reason)
 
     def run(self, task: str, history: list[tuple[str, str]] | None = None) -> AgentResult:
         usage = self._usage = Usage()
@@ -1119,14 +1247,12 @@ class Agent:
                     if steps and not self._fits():  # no room for the next reply
                         conv, full = self._make_room(provider, model, system, options, conv)
                         if full:
-                            if self._room() < 512:  # not even a final answer fits: stop here, cleanly
-                                note = ("[El contexto del modelo está lleno y no se puede compactar más: el trabajo se detuvo "
-                                        "aquí. Escribe «continúa» para seguir desde el historial guardado.]")
-                                final_text = (final_text + "\n\n" if final_text else "") + note
-                                return self._finish("max_steps", final_text, steps, usage)
+                            if self._room() < 512:  # not even a final answer fits: stop here, cleanly (_finish says so)
+                                return self._finish("max_steps", "".join(self._parts), steps, usage,
+                                                    stop_reason="context_full")
                             if not self._nudged:
-                                self._add_user(conv, CONTEXT_FULL_NUDGE)
-                                self._nudged = True
+                                self._nudge, self._stop_reason = CONTEXT_FULL_NUDGE, "context_full"
+                                self._add_note(conv, CONTEXT_FULL_NUDGE)
                     room = self._room()
                     max_tokens = min(out_budget, room)
                     room_limited = max_tokens < out_budget
@@ -1162,7 +1288,8 @@ class Agent:
                         self._compact_off = True
                 if turn.usage.input_tokens:
                     self._calibrate(turn.usage.input_tokens)
-                self._conv_chars += _visible(turn) + 16 + (len(turn.thinking or "") if _replays(conv) else 0)
+                reply_chars = _visible(turn) + 16 + (len(turn.thinking or "") if _replays(conv) else 0)
+                self._conv_chars += reply_chars
                 cut = turn.stop_reason in ("max_tokens", "model_context_window_exceeded")
                 if cut and self.context_limit and (room_limited or turn.stop_reason == "model_context_window_exceeded") \
                         and self._can_compact() and self._est() > self.context_limit * 0.45:
@@ -1173,7 +1300,7 @@ class Agent:
                     continue
                 steps += 1
                 self._steps = steps
-                self._pending = []
+                answered, self._pending = self._pending, []
                 self._limit_errors = 0  # context errors only count while they repeat without progress
                 usage.add(turn.usage)
                 if turn.thinking:  # archived (history.md, the next turn's trail, compaction transcripts): its end matters
@@ -1208,23 +1335,50 @@ class Agent:
                                f"{self._continuations + 1} veces seguidas.")
                     self.emit({"type": "error", "text": msg})
                     return AgentResult(final_text, "error", steps, usage, self.events, error=msg)
+                answer = turn.text if turn.tool_calls else "".join(self._parts) + turn.text
                 if turn.text:
-                    final_text = ("".join(self._parts) + turn.text) if not turn.tool_calls else turn.text
+                    final_text = answer  # what it said last: a run that is stopped or fails reports it as such
                 self._parts, self._continuations = [], 0
                 if not turn.tool_calls or self._nudged:
-                    return self._finish("max_steps" if self._nudged else "done", final_text, steps, usage, turn)
-                results = []
+                    if answer.strip():
+                        return self._finish("max_steps" if self._nudged else "done", answer, steps, usage, turn,
+                                            self._stop_reason)
+                    # No answer in this reply: asked for again (bounded), never replaced by an earlier step's words.
+                    if self._unanswered < EMPTY_RETRIES:
+                        self._unanswered += 1
+                        self._pending = answered  # (that round is still unanswered: a compaction must say so)
+                        self._ask_again(conv, turn, reply_chars)
+                        continue
+                    if turn.tool_calls:  # tools called again and again after the final answer was asked for
+                        return self._finish("max_steps", "", steps, usage, turn, self._stop_reason)
+                    self.emit({"type": "error", "text": EMPTY_REPLIES})
+                    return AgentResult("", "error", steps, usage, self.events, error=EMPTY_REPLIES,
+                                       stop_reason="empty_replies")
+                self._unanswered = 0
+                results, refused, worst = [], 0, (0, None)
                 for call in turn.tool_calls:
                     if self.cancel.is_set():
                         raise Cancelled()
                     self.emit({"type": "tool_call", "id": call.id, "name": call.name, "args": call.arguments})
-                    res = self._cut_call(call, options.max_tokens) if call in cut_calls else self._call_tool(call, usage)
+                    if call in cut_calls:
+                        res = self._cut_call(call, options.max_tokens)
+                    else:
+                        res = self._call_tool(call, usage)
                     self._track(call, res)
                     self.emit({
                         "type": "tool_result", "id": call.id, "name": call.name,
                         "output": res.content[:30_000], "is_error": res.is_error,
                     })
+                    refused += call in cut_calls or call.id in self._refused
+                    n = self._repeats(call, res)
+                    if REPEAT_NOTE_AT <= n < REPEAT_STOP_AT:
+                        what = f"`{call.name}` " + ctxm.clip(_args_text(call), 300, "arguments")
+                        res = ToolResult(res.call_id, res.content + REPEAT_NOTE.format(
+                            call=what, n=n, what="error" if res.is_error else "result", stop=REPEAT_STOP_AT), res.is_error)
+                    if n > worst[0]:
+                        worst = (n, call)
                     results.append(res)
+                self._rejected_rounds = self._rejected_rounds + 1 if refused == len(results) else 0
                 if self._ro_streak >= READ_STREAK and not self._ro_reminded and results \
                         and self._ro_streak - self._ro_at >= READ_STREAK // 2:  # (re-armed: not right after the last)
                     last = results[-1]
@@ -1235,10 +1389,18 @@ class Agent:
                 self._round_sizes.append(len(results))
                 if self.cancel.is_set():
                     raise Cancelled()
-                conv = self._after_step(conv, provider, model, system, options, turn, results)
-                if self.max_steps and steps >= self.max_steps and not self._nudged:  # max_steps == 0: no step cap
-                    self._add_user(conv, FINAL_NUDGE)
-                    self._nudged = True
+                # Time for the final answer? Decided before _after_step: a compaction there ends its checkpoint with it.
+                ask = ""
+                if not self._nudged:
+                    if why := self._stuck(*worst):
+                        ask, self._stop_reason = STUCK_NUDGE.format(why=why), "stuck"
+                    elif self.max_steps and steps >= self.max_steps:  # max_steps == 0: no step cap
+                        ask, self._stop_reason = FINAL_NUDGE, "step_cap"
+                    self._nudge = ask
+                after = self._after_step(conv, provider, model, system, options, turn, results)
+                if ask and after is conv:
+                    self._add_note(conv, ask)  # with the newest tool results (see _add_note)
+                conv = after
         except Cancelled:
             self._save_partial()
             self.emit({"type": "cancelled"})
@@ -1287,7 +1449,7 @@ class Agent:
             freed = _strip_reasoning(conv, 1)
             if freed:
                 self._conv_chars -= freed
-                if not self._strip_noted:  # (once per conversation: the system prompt already warns about it)
+                if not self._strip_noted and not self._nudged:  # (once per conversation: the system prompt warns too)
                     self._add_note(conv, MASK_NOTE_REASONING)
                     self._strip_noted = True
                 used = self._est()
@@ -1321,6 +1483,31 @@ class Agent:
 def _visible(turn) -> int:
     """Characters of a reply that go back into the conversation (text + tool calls; the reasoning is counted apart)."""
     return len(turn.text or "") + sum(len(json.dumps(c.arguments, ensure_ascii=False)) + len(c.name) for c in turn.tool_calls)
+
+
+def _args_text(call: ToolCall) -> str:
+    """A call's arguments as canonical JSON (the same call whatever the key order)."""
+    try:
+        return json.dumps(call.arguments, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return repr(call.arguments)
+
+
+def _take_back(conv) -> bool:
+    """Remove the reply the last step appended to the history (see Agent._ask_again). False if it cannot be done."""
+    drop = getattr(conv, "drop_last_reply", None)  # (a provider's own way, if it has one)
+    if callable(drop):
+        try:
+            return bool(drop())
+        except Exception:
+            return False
+    msgs = getattr(conv, "messages", None)  # every provider here keeps its native message list there
+    last = msgs[-1] if isinstance(msgs, list) and msgs else None
+    role = last.get("role") if isinstance(last, dict) else last[0] if isinstance(last, tuple) and last else None
+    if role != "assistant":
+        return False
+    msgs.pop()
+    return True
 
 
 def _replays(conv) -> bool:

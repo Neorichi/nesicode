@@ -504,8 +504,8 @@ def test_the_live_buffer_keeps_one_step_of_deltas(env, models):
                 return Turn("Hecho.", [], "end_turn", Usage(10, 10))
             for i in range(deltas):
                 on_event("thinking", f"razono {i} ")
-            return Turn("", [ToolCall(f"c{Reasoner.n}", "list_dir", {"path": "."})], "tool_use", Usage(10, 10),
-                        thinking="razono " * deltas)
+            call = ToolCall(f"c{Reasoner.n}", "search", {"pattern": f"paso{Reasoner.n}"})
+            return Turn("", [call], "tool_use", Usage(10, 10), thinking="razono " * deltas)
 
     models["mock/reasoner"] = lambda: _Prov(Reasoner)
     p = e.project("mock/reasoner")

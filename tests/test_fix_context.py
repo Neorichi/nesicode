@@ -228,7 +228,8 @@ def test_hopeless_context_stops_compacting_and_ends_cleanly(tmp_path, fake):
     def policy(conv, rec):
         if rec["role"] == "summarizer":
             return summarizer(rec)
-        return Turn("sigo", [ToolCall(f"b{len(prov.log)}", "bash", {"command": "echo " + "q" * 2000})], "tool_use", Usage(0, 40))
+        n = len(prov.log)
+        return Turn("sigo", [ToolCall(f"b{n}", "bash", {"command": f"echo {n} " + "q" * 2000})], "tool_use", Usage(0, 40))
     prov = fake(policy, window=32_768)
     events = []
     res = _agent(Workspace(tmp_path / "ws"), events, context_limit=32_768, extra_tools=tools, max_steps=60).run("tarea")
@@ -342,7 +343,7 @@ def test_bad_summaries_are_retried_then_a_bounded_fallback_is_used(tmp_path, fak
         if n >= 14:
             return Turn("fin", [], "end_turn", Usage(0, 10))
         return Turn(f"Valor confirmado: build_salt = q7Rk-55Lw-91Zt (paso {n})",
-                    [ToolCall(f"c{n}", "bash", {"command": "echo " + "v" * 3_000})], "tool_use", Usage(0, 40))
+                    [ToolCall(f"c{n}", "bash", {"command": f"echo {n} " + "v" * 3_000})], "tool_use", Usage(0, 40))
     prov = fake(policy)
     events = []
     res = _agent(Workspace(tmp_path / "ws"), events, context_limit=8_000, output_limit=4_000).run("tarea")
@@ -826,7 +827,7 @@ def test_read_only_streak_gets_one_reminder(tmp_path, fake):
         n = len(prov.executor())
         if n >= 25:
             return Turn("fin", [], "end_turn", Usage(0, 5))
-        return Turn("leo", [ToolCall(f"l{n}", "list_dir", {"path": "."})], "tool_use", Usage(0, 5))
+        return Turn("leo", [ToolCall(f"l{n}", "search", {"pattern": f"TODO-{n}"})], "tool_use", Usage(0, 5))
     prov = fake(policy)
     _agent(Workspace(tmp_path / "ws"), [], context_limit=128_000).run("explora")
     tools = [m["content"] for m in prov.executor()[-1]["messages"] if m["role"] == "tool"]

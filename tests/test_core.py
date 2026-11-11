@@ -191,7 +191,7 @@ def test_max_steps_zero_has_no_step_cap(tmp_path, monkeypatch):
     def step(self, on_event=None):
         n = self.steps  # _reply() increments it, mirroring the real executor
         if n < FINISH_AT:
-            return self._reply(f"paso {n}", [ToolCall(f"c{n}", "list_dir", {"path": "."})], on_event)
+            return self._reply(f"paso {n}", [ToolCall(f"c{n}", "bash", {"command": f"echo paso {n}"})], on_event)
         return self._reply("Hecho: objetivo cumplido.", on_event=on_event)
 
     monkeypatch.setattr(MockConversation, "step", step)
