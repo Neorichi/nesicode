@@ -5,7 +5,7 @@
   the disconnect, so it stops generating (and billing).
 - `pump`: runs the blocking request on a helper thread while the caller's thread forwards its deltas to `on_event`
   (which may raise the agent's Cancelled), watches Stop and enforces the first-byte / idle timeouts. There is no
-  total-duration limit while data flows.
+  total-duration limit while data flows; a reply marked complete gets only FINISH_GRACE for its stream to end.
 - `with_retries`: exponential backoff with jitter, honours Retry-After, notifies before each retry, never sleeps
   after the last attempt, and every wait can be cancelled.
 - The private-network guard for user-defined endpoints and for image URLs returned by providers.
@@ -40,6 +40,10 @@ RETRY_AFTER_CAP = 60.0  # never wait longer than this before one retry, whatever
 RETRY_AFTER_GIVE_UP = 300.0  # a provider asking for a longer wait (quota exhausted) is not retried
 RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529}
 IMAGE_MAX_BYTES = 20 * 1024 * 1024
+# A reply whose end has arrived (its finish_reason) waits at most this long (never more than the idle limit) for the
+# rest of its stream (usage, [DONE]) before it is taken as it is: a server that never closes it must not cost a stall
+# and a regenerated reply.
+FINISH_GRACE = 5.0
 
 
 def _env_seconds(name: str, default: float) -> float:
@@ -157,11 +161,14 @@ class Call:
         self._lock = threading.Lock()
         self._socks: list = []
         self.policy = policy
-        self.reason = ""  # why it was aborted: cancel | idle | caller | blocked
+        self.reason = ""  # why it was aborted: cancel | idle | caller | blocked | finished
         self.blocked = ""  # the policy refused the address it connected to
         self.last = time.monotonic()  # last bytes received
         self.data = False  # the reply has started: the idle limit replaces the first-byte limit
         self.emitted = 0  # deltas handed to the caller
+        # When the reply was complete (its finish arrived), moved on by each later event; 0 = not yet. From then on the
+        # stream gets only FINISH_GRACE more to end: comments and keep-alives do not extend it, unlike `last`.
+        self.finished = 0.0
 
     def touch(self) -> None:
         self.last = time.monotonic()
@@ -206,8 +213,11 @@ def pump(produce: Callable[[Call, Callable[[str, str], None]], Any], call: Call,
          idle: float | None = None) -> Any:
     """Run produce(call, emit) on a helper thread and wait for it here. emit(kind, text) deltas reach `on_event` in
     THIS thread, so the agent's Cancelled propagates unchanged. Stop aborts the request within ~0.1 s, also while it
-    connects; with first_byte/idle, a reply that stays silent too long is aborted and raised as Retryable."""
+    connects; with first_byte/idle, a reply that stays silent too long is aborted and raised as Retryable. Once the
+    producer marks the reply complete (call.finished), the stream gets a short grace to end: then it is aborted as
+    "finished" and the producer returns what it has."""
     q: queue.SimpleQueue = queue.SimpleQueue()
+    grace = min(FINISH_GRACE, idle) if idle else FINISH_GRACE
 
     def work() -> None:
         try:
@@ -226,6 +236,10 @@ def pump(produce: Callable[[Call, Callable[[str, str], None]], Any], call: Call,
                 call.abort("cancel")
                 raise LLMError(CANCELLED)
             if item is None:
+                if call.finished and not call.reason and time.monotonic() - call.finished > grace:
+                    call.abort("finished")  # the reply is whole: stop waiting for the end of its stream and keep it
+                    call.touch()  # (its producer returns at once; the idle limit below still guards that)
+                    continue
                 limit = idle if call.data else first_byte
                 if limit and time.monotonic() - call.last > limit:
                     call.abort("idle")

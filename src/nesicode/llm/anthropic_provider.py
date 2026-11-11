@@ -116,6 +116,51 @@ def _cost(model: str, fresh: int, read: int, write: int, output: int) -> float:
     return (fresh * pin + write * pin * CACHE_WRITE + read * pread + output * pout) / 1_000_000
 
 
+def _billed(final, requested: str) -> float:
+    """$ of a reply, at the prices of the model that ran each part (one we have no price for: the requested model's).
+    With a refusal fallback, usage.iterations lists every attempt, the declined ones too (billed), while the top-level
+    usage covers only the one that served the reply."""
+
+    def cost(model, u) -> float:
+        model = str(model or "")
+        fresh, read, write, output = (int(getattr(u, k, 0) or 0) for k in (
+            "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"))
+        return _cost(model if _price_key(model) else requested, fresh, read, write, output)
+
+    attempts = getattr(final.usage, "iterations", None)
+    if attempts:
+        return sum(cost(getattr(a, "model", None), a) for a in attempts)
+    return cost(getattr(final, "model", None), final.usage)
+
+
+def _kind(block) -> str:
+    return str(getattr(block, "type", "") or "")
+
+
+def _kept(blocks: list) -> list[int]:
+    """Indexes of the reply's blocks that make up the turn. A refusal fallback mid-output leaves the declined model's
+    partial before a `fallback` block, and of it only the text counts (the fallback model continued from it). Its
+    thinking and tool calls are left out, as the API requires when the turn is sent back: those calls never run, and
+    no tool_result is sent for them. So are its server-tool calls without their result and any other internal block.
+    The `fallback` blocks stay where they are (the API checks the turn against them)."""
+    last = max((i for i, b in enumerate(blocks) if _kind(b) == "fallback"), default=-1)
+    if last < 0:
+        return list(range(len(blocks)))
+    head = blocks[:last]
+    calls = {b.id for b in head if _kind(b) == "server_tool_use" and getattr(b, "id", None)}
+    paired = {r for b in head if (r := getattr(b, "tool_use_id", None)) in calls}
+
+    def keep(b) -> bool:
+        kind = _kind(b)
+        if kind == "fallback" or (kind == "text" and getattr(b, "text", "")):
+            return True
+        if kind == "server_tool_use":
+            return getattr(b, "id", None) in paired
+        return getattr(b, "tool_use_id", None) in paired  # the result of a server-tool call that is kept
+
+    return [i for i, b in enumerate(head) if keep(b)] + list(range(last, len(blocks)))
+
+
 def _rolling_breakpoint(messages: list[dict]) -> list[dict]:
     """A copy of the history whose last block carries a cache breakpoint. The history itself is never changed, so a
     request has at most two breakpoints (the system prompt and this one) and the next request reads this prefix."""
@@ -294,6 +339,7 @@ class AnthropicConversation(Conversation):
                             closed.add(event.index)
                         elif event.type == "message_stop":
                             state["complete"] = True
+                            break  # the last event: a server that leaves the stream open must not look stalled
                     try:
                         return stream.current_message_snapshot
                     except AssertionError:  # no message_start at all
@@ -331,30 +377,37 @@ class AnthropicConversation(Conversation):
             # The stream ended without its end (e.g. a proxy closed it after an upstream failure). The SDK silently
             # drops a tool input's unfinished fields, so a partial write_file would empty the file: never use it.
             raise Retryable("the reply stream ended before it was complete", partial=partial())
-        return self._take(final, inputs, closed)
+        return self._take(final, inputs, closed, partial())
 
-    def _take(self, final, inputs: dict[int, list[str]], closed: set[int]) -> Turn:
+    def _take(self, final, inputs: dict[int, list[str]], closed: set[int], partial: bool = False) -> Turn:
         u = final.usage
         read = int(getattr(u, "cache_read_input_tokens", 0) or 0)
         write = int(getattr(u, "cache_creation_input_tokens", 0) or 0)
         fresh = int(getattr(u, "input_tokens", 0) or 0)
         output = int(getattr(u, "output_tokens", 0) or 0)
-        # input_tokens is the WHOLE prompt (the loop measures the context with it); the cost uses the cache prices
-        # of the model that actually answered (a refusal fallback may serve the turn)
+        # input_tokens is the WHOLE prompt (the loop measures the context with it), of the attempt that served the reply
         usage = Usage(fresh + read + write, output, cache_read_tokens=read, cache_write_tokens=write)
-        served = str(getattr(final, "model", "") or "")
-        usage.cost_usd = _cost(served if _price_key(served) else self.model, fresh, read, write, output)
+        usage.cost_usd = _billed(final, self.model)
         stop = final.stop_reason
         cut = stop in ("max_tokens", "model_context_window_exceeded")
+        blocks = list(final.content or [])
+        kept = _kept(blocks)
 
-        # Pass the content back unchanged (thinking blocks must survive verbatim).
-        self.messages.append({"role": "assistant", "content": final.content})
+        if any(_kind(blocks[i]) != "fallback" for i in kept):
+            # Pass the content back unchanged (thinking blocks must survive verbatim), but for what a refusal fallback
+            # left out of the turn. An empty reply is not passed back: the API refuses an empty assistant message.
+            self.messages.append({"role": "assistant", "content": [blocks[i] for i in kept]})
+        elif stop in ("end_turn", "tool_use") and not output:
+            # Nothing at all and 0 output tokens (Claude's own empty end_turn reports a few): a provider hiccup
+            raise Retryable("the reply was empty: no text, thinking or tool call, and 0 output tokens (a provider "
+                            "hiccup)", partial=partial)
 
         if stop == "refusal":
             return Turn(text="", stop_reason="refusal", usage=usage)
 
         text_parts, thinking_parts, calls = [], [], []
-        for i, block in enumerate(final.content):
+        for i in kept:
+            block = blocks[i]
             if block.type == "text":
                 text_parts.append(block.text)
             elif block.type == "thinking":
@@ -366,7 +419,7 @@ class AnthropicConversation(Conversation):
                 # A partial input (cut by the output cap or a full window): the SDK drops the unfinished field. Cut
                 # right after the tool's name (the last block, no input at all), the whole input is missing.
                 if i not in closed or not _whole_json(raw) or \
-                        (cut and i == len(final.content) - 1 and not raw.strip() and not args):
+                        (cut and i == len(blocks) - 1 and not raw.strip() and not args):
                     err = CUT if cut else "the tool input arrived incomplete; resend the call"
                 calls.append(ToolCall(id=block.id, name=block.name, arguments=args, parse_error=err))
         return Turn(

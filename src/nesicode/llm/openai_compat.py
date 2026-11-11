@@ -7,6 +7,7 @@ from __future__ import annotations
 import codecs
 import json
 import re
+import time
 import uuid
 from urllib.parse import urlparse
 
@@ -171,7 +172,8 @@ class OpenAICompatConversation(Conversation):
         return turn
 
     def _take(self, data: dict) -> Turn:
-        """A chat completion (streamed and reassembled, or plain) -> Turn; the reply is appended to the history."""
+        """A chat completion (streamed and reassembled, or plain) -> Turn; the reply is appended to the history unless
+        there is nothing in it (strict servers refuse an empty assistant message, e.g. before the loop's next note)."""
         try:
             choice = data["choices"][0]
             msg = choice.get("message") or {}
@@ -210,7 +212,8 @@ class OpenAICompatConversation(Conversation):
             assistant["reasoning_content"] = thinking  # DeepSeek: always (its thinking mode requires the field)
         elif thinking and not self.provider.reasoning_refused:
             assistant[key] = thinking
-        self.messages.append(assistant)
+        if text or replay or any(assistant.get(k) for k in REASONING_KEYS):
+            self.messages.append(assistant)
         u = data.get("usage") if isinstance(data.get("usage"), dict) else {}
         details = u.get("prompt_tokens_details") if isinstance(u.get("prompt_tokens_details"), dict) else {}
         usage = Usage(_int(u.get("prompt_tokens")), _int(u.get("completion_tokens")),
@@ -299,6 +302,7 @@ class OpenAICompatProvider(Provider):
                 if not streamed:  # (a streamed reply was checked as it arrived: _Reply.add)
                     _check_finish(data)
                 _premature_cut(data, req, streamed=streamed)
+                _empty_reply(data, streamed)
                 return data, streamed
             raise last.error(self.name)  # type: ignore[union-attr]
 
@@ -565,6 +569,27 @@ def _premature_cut(data: dict, req: dict, streamed: bool) -> None:
                         "hiccup, not the output limit)", partial=streamed and chars > 0)
 
 
+def _empty_reply(data: dict, streamed: bool) -> None:
+    """A reply with nothing in it (no text, reasoning or tool call) that ended normally although the server generated
+    no token at all (0 or no completion_tokens: a stream of only [DONE], a finish 'stop' after nothing) is a provider
+    hiccup like _premature_cut's, not the model's answer: Retryable, so it never ends a run as 'done' with nothing. A
+    model that chose to stop at once still reports its end-of-sequence token, and a reply with reasoning is the
+    model's too: those are returned, for the loop to handle."""
+    try:
+        choice = data["choices"][0]
+    except (KeyError, IndexError, TypeError):
+        return
+    if not isinstance(choice, dict) or \
+            STOP.get(str(choice.get("finish_reason") or "stop")) not in ("end_turn", "tool_use"):
+        return  # (a cut, a refusal or another stop is judged elsewhere)
+    msg = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    shown = _text(msg.get("content")) + "".join(msg[k] for k in REASONING_KEYS if isinstance(msg.get(k), str))
+    u = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    if not shown.strip() and not msg.get("tool_calls") and _int(u.get("completion_tokens")) == 0:
+        raise Retryable("the reply was empty: no text, reasoning or tool call, and 0 output tokens (a provider hiccup)",
+                        partial=streamed and bool(shown))
+
+
 def _check_status(resp: httpx.Response, call: Call, name: str) -> None:
     """HTTP errors become _Status. A redirect means a wrong base URL: it is never followed (the key would go along)."""
     if resp.status_code >= 400:
@@ -715,9 +740,10 @@ def _read_reply(resp: httpx.Response, call: Call, emit, name: str) -> tuple[dict
             for event, data in decoder.flush():
                 reply.add(event, data, emit, call)
     except httpx.TransportError:
-        if mode != "sse" or call.reason or reply.finish is None:
+        if mode != "sse" or call.reason not in ("", "finished") or reply.finish is None:
             raise
-        # the server dropped the connection after the reply was complete (its finish_reason arrived): keep it
+        # the reply was complete (its finish_reason arrived) when the server dropped the connection, or when the wait
+        # for the end of its stream ran out: keep it
     if mode == "json":
         return _json_reply(bytes(raw), name), False
     if not mode:
@@ -887,6 +913,8 @@ class _Reply:
                     raise Retryable(f"the provider reported an error in the middle of the reply "
                                     f"(finish_reason={choice['finish_reason']})")
                 self.finish = str(choice["finish_reason"])
+        if self.finish is not None:
+            call.finished = time.monotonic()  # complete: its usage and [DONE] get only a short grace (transport.pump)
 
     def _tool(self, tc: dict) -> None:
         idx, cid = tc.get("index"), str(tc.get("id") or "")
