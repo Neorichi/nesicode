@@ -857,6 +857,12 @@ const EN: Record<string, string> = {
   'Programar seguimiento': 'Schedule follow-up',
   'Terminar tarea': 'Finish task',
   'Parar proceso': 'Stop process',
+  'Se recordó al agente que anote lo que ha encontrado': 'The agent was reminded to write down what it found',
+  'Se pidió al agente su respuesta final': 'The agent was asked for its final answer',
+  'Aviso al agente: estaba repitiendo la misma llamada': 'Notice to the agent: it was repeating the same call',
+  'Respuesta cortada en el límite de salida ({n} tokens)': 'Reply cut at the output limit ({n} tokens)',
+  'Respuesta cortada en el límite de salida ({n} tokens, solo razonamiento)': 'Reply cut at the output limit ({n} tokens, reasoning only)',
+  'se le pide que siga ({k}/3)': 'asked to continue ({k}/3)',
   'Nesicode: regla de seguridad (no descartar cambios sin confirmar ni hacer commits que no se pidan)':
     'Nesicode: safety rule (never discard uncommitted changes or make commits nobody asked for)',
   'Nesicode: regla de seguridad (no escribir credenciales ni iniciar sesión)': 'Nesicode: safety rule (never type credentials or sign in)',

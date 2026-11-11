@@ -425,7 +425,7 @@ export const KNOWN_EVENTS = new Set([
   'context_learned', 'masked', 'compacted', 'compaction_error', 'image', 'file', 'notify', 'bot_created', 'bot_finished',
   'connector_error', 'auto_harness', 'auto_harness_skipped', 'auto_harness_error', 'approval_request',
   'approval_result', 'phase', 'stage', 'rollout', 'selected', 'applied', 'adopted', 'adopt_skipped', 'lesson', 'omitted',
-  'stopped',
+  'stopped', 'note', 'output_cut',
 ])
 
 /** The live 'compaction_error' (the summarizer's call failed, or its summary was rejected and is retried) in words. */

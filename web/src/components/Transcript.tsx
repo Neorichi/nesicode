@@ -40,6 +40,14 @@ const TOOL_LABEL = (): Record<string, string> => ({
   stop_process: t('Parar proceso'),
 })
 
+/** The harness notes worth a line in the transcript; the others (mask, continue, empty_reply, no_tools) already have a
+ *  line of their own (🧹, ✂, the error) or tell the user nothing. */
+const NOTE_LABEL = (): Record<string, string> => ({
+  read_streak: '🔔 ' + t('Se recordó al agente que anote lo que ha encontrado'),
+  final_answer: '🏁 ' + t('Se pidió al agente su respuesta final'),
+  repeat: '🔁 ' + t('Aviso al agente: estaba repitiendo la misma llamada'),
+})
+
 function mcpLabel(name: string): string | null {
   const m = name.match(/^mcp__([^_]+(?:-[^_]+)*)__(.+)$/)
   return m ? `${m[1]} · ${m[2].replace(/_/g, ' ')}` : null
@@ -329,6 +337,19 @@ function EventRow({ e, result, decision, retries, current, runId, status }: RowP
       return <div className="muted small">{t('Cancelado.')}</div>
     case 'stopped': // why the run ended before its work was done (its context filled up, it was stuck): its own note
       return e.depth ? null : <div className="auto-note">⏹ {translateError(String(e.text ?? ''))}</div>
+    case 'note': { // a reminder or request the harness gave the agent: only the telling ones
+      const label = e.depth ? '' : (NOTE_LABEL()[String(e.kind)] ?? '')
+      return label ? <div className="auto-note muted small">{label}</div> : null
+    }
+    case 'output_cut': // a reply stopped at the output limit (one cut while it was still reasoning shows nothing else)
+      return e.depth ? null : (
+        <div className="auto-note muted small">
+          ✂ {e.visible
+            ? t('Respuesta cortada en el límite de salida ({n} tokens)', { n: num(e.tokens) })
+            : t('Respuesta cortada en el límite de salida ({n} tokens, solo razonamiento)', { n: num(e.tokens) })}
+          {e.then === 'continue' ? ' — ' + t('se le pide que siga ({k}/3)', { k: e.continuation }) : ''}
+        </div>
+      )
     case 'omitted': // (added by the server between the start and the end of a very long run)
       return <div className="auto-note muted">⋯ {t('{n} entradas intermedias de esta respuesta no se muestran aquí: es muy larga.', { n: num(e.count) })}</div>
   }
