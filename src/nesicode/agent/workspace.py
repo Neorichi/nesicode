@@ -26,6 +26,7 @@ import unicodedata
 import uuid
 import weakref
 from pathlib import Path, PurePath
+from typing import NamedTuple
 
 from ..config import DOTENV_PATHS, app_data_dir, settings
 from ..harness import Harness
@@ -45,6 +46,7 @@ MANIFEST_KEY, MANIFEST_VERSION = "", "2"
 OUTPUT_KEEP = 64_000  # bytes of a command's output kept from its start and from its end
 OUTPUT_CAP = 50_000_000  # a command printing more than this is stopped (a runaway loop would exhaust memory)
 EOF_GRACE = 2.0  # seconds to collect output after the command exits while children it left still hold the pipe
+STOP_GRACE = 5.0  # seconds a background process gets to end on SIGTERM (stop_process) before it is killed
 
 
 class ToolError(Exception):
@@ -1209,6 +1211,12 @@ class Workspace:
             _install_shims(home)
             path = _cage_path(path, self.root, home)
             env["CLANG_MODULE_CACHE_PATH"] = str(home / ".cache" / "clang")  # the default per-user cache is denied
+        # rustup's proxies (~/.cargo/bin/cargo, rustc…) find the toolchains in $RUSTUP_HOME, by default ~/.rustup: here
+        # the private HOME's, which has none. Point them at the user's, which they only read (the cage allows that);
+        # CARGO_HOME stays private (cargo writes its registry cache there).
+        rustup = os.environ.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
+        if os.path.isdir(rustup):
+            env["RUSTUP_HOME"] = rustup
         env["PATH"] = path
         if os.name == "nt":
             env.update({k: v for k, v in os.environ.items() if k.upper() in WINDOWS_ENV})
@@ -1308,27 +1316,88 @@ class Workspace:
 
     # ------------------------------------------------------------ background processes (`cmd &`)
     def _track_background(self, proc: subprocess.Popen, job: _WinJob | None = None) -> None:
-        group: int | _WinJob
+        groups: set[int | _WinJob]
         if os.name == "nt":
             if job is None:
                 return  # (no job: Windows refused one) nothing can find them once their parent is gone
             if not job.active():  # processes left in the command's job?
                 job.close()
                 return
-            group = job
+            groups = {job}
         else:
             try:
                 os.killpg(proc.pid, 0)  # members left in the command's process group?
             except OSError:
                 return
-            group = proc.pid
-        if self._bg.add(group):  # decided under the lock, so a watcher that is just exiting can't miss this group
+            # ...and the groups of what they started with setsid(), while their parents are still there to tell
+            groups = {proc.pid, *_groups_started_by(_process_table(), {proc.pid})}
+        if self._bg.add(*groups):  # decided under the lock, so a watcher that is just exiting can't miss these groups
             self._watcher = threading.Thread(target=_watch_background, args=(weakref.ref(self), self._bg), daemon=True)
             self._watcher.start()
 
     def kill_background(self) -> None:
         """Kill what this workspace's commands left running (call when the run ends; Stop and exit do it too)."""
         self._bg.kill()
+
+    def background_processes(self) -> list[tuple[int, int, str]]:
+        """(pid, parent pid, command line) of what this workspace's commands left running and of what that started,
+        by pid. Windows: the processes in the commands' jobs (parent 0; the program's name for a command line)."""
+        if os.name == "nt":
+            names = _win_process_names()
+            return sorted((pid, 0, names.get(pid, "?")) for _, pids in self._jobs() for pid in pids)
+        table = _process_table(commands=True)
+        return sorted((pid, table[pid].ppid, table[pid].command) for pid in self._left_running(table))
+
+    def stop_background(self, pid: int | None = None) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+        """Stop the background process `pid` of this workspace's commands and what it started (None: all of them): a
+        `kill` from a later command cannot, in the macOS sandbox (each command runs in a sandbox of its own, which may
+        only signal its own processes). They are asked to end first (SIGTERM: a server closes cleanly) and killed when
+        still there after STOP_GRACE s. Returns ([(pid, command line)] stopped, [(pid, command line)] still running);
+        ToolError for a pid that is not theirs."""
+        if os.name == "nt":
+            return self._stop_jobs(pid)
+        table = _process_table(commands=True)
+        ours = self._left_running(table)
+        if pid is not None and pid not in ours:
+            raise _not_yours(pid)
+        targets = ours if pid is None else _descendants(table, [pid]) & ours
+        _signal(targets, signal.SIGTERM)
+        cancel = getattr(self, "cancel", None)
+        deadline = time.monotonic() + STOP_GRACE
+        while (not all(map(_gone, targets)) and time.monotonic() < deadline
+               and not (cancel is not None and cancel.is_set())):
+            time.sleep(0.1)
+        if left := _still_there(targets, table):
+            _signal(left, signal.SIGKILL)
+            deadline = time.monotonic() + 2
+            while not all(map(_gone, left)) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            left = _still_there(left, table)
+        return [(p, table[p].command) for p in sorted(targets - left)], [(p, table[p].command) for p in sorted(left)]
+
+    def _left_running(self, table: dict[int, _Proc]) -> set[int]:
+        with self._bg.lock:
+            groups = {g for g in self._bg.groups if not isinstance(g, _WinJob)}
+        return {pid for pid in _members(table, groups) if not table[pid].zombie}
+
+    def _jobs(self) -> list[tuple[_WinJob, list[int]]]:
+        with self._bg.lock:
+            jobs = [g for g in self._bg.groups if isinstance(g, _WinJob)]
+        return [(job, job.pids()) for job in jobs]
+
+    def _stop_jobs(self, pid: int | None) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+        """stop_background on Windows. A job holds what one command left running, and its processes go together: there
+        is no polite stop for console programs, and no parent links to trust (ids are reused at once)."""
+        jobs = self._jobs()
+        if pid is not None and not any(pid in pids for _, pids in jobs):
+            raise _not_yours(pid)
+        names = _win_process_names()
+        stopped: list[tuple[int, str]] = []
+        failed: list[tuple[int, str]] = []
+        for job, pids in jobs:
+            if pid is None or pid in pids:
+                (stopped if job.kill() else failed).extend((p, names.get(p, "?")) for p in pids)
+        return sorted(stopped), sorted(failed)
 
 
 _XCRUN_NOISE = re.compile(r"^[^\n:]{1,80}: error: couldn't create cache file '[^'\n]*xcrun_db[^'\n]*' \(errno=[^)\n]*\)\n?", re.M)
@@ -1429,6 +1498,139 @@ def docker_argv(root: Path, command: str, name: str, read_dirs=()) -> list[str]:
     ]
 
 
+class _Proc(NamedTuple):
+    ppid: int
+    pgid: int
+    zombie: bool
+    command: str  # "" unless asked for
+
+
+def _process_table(commands: bool = False, proc_root: str = "/proc") -> dict[int, _Proc]:
+    """Every process of the machine by pid (POSIX), {} when it cannot be read: `ps`, else Linux's /proc (a slim
+    container has no `ps`)."""
+    table: dict[int, _Proc] = {}
+    argv = ["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "stat="] + (["-o", "command="] if commands else [])
+    try:
+        out = subprocess.run(argv, capture_output=True, timeout=5).stdout.decode("utf-8", "replace")
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    for line in out.splitlines():
+        f = line.split(None, 4)
+        try:
+            table[int(f[0])] = _Proc(int(f[1]), int(f[2]), f[3].startswith("Z"), f[4].strip() if len(f) > 4 else "")
+        except (IndexError, ValueError):
+            continue
+    if table:
+        return table
+    try:
+        names = [n for n in os.listdir(proc_root) if n.isdigit()]
+    except OSError:
+        return table
+    for name in names:
+        try:
+            with open(os.path.join(proc_root, name, "stat"), "rb") as fh:
+                raw = fh.read()
+            rest = raw[raw.rindex(b")") + 2:].split()  # after "pid (name)": the name may hold spaces and parentheses
+            cmd = b""
+            if commands:
+                with open(os.path.join(proc_root, name, "cmdline"), "rb") as fh:
+                    cmd = fh.read().replace(b"\0", b" ").strip()
+            table[int(name)] = _Proc(int(rest[1]), int(rest[2]), rest[0] in (b"Z", b"X"), cmd.decode("utf-8", "replace"))
+        except (OSError, ValueError, IndexError):
+            continue
+    return table
+
+
+def _descendants(table: dict[int, _Proc], roots) -> set[int]:
+    """The `roots` still in `table` and everything they started, by parent links (a process whose parent is gone has
+    been adopted by init/launchd: nothing tells any more who started it)."""
+    children: dict[int, list[int]] = {}
+    for pid, p in table.items():
+        children.setdefault(p.ppid, []).append(pid)
+    out: set[int] = set()
+    todo = [r for r in roots if r in table]
+    while todo:
+        pid = todo.pop()
+        if pid not in out:
+            out.add(pid)
+            todo.extend(children.get(pid, ()))
+    return out
+
+
+def _members(table: dict[int, _Proc], pgids) -> set[int]:
+    """The processes of the groups `pgids` and everything they started."""
+    pgids = set(pgids)
+    return _descendants(table, [pid for pid, p in table.items() if p.pgid in pgids])
+
+
+def _groups_started_by(table: dict[int, _Proc], pgids) -> set[int]:
+    """The other process groups that hold what the groups `pgids` started: a descendant that called setsid() (a detached
+    child, a browser Playwright launched) leads a group of its own, which a killpg() of theirs never reaches."""
+    pgids, own = set(pgids), os.getpgrp()
+    return {g for g in (table[pid].pgid for pid in _members(table, pgids)) if g > 1 and g != own} - pgids
+
+
+def _kill_groups(pgids) -> None:
+    """SIGKILL the process groups `pgids` and the groups of whatever their processes started. Frozen first, so nothing
+    they start between the snapshot of the process tree and the kill escapes it."""
+    pgids = {g for g in pgids if g > 1}
+    for g in pgids:
+        try:
+            os.killpg(g, signal.SIGSTOP)
+        except OSError:
+            pass
+    more: set[int] = set()
+    try:
+        more = _groups_started_by(_process_table(), pgids)
+    except Exception:  # noqa: BLE001 - never a reason to leave the groups themselves running
+        pass
+    finally:
+        for g in [*pgids, *more]:
+            try:
+                os.killpg(g, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def _signal(pids, sig: int) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
+
+def _gone(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:  # no such process (or, EPERM, the id belongs to another user's process now)
+        return True
+    return False
+
+
+def _still_there(pids, before: dict[int, _Proc]) -> set[int]:
+    """The processes `pids` that are still running, and are the ones `before` saw (same group: not a reused id)."""
+    now = _process_table()
+    return {p for p in pids if p in now and not now[p].zombie and now[p].pgid == before[p].pgid}
+
+
+def _not_yours(pid: int) -> ToolError:
+    return ToolError(f"pid {pid} is not one of the processes your commands left running (or it has ended already); "
+                     "call stop_process without arguments to list them")
+
+
+def _win_process_names() -> dict[int, str]:
+    """{pid: program name} of the running processes (Windows; {} when tasklist fails)."""
+    import csv
+
+    try:
+        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, timeout=20, **_NO_WINDOW).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return {int(row[1]): row[0] for row in csv.reader(out.decode("utf-8", "replace").splitlines())
+            if len(row) > 1 and row[1].isdigit()}
+
+
 def _kill_tree(proc: subprocess.Popen, container: str | None = None, job: _WinJob | None = None) -> None:
     if container:
         try:
@@ -1441,7 +1643,7 @@ def _kill_tree(proc: subprocess.Popen, container: str | None = None, job: _WinJo
                 return  # every process the command started, also those whose parent is gone
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=20, **_NO_WINDOW)
         else:
-            os.killpg(proc.pid, signal.SIGKILL)
+            _kill_groups({proc.pid})  # (its group, and what left it with setsid while its parent was still there)
     except (OSError, subprocess.SubprocessError):
         pass
 
@@ -1525,6 +1727,21 @@ class _WinJob:
             if not k32.QueryInformationJobObject(self._handle, 1, ctypes.byref(acct), ctypes.sizeof(acct), None):
                 return 1
             return int(acct.ActiveProcesses)
+
+    def pids(self) -> list[int]:
+        """The ids of the processes running in the job ([] when it cannot be told)."""
+        ctypes, k32, _, _, _ = self._api
+        n = 4096
+
+        class IdList(ctypes.Structure):  # JOBOBJECT_BASIC_PROCESS_ID_LIST with room for n ids
+            _fields_ = [("Assigned", ctypes.c_uint32), ("Listed", ctypes.c_uint32), ("Ids", ctypes.c_size_t * n)]
+
+        ids = IdList()
+        with self._lock:
+            if not self._handle or not k32.QueryInformationJobObject(self._handle, 3, ctypes.byref(ids),
+                                                                     ctypes.sizeof(ids), None):
+                return []
+        return [int(ids.Ids[i]) for i in range(min(int(ids.Listed), n))]
 
     def kill(self) -> bool:
         """Kill every process in the job and let the job go. False if Windows refused (or it was gone already)."""
@@ -1632,17 +1849,18 @@ class _Capture:
 
 
 class _Background:
-    """Process groups (Windows: jobs, see _WinJob) a workspace's commands left running."""
+    """Process groups (Windows: jobs, see _WinJob) a workspace's commands left running, and the groups of what those had
+    started with setsid() when they were tracked (found through their parents, who may be gone by the time they go)."""
 
     def __init__(self):
         self.groups: set[int | _WinJob] = set()
         self.lock = threading.Lock()
         self.watched = False  # a watcher thread is running (or about to) for these groups
 
-    def add(self, pgid: int | _WinJob) -> bool:
-        """Track a group; True when the caller must start a watcher (none is running)."""
+    def add(self, *groups: int | _WinJob) -> bool:
+        """Track groups; True when the caller must start a watcher (none is running)."""
         with self.lock:
-            self.groups.add(pgid)
+            self.groups.update(groups)
             start, self.watched = not self.watched, True
             return start
 
@@ -1671,11 +1889,8 @@ class _Background:
         for g in groups:
             if isinstance(g, _WinJob):
                 g.kill()
-                continue
-            try:
-                os.killpg(g, signal.SIGKILL)
-            except OSError:
-                pass
+        if pgids := {g for g in groups if not isinstance(g, _WinJob)}:
+            _kill_groups(pgids)  # (with what they started since, if it left their groups)
 
 
 def _watch_background(ws_ref, bg: _Background) -> None:

@@ -1394,12 +1394,23 @@ SCHEMAS = {
         "Long output is trimmed automatically (start and end kept): don't pipe into head/tail just to shorten it. "
         "Processes left in the background (`cmd > log.txt 2>&1 &`) keep running until the run ends or the user "
         "presses Stop."
+        " To list them or stop one (e.g. to restart a server after an edit) use `stop_process`: a `kill` from a later "
+        "command may be refused."
         + (" On this machine the shell is Windows PowerShell (not bash): use PowerShell syntax."
            if shell_name() == "powershell" else ""),
         {"type": "object", "properties": {
             "command": {"type": "string"},
             "timeout": {"type": "integer", "description": "Seconds, default 120, max 900."},
         }, "required": ["command"]},
+    ),
+    "stop_process": ToolSpec(
+        "stop_process", "List the processes your commands left running in the background (servers, watchers…), or stop "
+        "one of them with everything it started, e.g. to restart a server after an edit. Only processes your own "
+        "commands started can be stopped.",
+        {"type": "object", "properties": {
+            "pid": {"type": "integer", "description": "Process id to stop, from the list. Omit it to get the list."},
+            "all": {"type": "boolean", "description": "Stop all of them."},
+        }},
     ),
 }
 
@@ -1416,6 +1427,37 @@ def read_file_spec(budget: int | None = None) -> ToolSpec:
         "lines that matter first)."), base.parameters)
 
 
+def stop_process(ws: Workspace, args: dict) -> str:
+    """List what the workspace's commands left running in the background, or stop some of it (see stop_background)."""
+    pid = args.get("pid")
+    if _bool(args, "all") or (isinstance(pid, str) and pid.strip().lower() == "all"):
+        target = None
+    elif pid is None or pid == "":
+        procs = ws.background_processes()
+        if not procs:
+            return "Nothing your commands started is running in the background."
+        pids = {p for p, _, _ in procs}
+        return "Running in the background (started by your commands):\n" + "\n".join(
+            f"pid {p}: {_one_line(cmd)}" + (f"  (started by {parent})" if parent in pids else "") for p, parent, cmd in procs
+        ) + "\nStop one with stop_process(pid=N) (what it started stops with it), or all of them with stop_process(all=true)."
+    else:
+        target = _int(args, "pid", 0)
+        if target <= 0:
+            raise ToolError("`pid` must be a process id from the list (call stop_process without arguments to get it)")
+    stopped, left = ws.stop_background(target)
+    if not stopped and not left:
+        return "Nothing your commands started is running in the background."
+    out = "Stopped: " + "; ".join(f"pid {p} ({_one_line(cmd)})" for p, cmd in stopped) if stopped else ""
+    if left:
+        out += ("\n" if out else "") + "Could not stop: " + "; ".join(f"pid {p} ({_one_line(cmd)})" for p, cmd in left)
+    return out
+
+
+def _one_line(command: str, limit: int = 200) -> str:
+    command = " ".join(command.split()) or "?"
+    return command if len(command) <= limit else command[: limit - 1] + "…"
+
+
 BASIC_TOOLS: dict[str, Callable[[Workspace, dict], str]] = {
     "list_dir": list_dir,
     "read_file": read_file,
@@ -1423,6 +1465,7 @@ BASIC_TOOLS: dict[str, Callable[[Workspace, dict], str]] = {
     "edit_file": edit_file,
     "search": search,
     "bash": bash,
+    "stop_process": stop_process,
 }
 
 
