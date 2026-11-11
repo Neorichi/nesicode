@@ -2,10 +2,10 @@ import { t, useLang } from '../i18n'
 import { conflictWhy, skippedPath, type ApplyResult, type Conflict } from '../logic'
 
 /**
- * What an Apply left out, path by path: harnessing conflicts (the project's file was kept; the proposed version may
- * be next to it) and paths a conversation's Apply skipped. Nothing when everything was applied.
+ * What an Apply left out, path by path: conflicts (the project's file was kept; the proposed version may be next to
+ * it) and paths that could not be written. Nothing when everything was applied. `chat`: a conversation's Apply.
  */
-export default function ApplyReport({ result, title }: { result: ApplyResult | null | undefined; title?: string }) {
+export default function ApplyReport({ result, title, chat }: { result: ApplyResult | null | undefined; title?: string; chat?: boolean }) {
   useLang()
   const conflicts: Conflict[] = Array.isArray(result?.conflicts) ? result!.conflicts! : []
   const skipped = (Array.isArray(result?.skipped) ? result!.skipped! : []).map(skippedPath)
@@ -21,7 +21,7 @@ export default function ApplyReport({ result, title }: { result: ApplyResult | n
           <ul className="apply-list small">
             {conflicts.map((c, i) => (
               <li key={`${c?.path}:${i}`}>
-                <code>{c?.path}</code> — {conflictWhy(c?.reason)}
+                <code>{c?.path}</code> — {conflictWhy(c?.reason, chat)}
                 {c?.side_file && <> · {t('la versión propuesta está en')} <code>{c.side_file}</code></>}
               </li>
             ))}

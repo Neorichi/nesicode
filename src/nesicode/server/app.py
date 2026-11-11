@@ -38,7 +38,8 @@ from .vault import Vault
 from . import auth
 from .db import DB, loads
 from ..agent.vision import image_mime
-from ..agent.workspace import ATTACHMENTS_DIR, apply_cage, manifest, manifest_paths
+from ..agent.workspace import ATTACHMENTS_DIR, apply_cage, cage_plan, manifest, manifest_paths
+from .cage_git import report as git_report
 from .jobs import (
     FINAL, Jobs, create_cage, current_harness, merge_harness, project_root, project_ws, run_dir, save_harness_version,
     thread_dir, thread_ws, user_root,
@@ -442,7 +443,8 @@ def run_view(run: dict, *, full: bool = False) -> dict:
     if full:
         out["result"] = result
     else:
-        out["summary"] = {k: result.get(k) for k in ("selected", "harness_changed", "adopted_version", "usage", "steps") if k in result}
+        out["summary"] = {k: result.get(k) for k in ("selected", "harness_changed", "adopted_version", "usage", "steps",
+                                                     "stop_reason") if k in result}
     return out
 
 
@@ -2670,6 +2672,23 @@ def thread_out(t: dict) -> dict:
     return {k: v for k, v in t.items() if k != "manifest"}
 
 
+VIEW_EVENTS = 5_000  # events of one run a page gets: all of them, or (a very long run) its first VIEW_HEAD and its newest
+VIEW_HEAD = 500
+
+
+def view_events(run_id: int) -> list[dict]:
+    """A run's events for a page. A very long one (an autonomous turn of thousands of steps) brings its start and its
+    newest events — its end, the final answer and 'done', always show — with one 'omitted' marker between them (no
+    seq: a stream resumes after the newest event shown)."""
+    events = [{"seq": s, **e} for s, e in db.events_after(run_id, 0, limit=VIEW_EVENTS + 1)]
+    if len(events) <= VIEW_EVENTS:
+        return events
+    rows = db.all("SELECT seq, data FROM events WHERE run_id=? ORDER BY seq DESC LIMIT ?", (run_id, VIEW_EVENTS - VIEW_HEAD))
+    tail = [{"seq": r["seq"], **json.loads(r["data"])} for r in reversed(rows)]
+    head = events[:VIEW_HEAD]
+    return head + [{"type": "omitted", "count": tail[0]["seq"] - head[-1]["seq"] - 1}] + tail
+
+
 @app.get("/api/threads/{thread_id}")
 def read_thread(thread_id: int, user: dict = Depends(current_user)):
     t, _ = get_thread(user, thread_id)
@@ -2677,7 +2696,7 @@ def read_thread(thread_id: int, user: dict = Depends(current_user)):
     msgs = []
     for r in runs:
         view = run_view(r)
-        view["events"] = [{"seq": s, **e} for s, e in db.events_after(r["id"], 0, limit=5000)]
+        view["events"] = view_events(r["id"])
         msgs.append(view)
     tg = db.one("SELECT chat_id, active_thread FROM telegram_links WHERE user_id=?", (user["id"],)) or {}
     b = db.one("SELECT * FROM bots WHERE id=? AND user_id=? AND project_id=?", (t.get("bot_id"), user["id"], t["project_id"])) if t.get("bot_id") else None
@@ -2881,10 +2900,13 @@ def cage_change_sets(base: dict, cage: Path) -> tuple[list[str], list[str], list
 def cage_changes(base: dict, cage: Path, project: Path, max_chars: int = 80_000) -> dict:
     """What a conversation changed since its starting manifest, diffed against the project. Same output as
     workspace.changes_since, but the project side is read without following links: a linked folder in the
-    project (`d -> another user's project`) must not print someone else's .env as the 'old' side."""
+    project (`d -> another user's project`) must not print someone else's .env as the 'old' side. 'conflicts': the
+    paths the project changed meanwhile too ({"path", "reason"}), which «Aplicar» leaves as they are (cage_plan)."""
     import difflib
 
     added, modified, removed = cage_change_sets(base, cage)
+    conflicts = [{"path": rel, "reason": reason} for rel, reason, _side in
+                 cage_plan(manifest_paths(base), cage, project, (added, modified, removed))["conflicts"]]
     chunks: list[str] = []
     for rel in added + modified + removed:
         (had, ta), (has, tb) = _diff_side(project, rel), _diff_side(cage, rel)
@@ -2896,19 +2918,19 @@ def cage_changes(base: dict, cage: Path, project: Path, max_chars: int = 80_000)
     text = "".join(c if c.endswith("\n") else c + "\n" for c in chunks)
     if len(text) > max_chars:
         text = text[:max_chars] + "\n... (diff truncated)\n"
-    return {"added": added, "modified": modified, "removed": removed, "diff": text}
+    return {"added": added, "modified": modified, "removed": removed, "diff": text, "conflicts": conflicts}
 
 
 def prepare_targets(root: Path, writes: list[str], removes: list[str]) -> None:
-    """Before a conversation's changes are copied onto the project (apply_cage writes with plain open() and is not
-    three-way; a harnessing run's «Aplicar» never uses this, see apply_run): a path whose folders go through a link —
-    or meet a file, FIFO… where a folder should be — refuses the whole apply; a link AT a path about to be written is
-    removed first, so the copy replaces the link instead of writing wherever it points. Call it holding the project
-    lock (shared-workspace runs hold it too)."""
+    """Before a conversation's changes are copied onto the project (a harnessing run's «Aplicar» never uses this, see
+    apply_run): a path whose folders go through a link — or meet a file, FIFO… where a folder should be — refuses the
+    whole apply. A link AT a changed path is left to apply_cage: it replaces the link (never writing through it) only
+    when the link is what the conversation started from, and keeps a link the user made meanwhile. Call it holding the
+    project lock (shared-workspace runs hold it too)."""
     import stat as _stat
 
-    blocked, links, writing = [], [], set(writes)
-    for rel in sorted(writing | set(removes)):
+    blocked = []
+    for rel in sorted(set(writes) | set(removes)):
         try:
             parts = rel_parts(rel)
         except UnsafePath:
@@ -2929,10 +2951,7 @@ def prepare_targets(root: Path, writes: list[str], removes: list[str]) -> None:
         if not bad:
             try:
                 mode = os.lstat(root / rel).st_mode
-                if _stat.S_ISLNK(mode):
-                    if rel in writing:  # (a link that is removed goes itself: unlink never follows it)
-                        links.append(rel)
-                elif not _stat.S_ISREG(mode):
+                if not (_stat.S_ISLNK(mode) or _stat.S_ISREG(mode)):
                     bad = True
             except FileNotFoundError:
                 pass
@@ -2943,8 +2962,6 @@ def prepare_targets(root: Path, writes: list[str], removes: list[str]) -> None:
     if blocked:
         raise HTTPException(422, "No se ha aplicado nada: en el proyecto estas rutas pasan por un enlace simbólico o no "
                                  "son ficheros normales: " + ", ".join(blocked[:10]) + ("…" if len(blocked) > 10 else ""))
-    for rel in links:
-        unlink_in(root, rel, only_link=True)
 
 
 HTML_SANDBOX_CSP = (
@@ -2993,7 +3010,9 @@ def thread_changes(thread_id: int, user: dict = Depends(current_user)):
     t, p = get_thread(user, thread_id)
     if not t["isolated"]:
         return {"isolated": False, "added": [], "modified": [], "removed": [], "diff": ""}
-    return {"isolated": True, **cage_changes(loads(t["manifest"], {}), thread_ws(p, t), project_ws(p))}
+    cage = thread_ws(p, t)
+    # 'git': commits/stashes made in the copy, which «Aplicar» never brings over (None: none, or nothing known)
+    return {"isolated": True, **cage_changes(loads(t["manifest"], {}), cage, project_ws(p)), "git": git_report(cage)}
 
 
 @contextmanager
@@ -3022,13 +3041,17 @@ def thread_apply(thread_id: int, user: dict = Depends(current_user)):
     if db.one("SELECT id FROM runs WHERE thread_id=? AND status IN ('queued', 'running')", (thread_id,)):
         raise HTTPException(409, "Espera a que termine la respuesta en curso")
     cage, target, base = thread_ws(p, t), project_ws(p), manifest_paths(loads(t["manifest"], {}))
+    if not target.is_dir():  # (a removal would look done, and be dropped from the Changes panel for good)
+        raise HTTPException(409, "La carpeta del proyecto no está disponible (¿está en un disco desconectado o se ha "
+                                 "movido?): no se ha aplicado nada.")
     with project_lock(p["id"]):
         added, modified, removed = cage_change_sets(base, cage)
         prepare_targets(target, added + modified, removed)
-        applied = apply_cage(base, cage, target)
+        # three-way: what the project changed meanwhile is kept, the conversation's version beside it ('conflicts')
+        applied = apply_cage(base, cage, target, (added, modified, removed))
     # Re-baseline: later applies only carry changes made after this one — except the ones that could not be applied
-    # ('skipped': a link or a folder in the way…): they keep their starting entry, so the Changes panel goes on listing
-    # them until they apply (or are undone in the conversation).
+    # ('skipped': a link or a folder in the way…; 'conflicts': the project changed them too): they keep their starting
+    # entry, so the Changes panel goes on listing them until they apply (or are undone in the conversation).
     done = {*applied.get("added", []), *applied.get("modified", []), *applied.get("removed", [])}
     now = manifest(cage)
     for rel in {*added, *modified, *removed} - done:
@@ -3215,7 +3238,7 @@ def list_runs(project_id: int, kind: str = "harness", user: dict = Depends(curre
 def read_run(run_id: int, user: dict = Depends(current_user)):
     run, _ = get_run(user, run_id)
     view = run_view(run, full=True)
-    view["events"] = [{"seq": s, **e} for s, e in db.events_after(run_id, 0, limit=5000)]
+    view["events"] = view_events(run_id)
     return view
 
 

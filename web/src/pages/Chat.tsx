@@ -10,8 +10,8 @@ import { forgetDraft } from '../drafts'
 import { PausedNote } from './Bots'
 import { t, useLang } from '../i18n'
 import {
-  applySummary, compactionNotice, compactReason, endedRuns, endsLiveText, followAgainIn, liveText, mergeLoaded, openFileError, queueStalled,
-  runKey, withEvent, withRun, type ApplyResult,
+  applySummary, compactionNotice, compactReason, endedRuns, endsLiveText, followAgainIn, gitNotes, liveText, mergeLoaded, openFileError, queueStalled,
+  runKey, withEvent, withRun, type ApplyResult, type GitNote,
 } from '../logic'
 
 type Ctx = { used: number; limit: number; reason?: string }
@@ -355,6 +355,8 @@ export default function Chat() {
                 notice={r.id === activeId ? notice : undefined}
                 interrupted={r.id === activeId ? undefined : interruptedText.get(runKey(r))}
                 runId={r.id}
+                finalText={r.final_text}
+                stopReason={r.summary?.stop_reason}
               />
               {r.status !== 'running' && r.status !== 'queued' && !gone && <ImproveButton run={r} pid={Number(pid)} />}
             </div>
@@ -393,8 +395,12 @@ export default function Chat() {
   )
 }
 
-// (skipped: paths an earlier Apply could not copy, when the server keeps listing them until they are resolved)
-type Changes = { added: string[]; modified: string[]; removed: string[]; diff: string; skipped?: string[] }
+// (skipped: paths an earlier Apply could not copy, when the server keeps listing them until they are resolved;
+// conflicts: paths the project changed too, which Apply leaves as they are; git: commits/stashes Apply never copies)
+type Changes = {
+  added: string[]; modified: string[]; removed: string[]; diff: string; skipped?: string[]
+  conflicts?: { path: string; reason: string }[]; git?: GitNote | null
+}
 // A symbolic link is listed as one entry (never entered or followed): it opens when it points to a file of the copy.
 type TreeEntry = { path: string; dir: boolean; size: number; link?: boolean }
 
@@ -451,8 +457,10 @@ function ChangesButton({ tid, busy }: { tid: number; busy: boolean }) {
     if (!busy) load()
   }, [busy, load])
   const n = ch ? ch.added.length + ch.modified.length + ch.removed.length : 0
+  const pending = Array.isArray(ch?.conflicts) ? ch!.conflicts! : [] // changed in the project too: Apply keeps them
   const apply = async () => {
-    if (!confirm(t('¿Copiar {n} cambio(s) de esta conversación a la carpeta del proyecto?', { n }))) return
+    const kept = pending.length ? `\n\n${t('{c} de ellos cambiaron también en el proyecto: esos no se sobrescriben (la versión de la conversación queda al lado, como .nesicode-new).', { c: pending.length })}` : ''
+    if (!confirm(t('¿Copiar {n} cambio(s) de esta conversación a la carpeta del proyecto?', { n }) + kept)) return
     setTab('changes') // where the result is shown
     setMsg('')
     setErr('')
@@ -513,8 +521,19 @@ function ChangesButton({ tid, busy }: { tid: number; busy: boolean }) {
               )}
               {msg && <div className="ok-box">{msg}</div>}
               {err && <div className="error-box">{err}</div>}
-              <ApplyReport result={applied} />
-              <ApplyReport result={earlier} title={t('No se pudieron aplicar la última vez:')} />
+              {!applied && pending.length > 0 && (
+                <div className="apply-report">
+                  <div className="warn small">
+                    {t('{n} archivo(s) cambiaron también en el proyecto después de que esta conversación lo copiara. «Aplicar» no los sobrescribe ni los borra: deja la versión de la conversación al lado, como <nombre>.nesicode-new.', { n: pending.length })}
+                  </div>
+                  <ul className="apply-list small">
+                    {pending.map((c, i) => <li key={`${c?.path}:${i}`}><code>{c?.path}</code></li>)}
+                  </ul>
+                </div>
+              )}
+              {gitNotes(ch?.git).map((line, i) => <div key={i} className="warn small">{line}</div>)}
+              <ApplyReport result={applied} chat />
+              <ApplyReport result={earlier} title={t('No se pudieron aplicar la última vez:')} chat />
               <Diff text={ch?.diff ?? ''} empty={t('Sin cambios todavía')} />
             </div>
             )}
@@ -529,13 +548,14 @@ function ChangesButton({ tid, busy }: { tid: number; busy: boolean }) {
 }
 
 function ImproveButton({ run, pid }: { run: Run; pid: number }) {
-  const [state, setState] = useState<{ id?: number; error?: string; busy?: boolean }>({})
+  const [state, setState] = useState<{ id?: number; error?: string; busy?: boolean; followUp?: boolean }>({})
   const auto = (run.events ?? []).find((e) => e.type === 'auto_harness')
   if (auto) return null
   if (state.id)
     return (
       <div className="improve">
         <Link to={`/p/${pid}/harnessing/${state.id}`}>{t('Harnessing #{n} en marcha →', { n: state.id })}</Link>
+        {state.followUp && <div className="muted small">{t('Este mensaje continúa la conversación: la tarea lleva la conversación, y el harness que salga no se adopta solo (revísalo y adóptalo si te sirve).')}</div>}
       </div>
     )
   return (
@@ -548,7 +568,7 @@ function ImproveButton({ run, pid }: { run: Run; pid: number }) {
           setState({ busy: true })
           try {
             const r = await api.post<Run>(`/api/runs/${run.id}/improve`)
-            setState({ id: r.id })
+            setState({ id: r.id, followUp: !!r.params?.source?.follow_up })
           } catch (e) {
             setState({ error: (e as Error).message })
           }

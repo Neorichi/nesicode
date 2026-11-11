@@ -102,6 +102,25 @@ export function interruptedSaved(events: RunEvent[], text: string): boolean {
 }
 
 /**
+ * The part of a finished run's final answer (runs.final_text) that none of its events shows, '' when they do: the
+ * answer of a run so long that the page got only its start and its newest events, or a note the run added to its
+ * last reply when it stopped (its context was full).
+ */
+export function unshownFinal(events: RunEvent[], finalText: string | null | undefined): string {
+  let final = String(finalText ?? '').trim()
+  // the note a run adds to its answer when it stops (context full, stuck) is drawn from its own 'stopped' event
+  for (const e of list<RunEvent>(events)) {
+    const note = e?.type === 'stopped' && !e.depth ? String(e.text ?? '').trim() : ''
+    if (note && final.endsWith(note)) final = final.slice(0, -note.length).trim()
+  }
+  if (!final) return ''
+  const said = list<RunEvent>(events).filter((e) => e?.type === 'assistant' && !e.depth).map((e) => String(e.text ?? ''))
+  if (said.join('').includes(final)) return '' // (a reply cut by the output limit is several of them, joined)
+  const last = (said[said.length - 1] ?? '').trim()
+  return last && final.startsWith(last) ? final.slice(last.length).trim() : final
+}
+
+/**
  * The runs of a conversation that was deleted meanwhile (in another tab, or with its project): the server stopped its
  * reply and dropped its queue (cancelled) and nothing more will ever come for them, whatever a late reload said.
  */
@@ -274,10 +293,13 @@ export type Conflict = { path: string; reason: string; side_file?: string | null
 /** What an Apply returns: the paths it changed, plus what it did not touch and why. */
 export type ApplyResult = { added?: string[]; modified?: string[]; removed?: string[]; skipped?: string[]; conflicts?: Conflict[] }
 
-/** Why a rollout's change was left out (apply_rollout's codes, in the CLI's words: cli.CONFLICT_WHY). */
-export function conflictWhy(reason: string): string {
+/**
+ * Why a change was left out: apply_rollout's codes, in the CLI's words (cli.CONFLICT_WHY); `chat`: a conversation's
+ * «Aplicar» (three-way against the copy it made of the project), whose 'changed' is about that copy.
+ */
+export function conflictWhy(reason: string, chat = false): string {
   const known: Record<string, string> = {
-    changed: t('cambió en el proyecto después de empezar la ejecución'),
+    changed: chat ? t('cambió en el proyecto después de que esta conversación lo copiara') : t('cambió en el proyecto después de empezar la ejecución'),
     exists: t('ya existe en el proyecto con otro contenido'),
     unsafe: t('sale del proyecto por un enlace simbólico'),
     error: t('no se pudo escribir'),
@@ -351,6 +373,25 @@ export function canRetryApply(r: ApplyResult | null | undefined): boolean {
     || ((c?.reason === 'changed' || c?.reason === 'exists') && !c?.side_file))
 }
 
+// ------------------------------------------------------------------ a conversation's git history
+/** What git did in a conversation's copy of the project that «Aplicar» leaves behind (GET /api/threads/{id}/changes). */
+export type GitNote = { commits?: number; branches?: string[]; stash?: boolean; uncounted?: boolean }
+
+/** That, in words for the Changes panel ([] when there is nothing to say). */
+export function gitNotes(git: GitNote | null | undefined): string[] {
+  const out: string[] = []
+  const n = typeof git?.commits === 'number' && Number.isFinite(git.commits) ? git.commits : 0
+  const branches = list<unknown>(git?.branches).filter((b): b is string => typeof b === 'string' && !!b)
+  const names = branches.length ? ` ${t('Ramas con esos commits: {names}.', { names: branches.join(', ') })}` : ''
+  if (n > 0)
+    out.push(t('{n} commit(s) hechos en esta conversación no llegan al proyecto: «Aplicar» copia solo los ficheros tal como están ahora en su copia, nunca el historial de git. Haz el commit en tu proyecto después de aplicar.', { n }) + names)
+  else if (git?.uncounted === true) // (its commits are packed: git gc in the copy)
+    out.push(t('El historial de git de la copia de esta conversación cambió: «Aplicar» copia solo los ficheros tal como están ahora en ella, nunca los commits ni las ramas.') + names)
+  if (git?.stash === true)
+    out.push(t('Esta conversación guardó cambios con git stash en su copia: no están en sus ficheros, así que «Aplicar» no los copia.'))
+  return out
+}
+
 // ------------------------------------------------------------------ a conversation's files
 /**
  * Why an entry of a conversation's folder («Archivos») could not be shown. A symbolic link opens when it leads to a
@@ -383,7 +424,8 @@ export const KNOWN_EVENTS = new Set([
   'start', 'assistant', 'thinking', 'tool_call', 'tool_result', 'error', 'cancelled', 'done', 'llm_retry', 'context',
   'context_learned', 'masked', 'compacted', 'compaction_error', 'image', 'file', 'notify', 'bot_created', 'bot_finished',
   'connector_error', 'auto_harness', 'auto_harness_skipped', 'auto_harness_error', 'approval_request',
-  'approval_result', 'phase', 'stage', 'rollout', 'selected', 'applied', 'adopted', 'adopt_skipped', 'lesson',
+  'approval_result', 'phase', 'stage', 'rollout', 'selected', 'applied', 'adopted', 'adopt_skipped', 'lesson', 'omitted',
+  'stopped',
 ])
 
 /** The live 'compaction_error' (the summarizer's call failed, or its summary was rejected and is retried) in words. */

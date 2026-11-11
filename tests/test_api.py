@@ -237,12 +237,15 @@ def test_auto_harness_option_b(alice, project):
     assert not any(e["type"] == "auto_harness" for e in chat["events"])
     # on, with a threshold the mock executor (3 steps) reaches
     alice.put("/api/me/settings", json={"auto_harness": True, "auto_harness_min_steps": 3, "auto_harness_daily": 1})
+    # (only a conversation's first message is re-run on its own: each request below starts a conversation)
+    t = alice.post(f"/api/projects/{pid}/threads", json={}).json()
     chat = _chat(alice, t["id"], "otra tarea")
     ev = [e for e in chat["events"] if e["type"] == "auto_harness"]
     assert ev and ev[0]["reason"] == "necesitó 3 pasos"
     hr = wait_run(alice, ev[0]["run_id"])
     assert hr["params"]["source"]["auto"] is True and hr["status"] == "done"
     # daily cap reached
+    t = alice.post(f"/api/projects/{pid}/threads", json={}).json()
     chat = _chat(alice, t["id"], "una más")
     skipped = [e for e in chat["events"] if e["type"] == "auto_harness_skipped"]
     assert skipped and "límite diario" in skipped[0]["why"]

@@ -2,7 +2,7 @@ import { Component, useState, type ReactNode } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { api, costSuffix, statusLabel, type RunEvent } from '../api'
 import { t, translateError, useLang } from '../i18n'
-import { compactionErrorText, compactReason, interruptedSaved, retryGroups, retryText, splitExit, unknownEventNote } from '../logic'
+import { compactionErrorText, compactReason, interruptedSaved, retryGroups, retryText, splitExit, unknownEventNote, unshownFinal } from '../logic'
 import Markdown from './Markdown'
 import { downloadFile, showImage } from './ImageViewer'
 
@@ -326,6 +326,10 @@ function EventRow({ e, result, decision, retries, current, runId, status }: RowP
       return <ApprovalCard req={e} runId={runId} decision={decision} live={status === 'running'} />
     case 'cancelled':
       return <div className="muted small">{t('Cancelado.')}</div>
+    case 'stopped': // why the run ended before its work was done (its context filled up, it was stuck): its own note
+      return e.depth ? null : <div className="auto-note">⏹ {translateError(String(e.text ?? ''))}</div>
+    case 'omitted': // (added by the server between the start and the end of a very long run)
+      return <div className="auto-note muted">⋯ {t('{n} entradas intermedias de esta respuesta no se muestran aquí: es muy larga.', { n: num(e.count) })}</div>
   }
   // a type this version doesn't know (a newer server): one compact line with its own words, if it has any
   const note = unknownEventNote(e)
@@ -343,6 +347,8 @@ export default function Transcript({
   runId,
   interrupted,
   notice,
+  finalText,
+  stopReason,
 }: {
   events: RunEvent[]
   live?: string
@@ -352,6 +358,10 @@ export default function Transcript({
   interrupted?: string
   /** A live-only problem of the step in progress (the context summary failed: 'compaction_error'). */
   notice?: string
+  /** The run's final answer as the server keeps it (shown when no event of the page carries it). */
+  finalText?: string
+  /** Why a 'max_steps' run stopped (the run's summary: 'step_cap' | 'context_full'). */
+  stopReason?: string
 }) {
   useLang()
   events = events.filter((e) => e && typeof e === 'object')
@@ -387,6 +397,13 @@ export default function Transcript({
     )
   })
   if (cut && cutAt < 0) out.push(cutNode)
+  const unshown = !running && (status === 'done' || status === 'max_steps') ? unshownFinal(events, finalText) : ''
+  if (unshown)
+    out.push(
+      <div key="final" className="answer">
+        <Markdown text={unshown} />
+      </div>,
+    )
   return (
     <div className="transcript">
       {out}
@@ -405,7 +422,7 @@ export default function Transcript({
       )}
       {!running && (
         <div className="run-meta">
-          {statusLabel(status)}
+          {statusLabel(status, stopReason || done?.stop_reason)}
           {done && ` · ${t('{n} pasos', { n: num(done.steps) })}${costSuffix(done.usage?.cost_usd)}`}
         </div>
       )}

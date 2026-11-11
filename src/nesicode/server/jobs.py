@@ -80,13 +80,16 @@ def run_dir(project: dict, run_id: int) -> Path:
 
 
 def create_cage(project: dict, thread_id: int) -> dict[str, str]:
-    """Copy the project into a fresh conversation cage; return its starting manifest."""
+    """Copy the project into a fresh conversation cage; return its starting manifest. Its git refs are noted beside it
+    (cage_git): what git does in the copy never reaches the project, and the Changes panel says so."""
     from ..agent.workspace import manifest
+    from .cage_git import record
 
     ws = thread_dir(project, thread_id) / "ws"
     src = project_ws(project)
     src.mkdir(parents=True, exist_ok=True)
     copy_workspace(src, ws)
+    record(ws)
     return manifest(ws)
 
 
@@ -601,15 +604,51 @@ def needs_improvement(res, max_steps: int, prefs: dict) -> str:
     """Why a finished chat answer deserves a harnessing run, or '' if it went fine."""
     if res.status not in ("done", "max_steps"):
         return ""  # API errors, refusals and cancellations are not the harness's fault
-    if res.status == "max_steps":
+    stop = getattr(res, "stop_reason", "")
+    # A 'max_steps' end is the step cap running out only when there is one (a loop that does not say why it stopped:
+    # judged by the project's cap). Otherwise the context filled up: no limit to blame, the thresholds decide.
+    if res.status == "max_steps" and (stop == "step_cap" or (not stop and max_steps)):
         return "agotó el límite de pasos"
     errors = sum(1 for e in res.events if e.get("type") == "tool_result" and e.get("is_error") and not e.get("depth"))
     if errors >= int(prefs.get("auto_harness_min_errors", 3)):
         return f"{errors} errores de herramientas"
     limit = int(prefs.get("auto_harness_min_steps", max(15, max_steps // 2)))
     if res.steps >= limit:
-        return f"necesitó {res.steps} pasos"
+        full = stop == "context_full" or (not stop and res.status == "max_steps")
+        return f"se llenó el contexto tras {res.steps} pasos" if full else f"necesitó {res.steps} pasos"
     return ""
+
+
+HARNESS_STEP_CAP = 150  # harnessing rollouts run unattended: a project with no step cap (0) gets this one for them
+FOLLOW_UP_TASK_CHARS = 24_000  # a follow-up turn re-run by harnessing: its conversation, shortened, fits in this
+
+
+def follow_up_task(db, run: dict) -> str:
+    """A follow-up turn («continúa», «ahora los tests»…) as a task that stands on its own, for harnessing: the
+    conversation's earlier messages, oldest first, each answer shortened (the first one and the newest that fit), then
+    this one. '' for a conversation's first turn: its own text is the task."""
+    rows = _earlier_turns(db, run)
+    if not rows:
+        return ""
+
+    def clip(text: str, n: int) -> str:
+        text = (text or "").strip()
+        return text if len(text) <= n else text[:n].rstrip() + " […]"
+
+    turns = [f"User: {clip(r['task'], 2_000)}\nAssistant: "
+             + (clip(r["final_text"], 1_500) or f"[this turn ended {r['status']} without an answer]") for r in rows]
+    newest, left = [], FOLLOW_UP_TASK_CHARS - len(turns[0])
+    for turn in reversed(turns[1:]):
+        if len(turn) + 2 > left:
+            break
+        newest.append(turn)
+        left -= len(turn) + 2
+    kept = [turns[0], *reversed(newest)]
+    omitted = len(turns) - len(kept)
+    return ("This request continues an earlier conversation and only makes sense with it. The conversation so far, "
+            "oldest first (answers shortened" + (f"; {omitted} message(s) in the middle left out" if omitted else "")
+            + "):\n\n" + "\n\n".join(kept) + "\n\nThe request to carry out now (what the earlier messages asked may not "
+            "be done in this workspace yet: do whatever this request needs):\n" + run["task"])
 
 
 MCP_START_TIMEOUT = 90  # s a message waits for its MCP servers to start (all at once; a hung one is then skipped a while)
@@ -908,6 +947,7 @@ class Jobs:
         self.bots = None  # BotManager, set by the app
         self._lock = threading.RLock()
         self._jobs: dict[int, _Job] = {}  # run_id -> the job that owns it (queued or running)
+        self._held: list[int] = []  # harnessing runs waiting for an unattended slot, oldest first (see _start_held)
         self._closing = False
         self._waiting_since: float | None = None  # when closing first waited for the runs to end (see shutdown)
         # A message accepted but never started goes back to its conversation's queue (resume_waiting starts the queues
@@ -936,8 +976,16 @@ class Jobs:
         return True
 
     def bot_slots(self) -> int:
-        """Unattended bot runs may use every worker but one: a chat always finds a free worker."""
+        """Unattended work — bot runs nobody is chatting in and harnessing runs — may use every worker but one: a chat
+        always finds a free worker."""
         return max(1, self.pool._max_workers - 1)
+
+    def _unattended(self) -> int:
+        """(with _lock) Unattended runs holding a worker or about to: bot runs started by a schedule, a webhook, Telegram
+        or «Ejecutar ahora», and harnessing runs submitted to the pool (one held back for a slot is not)."""
+        bots = self.db.one("SELECT COUNT(*) AS n FROM runs WHERE bot_id IS NOT NULL AND trigger<>'chat' "
+                           "AND status IN ('queued', 'running')")["n"]
+        return bots + sum(1 for j in self._jobs.values() if j.kind == "harness" and not j.finished)
 
     # ------------------------------------------------------------ jobs and runs
     def _owns(self, job: _Job) -> bool:
@@ -1099,7 +1147,7 @@ class Jobs:
             row = self.db.one("SELECT thread_id, kind FROM runs WHERE id=?", (run_id,))
             if row and row["kind"] == "chat" and row["thread_id"]:
                 self.advance(row["thread_id"])
-            self._start_held_bots()
+            self._start_held()
         except Exception as exc:
             print("nesicode: could not start the next queued message:", exc)
 
@@ -1176,12 +1224,10 @@ class Jobs:
 
     def _may_start(self, run: dict) -> bool:
         """(with _lock) Unattended bot runs (schedules, catch-up when the app opens, webhooks, Telegram, «Ejecutar
-        ahora») never take the last worker: they wait in their queue until a bot slot is free."""
+        ahora») never take the last worker: they wait in their queue until an unattended slot is free."""
         if not run.get("bot_id") or run.get("trigger") == "chat":
             return True
-        n = self.db.one("SELECT COUNT(*) AS n FROM runs WHERE bot_id IS NOT NULL AND trigger<>'chat' "
-                        "AND status IN ('queued', 'running')")["n"]
-        return n < self.bot_slots()
+        return self._unattended() < self.bot_slots()
 
     def advance(self, thread_id: int) -> None:
         """Start the oldest waiting message of the conversation, if nothing of it is queued or running (and, for an
@@ -1202,14 +1248,30 @@ class Jobs:
                 self._forget(job)
                 self.db.execute("UPDATE runs SET status='waiting' WHERE id=? AND status='queued'", (nxt["id"],))
 
-    def _start_held_bots(self) -> None:
-        """Bot runs held back by the bots' share of workers start as workers free up (oldest first)."""
+    def _start_held(self) -> None:
+        """Unattended runs held back by their share of workers start as workers free up, oldest first: harnessing runs
+        still 'queued' with no job, and bot runs waiting in their conversation's queue."""
         with self._lock:
             if self._closing:
                 return
-            for r in self.db.all("SELECT thread_id, MIN(created_at) AS t FROM runs WHERE status='waiting' AND bot_id IS NOT NULL "
-                                 "AND trigger<>'chat' AND thread_id IS NOT NULL GROUP BY thread_id ORDER BY t"):
-                self.advance(r["thread_id"])
+            held = []
+            for rid in list(self._held):
+                row = self.db.one("SELECT created_at, status FROM runs WHERE id=?", (rid,))
+                if not row or row["status"] != "queued" or rid in self._jobs:  # withdrawn, deleted or started meanwhile
+                    self._held.remove(rid)
+                else:
+                    held.append(("harness", rid, row["created_at"]))
+            held += [("bot", r["thread_id"], r["t"]) for r in self.db.all(
+                "SELECT thread_id, MIN(created_at) AS t FROM runs WHERE status='waiting' AND bot_id IS NOT NULL "
+                "AND trigger<>'chat' AND thread_id IS NOT NULL GROUP BY thread_id")]
+            for kind, key, _t in sorted(held, key=lambda h: h[2]):
+                if self._unattended() >= self.bot_slots():
+                    return
+                if kind == "harness":
+                    self._held.remove(key)
+                    self._submit(key, "harness", self._harnessing)
+                else:
+                    self.advance(key)
 
     def send_now(self, run_id: int) -> bool:
         """Jump the queue: this waiting message goes next. The reply in progress is stopped; one that had not started
@@ -1260,9 +1322,14 @@ class Jobs:
         self._submit(run_id, "chat", self._chat)
 
     def submit_harnessing(self, run_id: int) -> None:
+        """Run a 'queued' harnessing run — unattended work: while the unattended slots are taken it stays 'queued',
+        held back, and starts when one frees up (_start_held), so a chat always finds a worker."""
         with self._lock:
             self._new_run(run_id)
-        self._submit(run_id, "harness", self._harnessing)
+            if self._unattended() >= self.bot_slots():
+                self._held.append(run_id)
+                return
+            self._submit(run_id, "harness", self._harnessing)
 
     def _submit(self, run_id: int, kind: str, fn) -> None:
         job = _Job(run_id, kind)
@@ -1348,7 +1415,17 @@ class Jobs:
                          "files you create or clone stay in this conversation until the user presses «Archivos → Aplicar al "
                          "proyecto». Always work inside your workspace (never /tmp or other folders), and when you create files the "
                          "user may expect in their folder, tell them where they are and that they appear in " + where +
-                         " after «Aplicar».")
+                         " after «Aplicar».\n«Aplicar» copies files, never git history: commits, branches and stashes made "
+                         "here stay in this copy (and a repository you clone arrives without its .git). So don't commit "
+                         "unless the user asks, and never leave work only in a stash or on another branch — «Aplicar» sees "
+                         "just the files checked out here. If they ask you to commit, do it, but tell them the commit stays "
+                         "in this conversation: the changed files reach " + where + " uncommitted with «Aplicar», to commit "
+                         "there.")
+            if check := (project.get("check_command") or "").strip():
+                note += ("\n\n" if note else "") + ("# Verification\nThe user set this project's verification command "
+                         "(tests, linters, build):\n```\n" + check[:2_000] + "\n```\nRun it with bash after you change "
+                         "code and before your final answer, and report its result. Fix the failures your changes "
+                         "caused and run it again; a failure unrelated to your work is reported, not \"fixed\".")
             if info["on_request"]:
                 note += ("\n\n" if note else "") + ("# Connectors available on request\nThe user has these connectors but wants them used ONLY when they "
                         "explicitly ask for them by name: " + ", ".join(sorted(set(info["on_request"]))) + ". Do the task with "
@@ -1395,9 +1472,10 @@ class Jobs:
                 self._auto_improve(run, project, thread, res, emit)
         except Exception as exc:  # never break the chat because of the auto-improver
             emit({"type": "auto_harness_error", "text": f"{type(exc).__name__}: {exc}"})
+        stop = getattr(res, "stop_reason", "")  # why a 'max_steps' end stopped: the step cap or a full context
         self._finish(  # (it also marks the conversation as updated)
             run_id, res.status, job=job, final_text=res.final_text, error=res.error,
-            result=json.dumps({"usage": res.usage.to_dict(), "steps": res.steps}),
+            result=json.dumps({"usage": res.usage.to_dict(), "steps": res.steps, **({"stop_reason": stop} if stop else {})}),
         )
 
     # ----------------------------------------------------------- connectors
@@ -1613,17 +1691,23 @@ class Jobs:
         return rid
 
     def improve_from_chat(self, run: dict, project: dict, *, auto: bool, reason: str = "") -> int:
-        """Option A/B: re-run a chat request as a Harness² task (same text, same attachments)."""
-        task = run["task"]
+        """Option A/B: re-run a chat request as a Harness² task (same text, same attachments). A follow-up turn
+        («continúa», «ahora los tests»…) means nothing alone: its task carries the conversation (follow_up_task), and
+        what that run finds is only offered — no harness is adopted and no lesson learned on their own."""
+        follow = follow_up_task(self.db, run)
+        task = follow or run["task"]
         atts = loads(run.get("attachments"), [])
         if atts:
             task += "\n\nAttached files (paths relative to the workspace):\n" + "\n".join(
                 f"- `{a['path']}` ({a['kind']})" for a in atts
             )
         params = {
-            "k": 1, "mode": "parallel", "apply_changes": False, "adopt_harness": True,
+            "k": 1, "mode": "parallel", "apply_changes": False, "adopt_harness": not follow,
             "source": {"thread_id": run["thread_id"], "run_id": run["id"], "auto": auto, "reason": reason},
         }
+        if follow:
+            params["learn"] = False
+            params["source"]["follow_up"] = True
         return self.create_harnessing(project, task, params)
 
     def _auto_improve(self, run: dict, project: dict, thread: dict, res, emit) -> None:
@@ -1633,6 +1717,12 @@ class Jobs:
             return
         reason = needs_improvement(res, project["max_steps"], prefs)
         if not reason:
+            return
+        # Only a conversation's first turn stands on its own: a follow-up («continúa», «sí», «ahora los tests») re-run
+        # alone, without the conversation and on the project's files instead of its copy, teaches the harness nothing.
+        if _earlier_turns(self.db, run, limit=1):
+            emit({"type": "auto_harness_skipped", "reason": reason,
+                  "why": "este mensaje continúa la conversación y el harnessing lo repetiría sin el contexto de los anteriores"})
             return
         # The rollouts re-run this request several times with nobody to approve anything: never for a conversation
         # where the user gates commands, nor for a turn where something needed their approval.
@@ -1711,7 +1801,7 @@ class Jobs:
             mode=params.get("mode", "parallel"),
             domain=project["domain"],
             check_command=project["check_command"],
-            max_steps=project["max_steps"],
+            max_steps=project["max_steps"] or HARNESS_STEP_CAP,  # (0 = no cap is for a chat someone can stop)
             rollout_width=settings.rollout_width,
             context_limit=_lim["context"],
             output_limit=_lim["output"],
@@ -1778,7 +1868,7 @@ class Jobs:
             if cancel.is_set():
                 return stopped(result)
             exp = (result.get("reflection") or {}).get("experience")
-            if exp:
+            if exp and params.get("learn", True):  # (never from a follow-up turn: see improve_from_chat)
                 db.insert(
                     "INSERT INTO lessons (user_id, project_id, domain, cue, lesson, evidence, confidence, run_id, created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",

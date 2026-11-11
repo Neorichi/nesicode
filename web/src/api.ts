@@ -224,7 +224,15 @@ export function streamRun(
 
 export const ACTIVE = new Set(['queued', 'running'])
 
-export function statusLabel(status: string): string {
+/** A run's status in words. `stopReason` (the run's summary): why a 'max_steps' end stopped — the step cap, or else
+ *  (a project with no step cap never ends on one) a full context, a loop with no progress, empty replies. */
+export function statusLabel(status: string, stopReason?: string): string {
+  const stopped: Record<string, string> = {
+    context_full: t('Contexto lleno'),
+    stuck: t('Detenido: se repetía sin avanzar'),
+    empty_replies: t('Detenido: el modelo no respondía nada'),
+  }
+  if (status === 'max_steps' && stopReason && stopped[stopReason]) return stopped[stopReason]
   const labels: Record<string, string> = {
     queued: t('En cola'),
     waiting: t('Esperando turno'),

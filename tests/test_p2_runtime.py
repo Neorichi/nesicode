@@ -581,8 +581,11 @@ def test_walks_diffs_copies_and_applies_never_open_a_fifo_or_socket(tmp_path, fi
         assert [(c["path"], c["side_file"]) for c in res["conflicts"]] == [("sub/b.txt", "sub/b.txt.nesicode-new")]
         assert res["modified"] == ["a.txt"] and (project / "sub" / "b.txt.nesicode-new").read_text() == "b2\n"
         assert stat.S_ISFIFO(os.lstat(project / "sub" / "b.txt").st_mode)  # the user's own FIFO is left alone
-        out = _quick(lambda: apply_cage(base, cage, project))  # a conversation's «Aplicar» replaces it
-        assert "sub/b.txt" in out["modified"] and (project / "sub" / "b.txt").read_text() == "b2\n"
+        # a conversation's «Aplicar» is three-way too (v0.4.7): the user's FIFO stays, the conversation's file beside it
+        out = _quick(lambda: apply_cage(base, cage, project))
+        assert out["conflicts"] == [{"path": "sub/b.txt", "reason": "changed", "side_file": "sub/b.txt.nesicode-new"}]
+        assert stat.S_ISFIFO(os.lstat(project / "sub" / "b.txt").st_mode)
+        assert (project / "sub" / "b.txt.nesicode-new").read_text() == "b2\n" and "a.txt" in out["modified"]
         other = tmp_path / "other"
         other.mkdir()
         assert sorted(_quick(lambda: apply_changes(before, cage, other))["modified"]) == ["a.txt", "sub/b.txt"]

@@ -1052,11 +1052,112 @@ def _apply(src_root: Path, target: Path, added: list[str], modified: list[str], 
     return out
 
 
-def apply_cage(base: dict[str, str], root: Path, target: Path) -> dict:
-    """Copy a cage's own changes (relative to its starting manifest) onto `target`. Never writes through a
-    link in `target` and never creates a link pointing out of it; what can't be applied is in 'skipped'."""
-    added, modified, removed = _changes(base, Path(root))
-    return _apply(Path(root), Path(target), added, modified, removed)
+SIDE_SUFFIX = ".nesicode-new"  # a conflict's proposed version, written next to the project's file (as harnessing's)
+
+
+def _entry_sig(root: Path, rel: str, cache: dict | None = None) -> str | None:
+    """root/rel as manifest() records it — sha256, 'large:<size>:<mtime>' or 'symlink:<target>' —, without following
+    any link on the way. None: nothing there. 'alias': only another spelling of it (a case-insensitive disk). 'dir',
+    'other' (a FIFO, a socket…: never opened). '?': it can't be reached without a link, or read (writing it is
+    refused the same way, so whatever acts on it reports it as skipped)."""
+    try:
+        parts = _parts(root, rel)
+        if _FD_WALK:
+            dfd = _parent_fd(root, parts)
+            try:
+                st = os.stat(parts[-1], dir_fd=dfd, follow_symlinks=False)
+                link = os.readlink(parts[-1], dir_fd=dfd) if stat.S_ISLNK(st.st_mode) else None
+            finally:
+                os.close(dfd)
+        else:
+            p = _no_links(root, parts[:-1]) / parts[-1]
+            st = os.lstat(p)
+            link = os.readlink(p) if stat.S_ISLNK(st.st_mode) else None
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return "?"
+    if not _lexists_exact(root, rel, cache):
+        return "alias"
+    if link is not None:
+        return "symlink:" + link
+    if not stat.S_ISREG(st.st_mode):
+        return "dir" if stat.S_ISDIR(st.st_mode) else "other"
+    try:
+        return _file_sig(root, rel, st)
+    except (OSError, ValueError):
+        return "?"
+
+
+def _fold(rel: str) -> str:
+    return unicodedata.normalize("NFC", rel).casefold()
+
+
+def cage_plan(base: dict[str, str], root: Path, target: Path, changes=None) -> dict:
+    """What «Aplicar» does with each of a cage's own changes, judged three-way against `target` as it is now, the base
+    being the cage's starting manifest: a change lands where the project still holds what the cage started from; one
+    the project already has is done; a path the project changed meanwhile (the user in their editor, another
+    conversation's «Aplicar») is a conflict — never overwritten nor deleted. `changes`: (added, modified, removed) when
+    already computed. Returns {"write": {kind: [rel]}, "done": {kind: [rel]}, "conflicts": [(rel, reason, side)]}:
+    reason 'changed' (the project's entry changed since) or 'exists' (the project got its own entry where the cage
+    added one); side = the cage's version goes next to it."""
+    root, target, base = Path(root), Path(target), manifest_paths(base)
+    added, modified, removed = changes if changes is not None else _changes(base, root)
+    write: dict = {"added": [], "modified": [], "removed": []}
+    done: dict = {"added": [], "modified": [], "removed": []}
+    conflicts: list = []
+    if not target.is_dir():  # the project's folder is not there (a disk not connected…): nothing to judge against
+        return {"write": {"added": list(added), "modified": list(modified), "removed": list(removed)}, "done": done,
+                "conflicts": conflicts}
+    cache: dict = {}
+    for rel in removed:
+        cur = _entry_sig(target, rel, cache)
+        if cur is None:
+            done["removed"].append(rel)  # already gone
+        elif cur in ("?", base.get(rel)):
+            write["removed"].append(rel)
+        else:
+            conflicts.append((rel, "changed", False))
+    gone = {_fold(rel) for rel in write["removed"]}
+    for kind, rels in (("added", added), ("modified", modified)):
+        for rel in rels:
+            cur = _entry_sig(target, rel, cache)
+            # (an added path where the project has a folder: the copy replaces it if empty, else reports it skipped; a
+            # spelling of it the apply removes first: a case-only rename)
+            if cur in ("?", base.get(rel)) or (kind == "added" and (cur == "dir" or (cur == "alias" and _fold(rel) in gone))):
+                write[kind].append(rel)
+            elif cur not in ("dir", "other", "alias") and cur == _entry_sig(root, rel):
+                done[kind].append(rel)  # already there
+            else:
+                conflicts.append((rel, "exists" if kind == "added" else "changed", True))
+    return {"write": write, "done": done, "conflicts": conflicts}
+
+
+def _side_file(root: Path, target: Path, rel: str) -> str | None:
+    """The cage's version of a conflicting file, written next to the project's as <name>.nesicode-new (a regular file
+    only, never through a link). Its path, or None when it could not be written."""
+    try:
+        if not stat.S_ISREG(os.lstat(Path(root, rel)).st_mode):
+            return None
+        _copy_entry(Path(root), Path(target), rel, dst_rel=rel + SIDE_SUFFIX)
+        return rel + SIDE_SUFFIX
+    except (OSError, ValueError):
+        return None
+
+
+def apply_cage(base: dict[str, str], root: Path, target: Path, changes=None) -> dict:
+    """Copy a cage's own changes (relative to its starting manifest) onto `target`, three-way (cage_plan): what the
+    project changed meanwhile is never overwritten or deleted — it comes back in 'conflicts' ({"path", "reason",
+    "side_file"}, as harnessing's apply_rollout), the cage's version next to it as <name>.nesicode-new. Never writes
+    through a link in `target` and never creates a link pointing out of it; what can't be applied is in 'skipped'."""
+    plan = cage_plan(base, root, target, changes)
+    w = plan["write"]
+    out = _apply(Path(root), Path(target), w["added"], w["modified"], w["removed"])
+    for kind, rels in plan["done"].items():
+        out[kind] = sorted(out[kind] + rels)
+    out["conflicts"] = [{"path": rel, "reason": reason, "side_file": _side_file(root, target, rel) if side else None}
+                        for rel, reason, side in plan["conflicts"]]
+    return out
 
 
 class Workspace:
