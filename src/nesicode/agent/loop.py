@@ -113,16 +113,36 @@ NO_BOT_EVASION = (
     "browser to do it unless the user asked you to test it: if a download needs a real browser, ask for the file."
 )
 # A reply without tool calls ends the run: one that only announces its next step («Ahora ejecuto los tests») stopped the
-# work unverified until the user typed «continúa».
+# work unverified until the user typed «continúa». Seen live too: a bug explained to the user with the output the model
+# had predicted before running anything ("-0,95 €"), not the "-1,95 €" the tests had printed.
 TURN_END = (
     "# When your turn ends\n\n"
     "A reply without tool calls is your final answer: it ends your turn. Never end a reply by announcing what you will "
-    "do next («Ahora ejecuto los tests», \"Next I'll update the docs\"): make that tool call in the same reply."
+    "do next («Ahora ejecuto los tests», \"Next I'll update the docs\"): make that tool call in the same reply. In "
+    "your final answer, quote outputs, values and errors as your tools really returned them, never as you "
+    "predicted them."
 )
+# (seen live: logic replaced in a bug fix was checked only with the inputs the existing tests already used)
 NO_STEP_CAP = (
     "This run has no step limit: keep working until the task is done, or until you are blocked by something only the "
-    "user can resolve (then say exactly what you need). Before your final answer, verify the result (run the tests or "
-    "checks that exist, re-read what you changed) and say what you verified."
+    "user can resolve (then say exactly what you need). When you replace logic, list what the old code also handled "
+    "(guards, special cases, input formats) and check each with a quick run of your own, not only the tests. Before "
+    "your final answer, verify the result (run the tests or checks that exist, re-read what you changed) and say what "
+    "you verified."
+)
+# .nesicode/ lives in the workspace: seen live, a final `grep -rn … .` of the project from bash returned 13k chars, most
+# of them lines of the conversation's own archived history (the search tool skips the folder; the shell does not).
+OWN_FOLDER = (
+    f"`{HARNESS_DIR}/` is Nesicode's own folder (conversation archives, harness scripts), not part of the project: "
+    "leave it out of project-wide searches and bulk edits from the shell (e.g. "
+    f"`grep -r --exclude-dir={HARNESS_DIR}`); the `search` tool already skips it."
+)
+# Reasoning counts toward a reply's output cap: seen live, a reasoning-only reply drafted a whole file until it was cut
+# off at the cap, and the file then had to be written out again as write_file's arguments.
+ROOMY_WINDOW = 64_000  # tokens: from here the optional prompt lines below are always sent
+NO_DRAFTS = (
+    "Never draft whole files in your reasoning, where they count toward each reply's output cap and must then be "
+    "written out again: write them with write_file and refine them with edit_file."
 )
 # The repository's own instructions for coding agents. Anyone who can push to the repo wrote them: they are labelled as
 # its files, bounded, and rank below the user's requests and the guardrails.
@@ -298,6 +318,9 @@ def build_system(h: Harness, ws: Workspace, *, base: str | None = None, extra_to
     budget = min(REPO_RULES_MAX, int(context_limit * ctxm.CHARS_PER_TOKEN * 0.05)) if context_limit else REPO_RULES_MAX
     parts.append(repo_instructions(ws, budget))
     mode = sandbox_mode()
+    # (two helpful but optional lines only where tokens are cheap: on a small window every token of this prompt is
+    # paid on every request and moves the compactions earlier)
+    roomy = not context_limit or context_limit >= ROOMY_WINDOW
     env = [
         "# Environment",
         "",
@@ -307,11 +330,13 @@ def build_system(h: Harness, ws: Workspace, *, base: str | None = None, extra_to
         _shell_line(mode),
         _git_line(ws),
         f"Today is {time.strftime('%Y-%m-%d')}.",
+        *([NO_DRAFTS] if roomy else []),
         "Your private reasoning may be dropped between steps, and old tool outputs get cleared to save context: put "
         "facts you will need later (exact values, findings, decisions) in your visible replies, the deliverable or your "
         f"notes file as soon as you have them. Your notes file is `{notes or notes_file()}`: it lives in this "
         "conversation's archive, apart from the project's files, and `search_history` searches it; read it again after a "
         "context compaction. Never create notes files in the project unless the user asks for one.",
+        *([OWN_FOLDER] if roomy else []),
     ]
     dirs = seen_paths(getattr(ws, "read_dirs", ()), mode)
     if dirs:  # (with no OS sandbox nothing enforces it: still what the user allows, so still true)
