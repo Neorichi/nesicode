@@ -18,7 +18,7 @@ import pytest
 
 from nesicode.agent import Agent, Workspace
 from nesicode.agent import context as ctxm
-from nesicode.agent.loop import ANSWER_LEFT_OUT, TRAIL_MARK
+from nesicode.agent.loop import ANSWER_LEFT_OUT, RECORD_CLOSE, RECORD_OPEN, TRAIL_MARK
 from nesicode.harness import base_harness
 from nesicode.llm.base import ToolCall, Turn, Usage
 
@@ -251,6 +251,9 @@ def test_a_continue_rebuild_trims_the_earlier_trail_before_this_runs_steps_and_f
     steps = re.search(r"## Most recent steps.*?(?=\n## )", checkpoint, re.S).group(0)
     assert len(steps) > 20_000  # this run's recent steps stay (v0.4.6: crushed to ~4k while the old trail stayed whole)
     assert "shown COMPLETE" in checkpoint  # and the files it was reading
-    earlier = post[2]["content"]  # the previous turn's answer: its trail gave way first, keeping its newest steps
-    assert len(earlier) < 60_000 and earlier.rstrip().endswith("[ÚLTIMO-PASO]")
+    assert post[2] == {"role": "assistant", "content": "(no answer)"}  # (that stopped turn wrote no answer)
+    # Nesicode's record of the previous turn opens the next user message: its trail gave way first, keeping its newest
+    # steps
+    earlier = post[3]["content"].split(RECORD_CLOSE, 1)[0]
+    assert earlier.startswith(RECORD_OPEN) and len(earlier) < 60_000 and earlier.rstrip().endswith("[ÚLTIMO-PASO]")
     assert RULE in post[1]["content"]  # the user's message (the rule) stays whole

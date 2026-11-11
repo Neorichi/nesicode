@@ -932,8 +932,9 @@ def _search(ws, files, rx, budget: _Budget | None = None) -> str:
 
 # What an archive line is (history.md / transcripts use these prefixes; a line without one continues the item above)
 _LINE_KIND = (("[ASSISTANT]", "said"), ("[THINKING]", "said"), ("[REASONING", "said"), ("### Usuario", "user"),
-              ("## The user's request", "user"), ("### Respuesta final", "said"), ("[ACTION]", "action"),
-              ("[OBSERVATION]", "output"), ("[ERROR]", "output"), ("### Pasos", "other"), ("## Steps", "other"))
+              ("## The user's request", "user"), ("### Respuesta final", "said"), ("### Sin respuesta final", "said"),
+              ("[ACTION]", "action"), ("[OBSERVATION]", "output"), ("[ERROR]", "output"), ("### Pasos", "other"),
+              ("## Steps", "other"))
 _KIND_RANK = {"said": 0, "user": 0, "summary": 1, "action": 2, "other": 2, "output": 3}
 _NO_WORDS: frozenset = frozenset()
 
@@ -1097,6 +1098,14 @@ def run_digest(events: list[dict], max_chars: int = 4_000, *, actions: bool = Tr
             "urls": list(dict.fromkeys(anchors.get("urls", []) + urls))[-12:],
             "errors": error_lines(events, limit=4)}
     parts = [f"Steps run: {len(calls)} tool calls."]
+    written: list[str] = []  # (the files it read are among the identifiers below: these are the ones it changed)
+    for c in calls:
+        path, res = str((c.get("args") or {}).get("path") or ""), results.get(c.get("id")) or {}
+        if c.get("name") in ("write_file", "edit_file") and path not in written and res and not res.get("is_error"):
+            written.append(path)
+    if written:
+        more = f" (and {len(written) - 12} earlier ones)" if len(written) > 12 else ""
+        parts.append("Files it wrote or edited (calls that succeeded): " + ", ".join(written[-12:]) + more)
     if lines:
         parts.append("Last actions and what they returned:\n" + "\n".join(lines))
     block = anchors_block({k: v for k, v in keep.items() if v}, title="Identifiers seen:")

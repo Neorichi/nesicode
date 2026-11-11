@@ -198,8 +198,12 @@ def _write_thread_history(db: DB, ws: Workspace, run: dict, archive: str) -> Non
             steps = trajectory_text(events, HISTORY_TURN_CHARS if full else HISTORY_OLD_TURN_CHARS,
                                     obs_chars=6_000 if full else 2_000, args_chars=3_000 if full else 1_000,
                                     thinking_chars=3_000 if full else 1_000, fit="shrink")
-        blocks.append(f"## Turno #{r['id']} ({r['status']})\n### Usuario\n{task}\n### Pasos\n"
-                      f"{steps}\n### Respuesta final\n{answer}")
+        end = "### Respuesta final"
+        if r["status"] in STOPPED:  # its text is the last thing it said, often an intention («Creo … los tests») never
+            # carried out: never headed as its answer (a search_history hit would read it as the turn's conclusion)
+            end = f"### Sin respuesta final (turno {r['status']}, sin terminar)"
+            end += "; sus últimas palabras:" if answer.strip() else ""
+        blocks.append(f"## Turno #{r['id']} ({r['status']})\n### Usuario\n{task}\n### Pasos\n{steps}\n{end}\n{answer}")
         used += len(blocks[-1].encode("utf-8", "replace"))
     parts = ["# Historial de esta conversación (turnos anteriores)"] + blocks[::-1]
     try:
@@ -340,20 +344,42 @@ def _context_window(db, run: dict) -> int:
         return DEFAULT_LIMITS[0]
 
 
+# Why the harness ended a turn early (loop.STOP_NOTES: the note it added to that answer for the user), for its record
+ENDED_EARLY = {"context_full": "the model's context window was full and could not be compacted any further",
+               "stuck": "it was stuck (repeating the same actions without progress, or unable to run any)"}
+TRAIL_GROW = 16  # a short trail's outputs and arguments may be up to this many times the caps below (as room allows)
+
+
+def _own_words(final_text: str) -> tuple[str, str]:
+    """A turn's stored answer -> (what the model wrote, why the harness ended that turn early or ''): never a copy of
+    Nesicode's record of an earlier turn that the model echoed into its reply, nor the note the harness added for the
+    user — both would come back to the model as its own words."""
+    from ..agent.loop import STOP_NOTES, split_record
+
+    words = split_record((final_text or "").strip())[0]
+    for reason, note in STOP_NOTES.items():
+        if reason in ENDED_EARLY and words.endswith(note):
+            return words[: -len(note)].rstrip(), reason
+    return words, ""
+
+
 def conversation_history(db, run: dict, window: int | None = None) -> tuple[list[tuple[str, str]], dict | None]:
-    """Earlier turns of this conversation for the next message, oldest first.
+    """Earlier turns of this conversation for the next message, oldest first: (the user's message, the answer as the
+    model wrote it followed by Nesicode's record of that turn). The agent replays each record in the user role, apart
+    from the model's words (loop.split_record): a model that saw it under its own answers copied it into a reply.
 
     Finished turns bring their answer (+ a digest of their key steps for the last few that used tools); stopped turns
-    (Stop, error, app closed) bring a digest of what they did, so "continue" picks up the work; a turn that compacted
-    brings its last checkpoint summary (the last few turns, and always the conversation's newest checkpoint: a run's
-    first summary updates it, so it holds the earlier ones); the last turn that worked WITH TOOLS brings its step
-    trail (a later turn that only replied — a question between Stop and «continúa» — or an empty stopped one never
-    takes that slot): built from its END within ~20% of the model's context window (25% if it was stopped), with its
-    reasoning, each output shortened and listings cut to a few lines. Messages removed from the queue never appear.
+    (Stop, error, app closed) bring a digest of what they did, so "continue" picks up the work, and never their last
+    words as an answer; a turn that compacted brings its last checkpoint summary (the last few turns, and always the
+    conversation's newest checkpoint: a run's first summary updates it, so it holds the earlier ones); the last turn
+    that worked WITH TOOLS brings its step trail (a later turn that only replied — a question between Stop and
+    «continúa» — or an empty stopped one never takes that slot): built from its END within ~20% of the model's context
+    window (25% if it was stopped), with its reasoning, listings cut to a few lines and the outputs and arguments as
+    long as that room allows (whole when it can; each cut says so). Messages removed from the queue never appear.
     Returns (history, the stopped turn whose work is to resume, if any: the last one that worked with tools while
     every later turn only replied, else the last turn that did work)."""
-    from ..agent.context import CHECKPOINT_MARK, clip_summary, redact, run_digest, summary_target
-    from ..agent.loop import TRAIL_MARK, trajectory_text
+    from ..agent.context import CHECKPOINT_MARK, clip, clip_summary, redact, run_digest, summary_target
+    from ..agent.loop import DIGEST_MARK, TRAIL_MARK, trajectory_text
 
     rows = _earlier_turns(db, run)
     detail = max(0, len(rows) - 20)  # the newest 20 turns bring their steps; older ones only their answer
@@ -377,12 +403,19 @@ def conversation_history(db, run: dict, window: int | None = None) -> tuple[list
     history: list[tuple[str, str]] = []
     interrupted = None
     for i, r in enumerate(rows):
-        answer = (r["final_text"] or "").strip()
+        answer, ended = _own_words(r["final_text"])
+        stopped = r["status"] in STOPPED
+        record: list[str] = []  # Nesicode's record of this turn, after the model's words
+        if ended:
+            record.append(f"[Nesicode ended this turn early: {ENDED_EARLY[ended]}; the work stopped there]")
         if i < detail:
-            history.append((r["task"], answer or f"[this turn ended as {r['status']} without an answer]"))
+            if stopped or not answer:  # (a stopped turn's last words are not its answer)
+                record.insert(0, f"[this turn ended as {r['status']} without an answer]" + (
+                    f"\nIts last words (it did not finish): {clip(answer, 800, 'reply')}" if answer else ""))
+                answer = ""
+            history.append((r["task"], "\n\n".join(p for p in [answer, *record] if p)))
             continue
         ev, n = events[r["id"]], steps[r["id"]]
-        stopped = r["status"] in STOPPED
         trail = ""
         if i == trail_at:  # the last turn that worked with tools travels with its trail, newest steps first
             share = 0.25 if stopped else 0.20  # of the window, in chars at ~3.5 per token
@@ -391,31 +424,34 @@ def conversation_history(db, run: dict, window: int | None = None) -> tuple[list
             if not stopped and answer:  # a finished turn: its final answer is the answer above, not repeated
                 last = next((k for k in range(len(ev) - 1, -1, -1) if ev[k].get("type") == "assistant"
                              and not ev[k].get("depth")), None)
-                if last is not None and (ev[last].get("text") or "").strip() == answer:
+                said_last = (ev[last].get("text") or "").strip() if last is not None else None
+                if said_last in (answer, (r["final_text"] or "").strip()):  # (as stored: maybe with the harness's note)
                     shown = ev[:last] + ev[last + 1:]
             trail = redact(trajectory_text(shown, budget, obs_chars=4_000, args_chars=1_500, thinking_chars=2_000,
-                                           fit="tail", dumps=True))
+                                           fit="tail", dumps=True, grow=TRAIL_GROW))
         if stopped:
             if not n and not answer and not said[r["id"]]:
-                answer = f"[this turn was {r['status']} before doing any work]"
+                head = f"[this turn was {r['status']} before doing any work]"
                 # stopped while still reasoning: the end of that reasoning comes along (it never takes the trail slot
                 # of a turn that did work before it)
                 thought = next((str(e.get("text") or "").strip() for e in reversed(ev) if e.get("type") == "thinking"
                                 and not e.get("depth") and str(e.get("text") or "").strip()), "")
                 if thought:
-                    answer = (f"[this turn was {r['status']} while still reasoning, before doing any work; the end of "
-                              "its reasoning (private notes, unverified):]\n"
-                              + redact(("…" if len(thought) > 1_500 else "") + thought[-1_500:]))
+                    head = (f"[this turn was {r['status']} while still reasoning, before doing any work; the end of "
+                            "its reasoning (private notes, unverified):]\n"
+                            + redact(("…" if len(thought) > 1_500 else "") + thought[-1_500:]))
             else:
                 digest = run_digest(ev, actions=not trail, last_words=not trail)  # the trail ends with them
-                partial = (f"\n[Partial answer] {answer[:800]}" if answer and answer[:200] not in digest + trail
-                           else "")
-                answer = (f"[This turn was {r['status']} at step {n} and did NOT finish. What it had done so far:]\n"
-                          + digest + partial)
+                partial = (f"\n[Its last words — it did not finish, so they are not an answer] {answer[:800]}"
+                           if answer and answer[:200] not in digest + trail else "")
+                head = (f"[This turn was {r['status']} at step {n} and did NOT finish. What it had done so far:]\n"
+                        + digest + partial)
+            record.insert(0, head)
+            answer = ""  # (its last words are in the record, never presented as its answer)
             if i == last_work:
                 interrupted = {"id": r["id"], "status": r["status"], "steps": n}
         elif n and len(rows) - i <= 3:  # (its last words are the answer itself)
-            answer += "\n\n[Key steps of this turn]\n" + run_digest(ev, 2_500, actions=not trail, last_words=False)
+            record.append(f"{DIGEST_MARK}\n" + run_digest(ev, 2_500, actions=not trail, last_words=False))
         compacted = checkpoints[r["id"]]
         if compacted and (i in (trail_at, last_work, newest_cp) or len(rows) - i <= 3):
             # about the size it was written to (the summary target of the window), cut in its middle (said) and always
@@ -424,10 +460,10 @@ def conversation_history(db, run: dict, window: int | None = None) -> tuple[list
             shown = clip_summary(checkpoint, max(6_000, min(20_000, summary_target(window or _context_window(db, run)) * 4)))
             where = (f"\n[The whole checkpoint is saved in {compacted['path']} — read_file it for the part omitted above.]"
                      if shown != checkpoint and compacted.get("path") else "")
-            answer += f"\n\n{CHECKPOINT_MARK}\n" + redact(shown) + where
+            record.append(f"{CHECKPOINT_MARK}\n" + redact(shown) + where)
         if trail:
-            answer += f"\n\n{TRAIL_MARK}\n" + trail
-        history.append((r["task"], answer))
+            record.append(f"{TRAIL_MARK}\n" + trail)
+        history.append((r["task"], "\n\n".join(p for p in [answer, *record] if p)))
     if interrupted and last_work < len(rows) - 1:
         replied = sum(1 for k in worked if k > last_work)  # (later turns that only replied: they used no tools)
         empty = len(rows) - 1 - last_work - replied
@@ -459,8 +495,9 @@ def continuity_note(thread_id: int, interrupted: dict | None) -> str:
     note = (("# An earlier turn did not finish\n" if replied else "# The previous turn did not finish\n")
             + f"The last turn that {'worked with tools' if replied else 'did work'} was {interrupted['status']} at "
             f"step {interrupted['steps']} without finishing. "
-            "Its digest and steps are in the earlier turns: if the user asks to continue, resume right after its last "
-            "step — do not start over and do not redo what it already did. If something you need is not there, call "
+            "Its digest and steps are in Nesicode's record of it, in the user message right after it: if the user asks "
+            "to continue, resume right after its last step — do not start over and do not redo what it already did. "
+            "If something you need is not there, call "
             f"`search_history` (its full steps and outputs are archived in `{hist}`) before exploring files.")
     if replied:
         note += (" The user's later message(s) after it were only answered, with no tool work"
@@ -635,8 +672,13 @@ def follow_up_task(db, run: dict) -> str:
         text = (text or "").strip()
         return text if len(text) <= n else text[:n].rstrip() + " […]"
 
-    turns = [f"User: {clip(r['task'], 2_000)}\nAssistant: "
-             + (clip(r["final_text"], 1_500) or f"[this turn ended {r['status']} without an answer]") for r in rows]
+    def answer(r: dict) -> str:
+        words = clip(_own_words(r["final_text"])[0], 1_500)
+        if r["status"] in STOPPED and words:  # the last thing a stopped turn said is not its answer
+            return f"[this turn ended {r['status']} without an answer; its last words: {words}]"
+        return words or f"[this turn ended {r['status']} without an answer]"
+
+    turns = [f"User: {clip(r['task'], 2_000)}\nAssistant: " + answer(r) for r in rows]
     newest, left = [], FOLLOW_UP_TASK_CHARS - len(turns[0])
     for turn in reversed(turns[1:]):
         if len(turn) + 2 > left:
