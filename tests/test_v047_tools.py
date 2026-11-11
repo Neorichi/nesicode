@@ -229,8 +229,8 @@ def test_list_dir_lists_a_whole_level_before_going_deeper(tmp_path):
         (ws.root / "assets" / f"icon{i:03}.svg").write_text("<svg/>")
     for d in ("src", "tests"):
         (ws.root / d).mkdir()
-        (ws.root / d / "main.py").write_text("x = 1\n")
-    (ws.root / "README.md").write_text("# hi\n")
+        (ws.root / d / "main.py").write_bytes(b"x = 1\n")  # (bytes: Windows text mode adds \r)
+    (ws.root / "README.md").write_bytes(b"# hi\n")
     (ws.root / "package.json").write_text("{}")
     out = list_dir(ws, {})
     for line in ("assets/ (450 entries, not expanded)", "src/", "  main.py (6 B)", "tests/", "README.md (5 B)",

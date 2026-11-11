@@ -335,7 +335,7 @@ def test_history_md_never_heads_a_stopped_turns_last_words_as_its_answer(tmp_pat
     cur = _run(p, t, "continúa", "running", at=now)
     ws = Workspace(tmp_path / "ws")
     _write_thread_history(db, ws, cur, ".nesicode/chats/3")
-    md = (ws.root / ".nesicode/chats/3/context/history.md").read_text()
+    md = (ws.root / ".nesicode/chats/3/context/history.md").read_text(encoding="utf-8")
     stopped, answered = md.split("## Turno #")[1:]
     assert "### Respuesta final" not in stopped
     assert f"### Sin respuesta final (turno cancelled, sin terminar); sus últimas palabras:\n{SAY}" in stopped
