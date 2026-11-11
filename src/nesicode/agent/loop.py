@@ -157,18 +157,30 @@ REPO_RULES_HEAD = (
 )
 READ_STREAK = 20  # tool calls in a row without writing anything before the reminder (once per streak; again after a
 # masking or a compaction while the streak goes on, at least READ_STREAK // 2 calls after the previous one)
-# "your notes file" in these notes is the one the Environment section names (notes_file): never one in the project
+# "your notes file" in these notes is the one the Environment section names (notes_file): never one in the project.
+# {where} puts the file the user asked for first (see Agent._where): the notes file is only the fallback.
 READ_STREAK_NOTE = (
     "\n\n[harness] You have made {n} tool calls in a row without writing or editing any file. Write what you have now "
-    "and keep results on disk as you go (findings, exact values, partial results — in the deliverable or your notes "
-    "file): old tool outputs and your private reasoning may be cleared from the context, and the user can stop the turn "
-    "at any time.{rules}"
+    "and keep results on disk as you go (findings, exact values, partial results — in {where}your notes file): old "
+    "tool outputs and your private reasoning may be cleared from the context, and the user can stop the turn at any "
+    "time.{rules}"
 )
+# Before a masking that would clear what was read since the last write (see Agent._defer_mask): the masking then waits
+# one round, so the conclusions get written while the model still sees what they come from.
+MASK_SOON_NOTE = (
+    "[harness] The context is filling up: after your next reply, older tool outputs and your reasoning about them will "
+    "be cleared from it, including {what} that you read since you last wrote anything. While you still see them, write "
+    "down what you need from them (findings, exact values, line numbers) in {where}your notes file."
+)
+WHERE_NOTES = "the file the user asked for if they named one, else in "  # (…your notes file)
+WHERE_NAMED = "{files}, the file{s} the user asked for, rather than in "  # (…your notes file)
+DELIVERABLE_RX = re.compile(r"(?:[\w.-]+/)*[\w-][\w.-]*\.(?:md|markdown|txt|rst|adoc|org|csv|tsv)", re.I)  # documents
 REQUEST_QUOTE = 1_200  # chars of the user's own words the reminder quotes
 MASK_NOTE = ("[harness] {what} cleared to free context (full outputs on disk; paths in the markers). Record any conclusion "
-             "you have not written down yet (e.g. in the deliverable or your notes file) before re-reading.")
+             "you have not written down yet (in {where}your notes file) before re-reading.")
 MASK_NOTE_REASONING = ("[harness] Your reasoning from earlier steps was cleared to free context. Record any conclusion you "
-                       "have not written down yet (e.g. in the deliverable or your notes file).")
+                       "have not written down yet (in {where}your notes file).")
+MASKED_LISTED = 100  # cleared outputs a 'masked' event names (id, tool, what it was)
 THINKING_CAP = 32_000  # chars of one reply's reasoning kept in the event log (its END: the conclusions sit there)
 TRAIL_MARK = "[PREVIOUS TURN — STEPS]"  # heads the step trail of the previous turn in the history (see _trim_answer)
 USER_SHARE = 0.6  # of the earlier turns' budget, at most, for the user's own messages (the answers get the rest)
@@ -443,7 +455,8 @@ class Agent:
         self.on_limit = on_limit  # called when the real limit is learned from a provider error
         # Per-conversation archive (transcripts, checkpoints, full outputs) so chats never see each other's.
         self.archive = archive
-        self._saved: dict[str, tuple[str, str, str, str]] = {}  # call_id -> (tool, saved path, what it is, how to re-read)
+        # call_id -> (tool, saved path, what it is, how to re-read, the path it was called on)
+        self._saved: dict[str, tuple[str, str, str, str, str]] = {}
         self._errors: set[str] = set()
         self._summary: str | None = None  # the last good LLM summary of this run
         self._compactions = 0
@@ -470,6 +483,7 @@ class Agent:
         self._pending: list[tuple[ToolCall, ToolResult]] = []  # the tool round the model has not answered yet
         self._round_sizes: list[int] = []
         self._touched: dict[str, str] = {}  # files read/edited in this run (insertion order = recency)
+        self._wrote: set[str] = set()  # files written or edited in this run (see _deliverables)
         self._skills_loaded: list[str] = []
         self._steps = 0
         self._steps_at_compact = -1
@@ -487,6 +501,12 @@ class Agent:
         self._ro_streak = 0
         self._ro_reminded = False
         self._ro_at = 0  # the streak when the last reminder was given
+        self._ro_round = -1  # ...and the step it went out with
+        self._streak_ids: set[str] = set()  # the calls of the read-only streak (their outputs: maybe not on disk yet)
+        self._ro_warned = False  # a masking waited a round in this streak (see _defer_mask)
+        self._mask_deferred = False  # ...in the last round: the next one masks
+        self._cleared: list[str] = []  # the outputs the last masking cleared (named in the 'masked' event)
+        self._outline_drop: set[str] = set()  # during a masking: the markers that lose (or never get) a code outline
         self._strip_noted = False  # the model was told its older reasoning is cleared (small windows)
         self._live: dict[str, list[str]] = {}  # deltas of the reply being streamed (kept if Stop or an error cuts it)
         self._usage = Usage()
@@ -642,12 +662,19 @@ class Agent:
         conv.add_user(text)
         self._conv_chars += len(text) + 16
 
-    def _add_note(self, conv, text: str) -> None:
+    def _add_note(self, conv, text: str, kind: str, **extra) -> None:
         """A harness line for the model inside the tool loop: with the newest tool results when the provider can (a
         new user turn would make interleaved-thinking templates drop the reasoning replayed so far), else a user turn."""
         add = getattr(conv, "add_note", None)
         (add if callable(add) else conv.add_user)(text)
         self._conv_chars += len(text) + 16
+        self._note(kind, text, **extra)
+
+    def _note(self, kind: str, text: str, **extra) -> None:
+        """What the harness told the model goes on record too (a 'note' event, persisted): a run's events show every
+        reminder and request it got, and when — kind: read_streak, mask, final_answer, repeat, empty_reply, no_tools,
+        continue."""
+        self.emit({"type": "note", "kind": kind, "text": text.strip(), **extra})
 
     @property
     def _nudged(self) -> bool:
@@ -668,7 +695,8 @@ class Agent:
             note = NO_TOOLS_NOTE
         else:
             note = EMPTY_NOTE if self._nudged else f"{EMPTY_NOTE} {EMPTY_NEXT}"
-        self._add_note(conv, f"{note}\n{self._nudge}" if self._nudged else note)
+        self._add_note(conv, f"{note}\n{self._nudge}" if self._nudged else note,
+                       "no_tools" if turn.tool_calls else "empty_reply")
 
     def _add_assistant(self, conv, text: str) -> None:
         conv.add_assistant_text(text)
@@ -730,7 +758,42 @@ class Agent:
                 caps = [s, REQUEST_QUOTE - s] if caps[0] <= caps[1] else [REQUEST_QUOTE - s, s]
         rows = [f"- {label}: «{ctxm.clip(t, n, 'message')}»" for (label, t), n in zip(quotes, caps)]
         rules = ("\nThe user's request, verbatim (excerpt) — follow its rules:\n" + "\n".join(rows)) if rows else ""
-        return READ_STREAK_NOTE.format(n=self._ro_streak, rules=rules)
+        return READ_STREAK_NOTE.format(n=self._ro_streak, rules=rules, where=self._where())
+
+    def _deliverables(self) -> list[str]:
+        """The files the user's words (the current message and the conversation's first one) name that are evidently
+        this work's deliverable: documents (.md, .txt, .csv…) this run already wrote, or that do not exist yet — what
+        is there to be read is no deliverable. At most 3."""
+        found: list[str] = []
+        first = self._history[0][0] if self._history else ""
+        for words in (self._task_full or self._task, first):
+            for token in re.split(r"[\s`'\"«»“”‘’()\[\]{}<>,;:!?*|]+", (words or "")[:100_000]):
+                token = token.rstrip(".")
+                if not DELIVERABLE_RX.fullmatch(token):
+                    continue
+                try:
+                    path = self.ws.resolve(token)
+                    rel = self.ws.rel(path)
+                    new = not path.exists()
+                except Exception:
+                    continue
+                if (new or rel in self._wrote) and rel not in found and not rel.startswith((HARNESS_DIR, ".attachments")):
+                    found.append(rel)
+        return found[:3]
+
+    def _where(self) -> str:
+        """Where the reminders say to write conclusions down: the file the user asked for when it is evident (named),
+        else that file if the user named one; the notes file only after it ("…in {where}your notes file")."""
+        files = self._deliverables()
+        if not files:
+            return WHERE_NOTES
+        return WHERE_NAMED.format(files=", ".join(f"`{f}`" for f in files), s="s" if len(files) > 1 else "")
+
+    def _described(self, ids: list[str], n: int = 5) -> str:
+        """Some outputs in words, as their markers name them: '3 outputs (src/a.py lines 1–400, …)'."""
+        what = [d for cid in ids if (d := (self._saved.get(cid) or ("", "", ""))[2])]
+        listed = ", ".join(what[:n]) + (f" and {len(what) - n} more" if len(what) > n else "")
+        return f"{len(ids)} output{'s' if len(ids) != 1 else ''}" + (f" ({listed})" if listed else "")
 
     # ------------------------------------------------------------------ conversations
     def _open(self, provider, model, system, options, task, history_budget=None):
@@ -796,36 +859,98 @@ class Agent:
 
     # ------------------------------------------------------------------ layer 1: masking
     def _marker(self, call_id: str, old: str):
+        if old.startswith("[old "):  # already a marker: it may only lose its code outline (see _mask)
+            return ctxm.drop_outline(old) if call_id in self._outline_drop else None
         info = self._saved.get(call_id)
         if not info:  # only outputs saved to disk are ever masked: the marker must say where they are
             return None
-        tool, rel, desc, reread = info
-        return ctxm.mask_marker(tool, rel, call_id in self._errors, desc, reread)(call_id, old)
+        tool, rel, desc, reread, path = info
+        outline = 0 if call_id in self._outline_drop else ctxm.outline_budget(self.context_limit)
+        return ctxm.mask_marker(tool, rel, call_id in self._errors, desc, reread, path, outline)(call_id, old)
+
+    def _masking(self, conv, keep_last: int, keep_chars: int, apply: bool):
+        """(chars freed, [(call id, chars)] of the tool outputs cleared, [call ids] of the markers that keep or get a code
+        outline — oldest first —, chars of the outlines dropped) — of a dry run unless `apply`. The rest of the chars
+        freed is reasoning."""
+        cleared: list[tuple[str, int]] = []
+        outlined: list[str] = []
+        trimmed = [0]
+
+        def marker(call_id: str, old: str):
+            new = self._marker(call_id, old)
+            if old.startswith("[old "):
+                if new is not None and len(new) < len(old):
+                    trimmed[0] += len(old) - len(new)
+                elif ctxm.has_outline(old):
+                    outlined.append(call_id)
+            elif new is not None and len(new) < len(old):
+                cleared.append((call_id, len(old) - len(new)))
+                if ctxm.has_outline(new):
+                    outlined.append(call_id)
+            return new
+        freed = conv.mask_tool_results(keep_last, marker, keep_chars=keep_chars, apply=apply)
+        return freed, cleared, outlined, trimmed[0]
 
     def _mask(self, conv, keep_last: int, keep_chars: int, min_tokens: int) -> int:
         """Mask old tool outputs (and the reasoning of the replies before them) if that frees at least `min_tokens` (a
         dry run first: masking breaks the prompt cache, so it only happens when it is worth it). The model is told in
-        one line, and the progress reminder may come again. Returns the chars freed."""
-        would = conv.mask_tool_results(keep_last, self._marker, keep_chars=keep_chars, apply=False)
+        one line, and the progress reminder may come again. Returns the chars freed (self._cleared: what went)."""
+        self._cleared = []
+        would, _, outlined, _ = self._masking(conv, keep_last, keep_chars, apply=False)
         if not would or would // 4 < min_tokens:
             return 0
-        cleared = [0, 0]  # tool outputs masked, chars they freed (the rest of `freed` is reasoning)
-
-        def marker(call_id: str, old: str):
-            new = self._marker(call_id, old)
-            if new is not None and len(new) < len(old):
-                cleared[0] += 1
-                cleared[1] += len(old) - len(new)
-            return new
-        freed = conv.mask_tool_results(keep_last, marker, keep_chars=keep_chars, apply=True)
+        # code outlines: only the newest OUTLINES_KEPT markers keep one (older ones lose it in this same pass)
+        self._outline_drop = set(outlined[:-ctxm.OUTLINES_KEPT])
+        try:
+            freed, cleared, _, trimmed = self._masking(conv, keep_last, keep_chars, apply=True)
+        finally:
+            self._outline_drop = set()
         self._conv_chars -= freed
+        self._cleared, self._mask_deferred = [cid for cid, _ in cleared], False
         if freed and not self._nudged:  # (once the final answer was asked for, that request stays the last word)
-            n = cleared[0]
+            n = len(cleared)
             what = (f"{n} earlier tool output{'s' if n != 1 else ''}"
-                    + (" and your reasoning from those steps were" if freed > cleared[1] else (" were" if n != 1 else " was")))
-            self._add_note(conv, MASK_NOTE.format(what=what) if n else MASK_NOTE_REASONING)
+                    + (" and your reasoning from those steps were" if freed > sum(c for _, c in cleared) + trimmed
+                       else (" were" if n != 1 else " was")))
+            where = self._where()
+            note = MASK_NOTE.format(what=what, where=where) if n else MASK_NOTE_REASONING.format(where=where)
+            self._add_note(conv, note, "mask")
             self._ro_reminded = False
         return freed
+
+    def _defer_mask(self, conv, keep_last: int, keep_chars: int, used: int) -> bool:
+        """A masking is due: would it clear outputs the model read since it last wrote anything (conclusions that may be
+        nowhere else)? Then it waits one round, so the model records them while it still sees them: when the read-streak
+        reminder went out with this round's results, or — once per read-only streak, unless an earlier reminder was
+        read past — after telling the model now what is about to go. Never two rounds in a row, once the final answer
+        was asked for, or near the compaction threshold (a summary of everything would come instead). True: it waits."""
+        deferred, self._mask_deferred = self._mask_deferred, False
+        lim = self.context_limit
+        now = self._ro_round == self._steps  # the read-streak reminder went out with this round's results
+        if deferred or not self._streak_ids or self._nudged or (not now and (self._ro_warned or self._ro_reminded)) \
+                or used + ctxm.min_freed_tokens(lim) >= ctxm.SUMMARY_AT * lim:
+            return False
+        would, cleared, _, _ = self._masking(conv, keep_last, keep_chars, apply=False)
+        risk = [cid for cid, _ in cleared if cid in self._streak_ids]
+        if not risk or would // 4 < ctxm.min_freed_tokens(lim):
+            return False
+        if not now:
+            self._add_note(conv, MASK_SOON_NOTE.format(what=self._described(risk), where=self._where()), "read_streak",
+                           trigger="context")
+            self._ro_reminded, self._ro_at, self._ro_round = True, self._ro_streak, self._steps
+        self._ro_warned = self._mask_deferred = True
+        return True
+
+    def _masked_event(self, freed: int, used: int, deferred: bool = False) -> None:
+        """The 'masked' event: what it freed, the context after, and which outputs it cleared (id, tool, what they
+        were); `deferred`: it had waited a round (see _defer_mask)."""
+        cleared = []
+        for cid in self._cleared[:MASKED_LISTED]:
+            tool, _, desc, *_ = self._saved.get(cid) or ("", "", "")
+            cleared.append({"id": cid, "tool": tool, **({"what": desc} if desc else {})})
+        more = len(self._cleared) - len(cleared)
+        self.emit({"type": "masked", "freed": freed // 4, "used": used, "limit": self.context_limit, "cleared": cleared,
+                   **({"more": more} if more else {}), **({"deferred": True} if deferred else {})})
 
     # ------------------------------------------------------------------ layer 2: compaction
     def _can_compact(self) -> bool:
@@ -877,13 +1002,14 @@ class Agent:
             conv, task = self._first_conversation(provider, model, system, options, self._task_full or task)
             self._task = task
             if self._nudged:
-                self._add_note(conv, self._nudge)
+                self._add_note(conv, self._nudge, "final_answer", reason=self._stop_reason)
         after = self._est()
         self._last_compact_after = after
         self._steps_at_compact = self._steps
         self._judge = True  # the provider's next real count says whether this compaction got under the trigger
         self._masked_at = 0
         self._ro_reminded = False  # the progress reminder may come again if the read-only streak goes on
+        self._ro_warned = self._mask_deferred = False  # (a new conversation: its first masking may wait a round too)
         self.emit({"type": "compacted", "used": used, "after": after, "limit": lim,
                    "summary": ctxm.clip_summary(summary, 20_000),  # (the next message resumes from its Next Step)
                    "path": md_rel, "transcript": tr_rel, "n": n, "reason": reason, **({"fallback": True} if fallback else {})})
@@ -1194,6 +1320,17 @@ class Agent:
                     f"arguments included, must stay well under {cap:,} tokens (about {cap * 3:,} characters).")
         return ToolResult(call.id, msg, True)
 
+    def _cut_event(self, turn, cap: int, room_limited: bool, then: str) -> None:
+        """A reply cut by the output limit goes on record (an 'output_cut' event): one cut in its reasoning has no text
+        and no call, so the run log otherwise shows only a long gap. `then` is what the harness does about it: continue
+        (asks for the rest; `continuation`: which request that is), stop (none left: the run fails), compact (the
+        context left no room: it compacts and asks again), reject_calls (calls cut short do not run) or run_calls."""
+        self.emit({"type": "output_cut", "tokens": turn.usage.output_tokens, "cap": cap, "stop_reason": turn.stop_reason,
+                   "visible": bool((turn.text or "").strip()), "reasoning": len(turn.thinking or ""),
+                   "calls": len(turn.tool_calls), "then": then,
+                   "continuation": self._continuations + 1 if then == "continue" else 0,
+                   **({"room_limited": True} if room_limited else {})})
+
     def _track(self, call: ToolCall, res: ToolResult) -> None:
         """Files read/edited and skills loaded in this run (re-injected after a compaction), and the read-only streak."""
         if not res.is_error:
@@ -1205,15 +1342,19 @@ class Agent:
                 if rel and rel != ".":
                     self._touched.pop(rel, None)
                     self._touched[rel] = "read" if call.name == "read_file" else "edited"
+                    if call.name != "read_file":
+                        self._wrote.add(rel)
             elif call.name == "load_skill":
                 name = str(call.arguments.get("name", ""))
                 if name in self._skills_loaded:
                     self._skills_loaded.remove(name)
                 self._skills_loaded.append(name)
         if call.name in WRITE_TOOLS or (call.name == "bash" and _WRITES_RX.search(str(call.arguments.get("command", "")))):
-            self._ro_streak, self._ro_reminded, self._ro_at = 0, False, 0
+            self._ro_streak, self._ro_reminded, self._ro_at, self._ro_warned = 0, False, 0, False
+            self._streak_ids.clear()
         else:
             self._ro_streak += 1
+            self._streak_ids.add(call.id)
 
     def _repeats(self, call: ToolCall, res: ToolResult) -> int:
         """Loop detection: how many times, within the last REPEAT_WINDOW calls, this exact call got this same result with
@@ -1325,7 +1466,7 @@ class Agent:
                 out = ctxm.inline_output(out, rel, self._inline_limit(call.name), call.name, call.arguments)
                 # the mask marker describes what the model SAW (a cut read covers fewer lines than the file)
                 desc, reread = ctxm.describe_call(call.name, call.arguments, out)
-                self._saved[call.id] = (call.name, rel, desc, reread)
+                self._saved[call.id] = (call.name, rel, desc, reread, str(call.arguments.get("path") or ""))
             except Exception:
                 pass
         return ToolResult(call.id, self.hooks.after(call.name, out)), False
@@ -1458,7 +1599,7 @@ class Agent:
                                                     stop_reason="context_full")
                             if not self._nudged:
                                 self._nudge, self._stop_reason = CONTEXT_FULL_NUDGE, "context_full"
-                                self._add_note(conv, CONTEXT_FULL_NUDGE)
+                                self._add_note(conv, CONTEXT_FULL_NUDGE, "final_answer", reason="context_full")
                     room = self._room()
                     max_tokens = min(out_budget, room)
                     room_limited = max_tokens < out_budget
@@ -1501,6 +1642,7 @@ class Agent:
                         and self._can_compact() and self._est() > self.context_limit * 0.45:
                     # The reply was cut because the context left no room: drop it, compact, retry (once per step).
                     usage.add(turn.usage)
+                    self._cut_event(turn, options.max_tokens, room_limited, "compact")
                     conv = self._compact(provider, model, system, options, self._task,
                                          turn.usage.input_tokens + turn.usage.output_tokens, reason="truncated reply")
                     continue
@@ -1520,6 +1662,10 @@ class Agent:
                     return AgentResult(final_text, "refusal", steps, usage, self.events)
                 cut_calls = [c for c in turn.tool_calls if c.parse_error] if cut else []
                 self._cut_streak = self._cut_streak + 1 if cut and (cut_calls or not turn.tool_calls) else 0
+                if cut:  # on record, whatever comes next (a reply cut in its reasoning shows no text at all)
+                    self._cut_event(turn, options.max_tokens, room_limited,
+                                    "reject_calls" if cut_calls else "run_calls" if turn.tool_calls
+                                    else "continue" if self._continuations < 3 else "stop")
                 if cut and not turn.tool_calls:
                     # A text reply cut by the output limit is never the final answer: ask for the rest (bounded).
                     if turn.text:
@@ -1529,6 +1675,7 @@ class Agent:
                         self._continuations += 1
                         note = (CONTINUE_NOTE if turn.text else EMPTY_CUT_NOTE).format(cap=options.max_tokens)
                         self._add_user(conv, note)
+                        self._note("continue", note)
                         conv = self._after_step(conv, provider, model, system, options, turn, [])
                         continue
                     out, cap = turn.usage.output_tokens, options.max_tokens or 0
@@ -1579,17 +1726,20 @@ class Agent:
                     n = self._repeats(call, res)
                     if REPEAT_NOTE_AT <= n < REPEAT_STOP_AT:
                         what = f"`{call.name}` " + ctxm.clip(_args_text(call), 300, "arguments")
-                        res = ToolResult(res.call_id, res.content + REPEAT_NOTE.format(
-                            call=what, n=n, what="error" if res.is_error else "result", stop=REPEAT_STOP_AT), res.is_error)
+                        note = REPEAT_NOTE.format(call=what, n=n, what="error" if res.is_error else "result",
+                                                  stop=REPEAT_STOP_AT)
+                        res = ToolResult(res.call_id, res.content + note, res.is_error)
+                        self._note("repeat", note, call_id=call.id)
                     if n > worst[0]:
                         worst = (n, call)
                     results.append(res)
                 self._rejected_rounds = self._rejected_rounds + 1 if refused == len(results) else 0
                 if self._ro_streak >= READ_STREAK and not self._ro_reminded and results \
                         and self._ro_streak - self._ro_at >= READ_STREAK // 2:  # (re-armed: not right after the last)
-                    last = results[-1]
-                    results[-1] = ToolResult(last.call_id, last.content + self._streak_note(), last.is_error)
-                    self._ro_reminded, self._ro_at = True, self._ro_streak
+                    last, note = results[-1], self._streak_note()
+                    results[-1] = ToolResult(last.call_id, last.content + note, last.is_error)
+                    self._ro_reminded, self._ro_at, self._ro_round = True, self._ro_streak, steps
+                    self._note("read_streak", note, trigger="calls")
                 self._add_results(conv, results)
                 self._pending = list(zip(turn.tool_calls, results))
                 self._round_sizes.append(len(results))
@@ -1605,7 +1755,7 @@ class Agent:
                     self._nudge = ask
                 after = self._after_step(conv, provider, model, system, options, turn, results)
                 if ask and after is conv:
-                    self._add_note(conv, ask)  # with the newest tool results (see _add_note)
+                    self._add_note(conv, ask, "final_answer", reason=self._stop_reason)  # with the newest tool results
                 conv = after
         except Cancelled:
             self._save_partial()
@@ -1637,17 +1787,22 @@ class Agent:
         lim = self.context_limit
         used = self._est()
         reason = ""
-        # Layer 1: mask old tool outputs (no LLM), in batches, with hysteresis.
+        # Layer 1: mask old tool outputs (no LLM), in batches, with hysteresis — a round later if it would clear what
+        # the model read since it last wrote anything (it is told first: _defer_mask).
         if used > ctxm.MASK_AT * lim and used - self._masked_at > ctxm.min_freed_tokens(lim):
-            freed = self._mask(conv, sum(self._round_sizes[-2:]), int(lim * 4 * ctxm.MASK_KEEP_SHARE),
-                               ctxm.min_freed_tokens(lim))
-            used = self._est()
-            if freed:
-                reason = "masked"
-                self.emit({"type": "masked", "freed": freed // 4, "used": used, "limit": lim})
-                # Hysteresis only after a real masking: a dry run that found too little to clear must not postpone the
-                # next try by min_freed tokens (it then came after the compaction threshold: Layer 1 never ran there).
-                self._masked_at = used
+            keep_last, keep_chars = sum(self._round_sizes[-2:]), int(lim * 4 * ctxm.MASK_KEEP_SHARE)
+            waited = self._mask_deferred
+            if self._defer_mask(conv, keep_last, keep_chars, used):
+                used = self._est()
+            else:
+                freed = self._mask(conv, keep_last, keep_chars, ctxm.min_freed_tokens(lim))
+                used = self._est()
+                if freed:
+                    reason = "masked"
+                    self._masked_event(freed, used, waited)
+                    # Hysteresis only after a real masking: a dry run that found too little to clear must not postpone
+                    # the next try by min_freed tokens (it then came after the compaction threshold: Layer 1 never ran).
+                    self._masked_at = used
         # Small windows, past MASK_AT: only the newest reply keeps its replayed reasoning, whatever tool results are kept
         # (each reply's reasoning piled up next to them: a 16k-32k reasoning model compacted every 3-4 calls). After the
         # first time each step only changes the reply before the newest, near the end: the prompt cache stays valid.
@@ -1656,7 +1811,7 @@ class Agent:
             if freed:
                 self._conv_chars -= freed
                 if not self._strip_noted and not self._nudged:  # (once per conversation: the system prompt warns too)
-                    self._add_note(conv, MASK_NOTE_REASONING)
+                    self._add_note(conv, MASK_NOTE_REASONING.format(where=self._where()), "mask")
                     self._strip_noted = True
                 used = self._est()
                 reason = reason or "masked"
@@ -1673,10 +1828,11 @@ class Agent:
         compact if the context grew enough since the last compaction for one to pay off. Returns (conversation, full)
         — full: nothing more can be freed (the caller asks for a final answer instead of squeezing every reply)."""
         lim = self.context_limit
+        waited = self._mask_deferred
         freed = self._mask(conv, self._round_sizes[-1] if self._round_sizes else 0, 0, 1)
         if freed:
             self._display = self._est()
-            self.emit({"type": "masked", "freed": freed // 4, "used": self._display, "limit": lim})
+            self._masked_event(freed, self._display, waited)
             self._ctx_event("masked")
             self._masked_at = self._display
             if self._fits():

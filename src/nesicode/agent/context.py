@@ -4,7 +4,9 @@ Layers (see reports/Compactación de contexto en agentes.md):
   0. Every large tool output is saved to disk; the context keeps what fits the window-scaled inline limit
      (a read_file keeps its head and says exactly which lines are missing and the next call to read them).
   1. Masking (no LLM): past ~49% of the window, old tool outputs become one-line markers naming their source
-     and the saved copy. The newest results (by size) and the round the model has not answered are kept.
+     and the saved copy (a read of source code keeps an outline: definitions and their line ranges). The newest
+     results (by size) and the round the model has not answered are kept. One that would clear what the model read
+     since it last wrote anything waits a round after telling it, so it can write its conclusions down first.
   2. Structured summary (LLM): past ~67%, the conversation is rebuilt as system + earlier turns + a checkpoint:
      a sectioned summary (updated incrementally), the user's words verbatim, identifiers, the unanswered tool
      round verbatim, recent steps, and the files/skills of this run fresh from disk. Saved under
@@ -242,8 +244,11 @@ def describe_call(tool: str, args: dict, output: str) -> tuple[str, str]:
     return "", ""
 
 
-def mask_marker(tool: str, rel: str | None, is_error: bool, desc: str = "", reread: str = ""):
-    """Marker for an old output (only outputs saved to disk are ever masked: the marker says where they are)."""
+def mask_marker(tool: str, rel: str | None, is_error: bool, desc: str = "", reread: str = "", path: str = "",
+                outline: int = 0):
+    """Marker for an old output (only outputs saved to disk are ever masked: the marker says where they are). A read of
+    source code (`path`) keeps an outline of what it showed in up to `outline` chars (see outline_budget) — definitions
+    and their line ranges —, so the model can cite lines and re-read just the part it needs, not the whole file."""
     def marker(_call_id: str, old: str) -> str | None:
         if not rel or len(old) < SAVE_OVER or old.startswith("[old "):
             return None
@@ -252,9 +257,115 @@ def mask_marker(tool: str, rel: str | None, is_error: bool, desc: str = "", rere
             return f"[old {tool} error kept short: {first} — full output: {rel}]"
         again = f" with {reread}" if reread else ""
         what = f": {desc}" if desc else ""
-        return (f"[old {tool} output cleared to save context{what} ({len(old):,} chars) — read it again{again} if you need it; "
+        shape = code_outline(old, path, min(outline, len(old) // 8)) if tool == "read_file" and outline else ""
+        again += _OUTLINED.format(shape) if shape else _PLAIN
+        return (f"[old {tool} output cleared to save context{what} ({len(old):,} chars) — read it again{again}; "
                 f"full output: {rel}]")
     return marker
+
+
+_PLAIN = " if you need it"
+_OUTLINED = " if you need all of it, or just the lines you need (outline: {})"
+
+
+def has_outline(marker: str) -> bool:
+    return marker.startswith("[old ") and _OUTLINED.format("")[:-1] in marker
+
+
+def drop_outline(marker: str) -> str | None:
+    """A mask marker without its code outline (None if it has none): only the newest masked reads keep theirs."""
+    i, j = marker.find(_OUTLINED.format("")[:-1]), marker.rfind("); full output: ")
+    return marker[:i] + _PLAIN + marker[j + 1:] if marker.startswith("[old ") and 0 <= i < j else None
+
+
+# ------------------------------------------------------------------ code outlines (mask markers of read_file outputs)
+OUTLINE_MAX = 600  # chars of one outline (a 400-line read keeps ~3% of itself)
+OUTLINES_KEPT = 16  # markers that keep theirs: older ones lose it at the next masking (see Agent._mask)
+CODE_EXT = frozenset(".py .pyi .js .jsx .mjs .cjs .ts .tsx .mts .cts .go .rs .rb .php .java .kt .kts .scala .swift .cs "
+                     ".dart .lua .ex .exs .vue .svelte".split())
+_JS_EXT = frozenset(".js .jsx .mjs .cjs .ts .tsx .mts .cts .vue .svelte".split())
+# Where a definition starts. Python: def and class only, followed by their `(` or `:` (its docstrings are prose).
+_PY_DEF_RX = re.compile(r"([ \t]*)(?:async[ \t]+)?(def|class)[ \t]+([A-Za-z_]\w*)(?=[ \t]*[(:])")
+# Other languages, whatever the modifiers: JS/TS, Go (methods too), Rust, Ruby, PHP, Java, Kotlin, Swift, C#… The name
+# is followed by code (a parameter list, a body, a base, `=`…) or ends the line; a word after it only where the language
+# puts one (impl X for Y, type X struct, class X extends Y).
+_DEF_RX = re.compile(
+    r"([ \t]*)(?:(?:export|default|declare|pub(?:\([\w ]*\))?|public|private|protected|internal|static|abstract|final|"
+    r"async|unsafe|extern|override|open|sealed|data|inline|suspend|local)\s+)*"
+    r"(def|class|function\*?|func|fn|fun|struct|enum|trait|interface|impl|module|object|protocol|type)(?:<[^>]*>)?\s+"
+    r"(?:\([^)]*\)\s*)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)"
+    r"(?=\s*([(<:{\[=;]|extends\b|implements\b|for\b|struct\b|interface\b|$))")
+_FOLLOWS = {"for": ("impl",), "struct": ("type",), "interface": ("type",), "extends": ("class", "interface"),
+            "implements": ("class",)}
+_ARROW_RX = re.compile(r"([ \t]*)(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]{1,80})?=\s*(?:async\s+)?"
+                       r"(?:function\b|\([^)]*\)\s*(?::[^=]{1,80})?=>|[A-Za-z_$][\w$]*\s*=>)")
+_CALLABLE = frozenset(("def", "function", "function*", "func", "fn", "fun", "const"))
+
+
+def outline_budget(limit: int | None) -> int:
+    """Chars of the code outline in one mask marker: a marker stays until the next compaction, so small windows keep
+    plain one-line markers (there outlines piled up into extra compactions) and ~128k ones get the whole OUTLINE_MAX."""
+    return 0 if not limit or limit <= SMALL_WINDOW else min(OUTLINE_MAX, int(limit * 0.0046))
+
+
+def _definition(body: str, ext: str) -> tuple[int, str, str] | None:
+    """(indent, kind, name) when this line of code starts a definition."""
+    if ext in (".py", ".pyi"):
+        d = _PY_DEF_RX.match(body)
+    elif (d := _DEF_RX.match(body)) and d.group(2) not in _FOLLOWS.get(d.group(4), (d.group(2),)):
+        d = None
+    if d:
+        return len(d.group(1).expandtabs(4)), d.group(2), d.group(3)
+    if ext in _JS_EXT and (d := _ARROW_RX.match(body)):
+        return len(d.group(1).expandtabs(4)), "const", d.group(2)
+    return None
+
+
+def code_outline(output: str, path: str, budget: int = OUTLINE_MAX) -> str:
+    """The definitions a read_file output of source code shows, with their line ranges, in about `budget` chars:
+    "notes_file 188–193 · class Agent 363–400 (__init__ 364–390, emit 392–400)". The outermost ones first, then their
+    direct members while there is room; '' for other files, or when nothing fits."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in CODE_EXT or budget < 60:
+        return ""
+    defs: list[tuple[int, int, str, str]] = []  # (line, indent, kind, name)
+    last = 0
+    for ln in output.split("\n"):
+        if not (m := _NUM_LINE.match(ln)):
+            continue
+        last = int(m.group(1))
+        if d := _definition(ln[m.end():], ext):
+            defs.append((last, *d))
+    if not defs:
+        return ""
+    # each one ends where the next one at its level (or outside it) starts; its parent is the one it sits in
+    ends, parent, open_ = [last] * len(defs), [-1] * len(defs), []
+    for i, (line, indent, _, _) in enumerate(defs):
+        while open_ and defs[open_[-1]][1] >= indent:
+            ends[open_.pop()] = line - 1
+        parent[i] = open_[-1] if open_ else -1
+        open_.append(i)
+
+    def name(i: int) -> str:
+        line, _, kind, title = defs[i]
+        return f"{'' if kind in _CALLABLE else kind + ' '}{title} {line}–{ends[i]}"
+
+    roots = [i for i in range(len(defs)) if parent[i] < 0]
+    parts, sep = [name(i) for i in roots], " · "
+    if len(sep.join(parts)) > budget:  # not even the outermost ones fit: the first ones, saying how many more
+        kept: list[str] = []
+        for p in parts:
+            if len(sep.join(kept + [p])) + 16 > budget:
+                break
+            kept.append(p)
+        return sep.join(kept) + f"{sep}… +{len(parts) - len(kept)} more" if kept else ""
+    for k, i in enumerate(roots):  # then the members of each, while they fit
+        members = [name(j) for j in range(i + 1, len(defs)) if parent[j] == i]
+        for whole in (f"{parts[k]} ({', '.join(members)})", f"{parts[k]} ({len(members)} inside)") if members else ():
+            if len(sep.join(parts)) - len(parts[k]) + len(whole) <= budget:
+                parts[k] = whole
+                break
+    return sep.join(parts)
 
 
 # ------------------------------------------------------------------ anchors
