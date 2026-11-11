@@ -34,26 +34,29 @@ from nesicode.agent import Workspace, tools
 args, opts = json.loads(sys.argv[2]), json.loads(sys.argv[3])
 ws = Workspace(sys.argv[1])
 tools.SEARCH_BUDGET = opts.get("budget", tools.SEARCH_BUDGET)
-if "stop" in opts:
-    ws.cancel = threading.Event()
-    threading.Timer(opts["stop"], ws.cancel.set).start()
 ticks, done = [0], threading.Event()
 def tick():
     while not done.is_set():
         ticks[0] += 1
         time.sleep(0.01)
 threading.Thread(target=tick, daemon=True).start()
+time.sleep(0.5)  # the other thread's own pace on this machine first (a slow CI runner's 10 ms sleeps can take 50)
+pace = ticks[0] / 0.5
+if "stop" in opts:
+    ws.cancel = threading.Event()
+    threading.Timer(opts["stop"], ws.cancel.set).start()
+ticks[0] = 0
 t0 = time.monotonic()
 out = tools.search(ws, args)
 took = time.monotonic() - t0
 done.set()
-print(json.dumps([took, out, ticks[0]]))
+print(json.dumps([took, out, ticks[0], pace]))
 """
 
 
 def _search_in_child(root, args: dict, opts: dict | None = None, timeout: float = 30.0):
-    """search in a child process: (seconds it took, its output, ticks of another thread meanwhile); None if it was
-    still running after `timeout` (the server would be frozen)."""
+    """search in a child process: (seconds it took, its output, ticks of another thread meanwhile, that thread's ticks
+    per second before the search); None if it was still running after `timeout` (the server would be frozen)."""
     import nesicode
 
     src = os.path.dirname(os.path.dirname(nesicode.__file__))  # the child imports the very code under test
@@ -99,7 +102,7 @@ def test_the_any_character_idiom_never_freezes_search(tmp_path, pattern):
     (root / "README.md").write_text("# Notas\n<div" + " " * 30 + "\n" + " ".join(["palabra"] * 32) + "\n")
     res = _search_in_child(root, {"pattern": pattern})
     assert res is not None, f"search({pattern!r}) was still running after 30 s: the whole server would be frozen"
-    took, out, _ = res
+    took, out, *_ = res
     assert took < 5 and out.startswith("no matches"), (took, out)
 
 
@@ -109,12 +112,14 @@ def test_stop_and_the_deadline_end_a_pattern_that_backtracks_forever_and_other_t
     (root / "a.txt").write_text("a" * 60 + "!\n")  # `(a|aa)+$` here takes longer than the age of the universe
     res = _search_in_child(root, {"pattern": r"(a|aa)+$"}, {"stop": 0.5})
     assert res is not None, "Stop did not end the search"
-    took, out, ticks = res
+    took, out, ticks, pace = res
     assert took < 4 and out.endswith("[search stopped by the user]"), (took, out)
-    assert ticks > took / 0.01 / 4, f"other threads ran {ticks} times in {took:.1f} s: the GIL was held"
+    # A search holding the GIL leaves the other thread a tick or two; one whose regex runs in a child process leaves it
+    # its own pace (measured first, so a slow CI runner is not taken for a held GIL)
+    assert ticks >= max(3, pace * took / 3), f"other threads ran {ticks} times in {took:.1f} s at {pace:.0f}/s: GIL held"
     res = _search_in_child(root, {"pattern": r"(a|aa)+$"}, {"budget": 1.0})
     assert res is not None, "the search budget did not end the search"
-    took, out, _ = res
+    took, out, *_ = res
     assert took < 5 and "[search stopped after 1 s" in out and "the pattern is slow on a.txt" in out, (took, out)
 
 
