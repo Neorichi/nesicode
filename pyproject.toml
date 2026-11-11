@@ -1,6 +1,6 @@
 [project]
 name = "nesicode"
-version = "0.4.6"
+version = "0.4.7"
 description = "Self-improving coding agent with recursive harness optimization (Harness²-style) and a web UI"
 requires-python = ">=3.12"
 dependencies = [

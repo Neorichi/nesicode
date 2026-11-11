@@ -4,4 +4,4 @@ The harnessing method (Propose-Probe-Compose task-level recursion plus a persist
 experience library) follows Harness^2 (google-research/harness2, Apache-2.0).
 """
 
-__version__ = "0.4.6"
+__version__ = "0.4.7"
