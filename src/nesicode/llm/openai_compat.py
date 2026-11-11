@@ -190,9 +190,10 @@ class OpenAICompatConversation(Conversation):
             fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
             name = str(fn.get("name") or "")
             args, err, raw = _arguments(fn.get("arguments"))
-            # Cut by the output cap (or a full context): invalid arguments, or a last call that has its name but no
-            # arguments yet
-            if STOP.get(finish) == "max_tokens" and (err or (n == len(tool_calls) - 1 and fn.get("arguments") in (None, ""))):
+            # Cut by the output cap (or a full context): any call whose arguments are not valid JSON, and the reply's
+            # LAST call whatever its arguments look like, since generation stopped inside it. Some servers close a cut
+            # JSON object, so it parses: a write_file whose `content` stops mid-line would run and report success.
+            if STOP.get(finish) == "max_tokens" and (err or n == len(tool_calls) - 1):
                 err = CUT
             cid = self.provider.unique_call_id(tc.get("id"))
             calls.append(ToolCall(id=cid, name=name, arguments=args, parse_error=err))

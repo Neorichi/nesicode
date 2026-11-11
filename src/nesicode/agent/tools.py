@@ -459,7 +459,8 @@ def _check_seen(ws, p: Path, st: os.stat_result, old: str | None) -> None:
 
 
 _EDIT_PARAMS = ("path", "old", "new", "replace_all")
-_EDIT_ALIASES = {"old_string": "old", "new_string": "new"}  # Claude Code's names for the same parameters
+_EDIT_ALIASES = {"old_string": "old", "new_string": "new",  # Claude Code's names for the same parameters
+                 "old_text": "old", "new_text": "new"}  # (and other agents')
 _EDIT_USAGE = ("edit_file takes `path`, `old` (the exact text to replace), `new` (its replacement; \"\" deletes `old`) "
                "and optionally `replace_all`")
 
@@ -477,7 +478,9 @@ def _edit_args(args: dict) -> dict:
         elif name in out and out[name] != value:
             raise ToolError(f"both `{name}` and `{key}` were given, with different values: {_EDIT_USAGE}")
         else:
-            out[name] = value
+            # (a server parsing a call against a schema that lacks the alias may hand a bare number over as one)
+            out[name] = str(value) if name in ("old", "new") and isinstance(value, int) and not isinstance(value, bool) \
+                else value
     if unknown:
         raise ToolError(f"unknown parameter(s) {', '.join(f'`{k}`' for k in unknown)}: {_EDIT_USAGE}")
     if out.get("new") is None:
@@ -1345,9 +1348,13 @@ def bash(ws: Workspace, args: dict) -> str:
     if "Operation not permitted" in out and _KILL_CMD.search(command):
         out += ("\n[sandbox] A process that an earlier command started cannot be signalled from this one: stop it "
                 "with the stop_process tool (no arguments lists them).")
-    return f"exit code: {code}\n{out}"
+    failed = _PIPE_CODES.search(out)
+    head = f"exit code: {code}" + (f" (but a stage of the pipeline failed: exit codes {failed.group(1)})"
+                                   if failed and code == 0 else "")
+    return f"{head}\n{out}"
 
 
+_PIPE_CODES = re.compile(r"\[pipeline exit codes: ([0-9 ]+)\]")  # PIPE_TRAP's line
 _KILL_CMD = re.compile(r"(?:^|[;&|(\s])(?:kill|pkill|killall)\b")
 
 
@@ -1462,8 +1469,8 @@ SCHEMAS = {
         "Long output is trimmed automatically (start and end kept): don't pipe into head/tail just to shorten it. "
         "Processes left in the background (`cmd > log.txt 2>&1 &`) keep running until the run ends or the user "
         "presses Stop."
-        " To list them or stop one (e.g. to restart a server after an edit) use `stop_process`: a `kill` from a later "
-        "command may be refused."
+        " To list them or stop one (e.g. to restart a server after an edit) use `stop_process`: under the macOS "
+        "sandbox each command runs in its own sandbox, so a `kill` from a later command is always refused."
         + (" On this machine the shell is Windows PowerShell (not bash): use PowerShell syntax."
            if shell_name() == "powershell" else ""),
         {"type": "object", "properties": {

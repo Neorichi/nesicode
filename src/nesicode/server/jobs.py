@@ -297,7 +297,8 @@ def builtin_agent_tools(connector: str, label: str, which: str, cfg=None, alive=
 
 FINISHED = ("done", "max_steps")
 STOPPED = ("cancelled", "error", "interrupted", "refusal")
-HISTORY_TURNS = 200  # earlier turns handed to the agent (it keeps the first one and the newest that fit)
+HISTORY_TURNS = 1_000  # earlier turns handed to the agent (it keeps the first one and the newest that fit: the token
+# budget decides, this only bounds the query; at 200 a rule given in turn 2 of a 250-turn conversation was gone)
 
 
 def _earlier_turns(db, run: dict, limit: int = HISTORY_TURNS) -> list[dict]:
