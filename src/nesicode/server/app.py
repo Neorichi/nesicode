@@ -139,6 +139,29 @@ try:  # «Chrome» (the separate DevTools Chrome from early galleries) → «Chr
 except Exception as exc:  # never keeps the app from starting
     print("nesicode: could not rename old connector labels:", exc)
 
+GIT_RULES_NOTE = "Nesicode: regla de seguridad (no descartar cambios sin confirmar ni hacer commits que no se pidan)"
+
+
+def _add_git_rules() -> None:
+    """Every project's current harness gets the guardrails against discarding the user's uncommitted work and against
+    unrequested commits (a safety rule, like the credentials one: also when an older version is restored), where a new
+    project has them. Blank projects stay without rules."""
+    from ..harness.base import with_git_rules
+    from ..harness.profiles import is_blank
+
+    for p in db.all("SELECT * FROM projects"):
+        try:
+            files = current_harness(db, p)
+            new = None if not files or is_blank(files) else with_git_rules(files)
+            if new is not None:
+                save_harness_version(db, p["id"], new, "base", GIT_RULES_NOTE)
+        except Exception as exc:  # one odd project must never keep the app from starting
+            print(f"nesicode: could not add the git rules to project {p['id']}:", exc)
+
+
+# (before _upgrade_base_harness: it recognises an untouched older base harness by today's guardrails)
+_add_git_rules()
+
 
 def _upgrade_base_harness() -> None:
     """Projects still on the untouched previous base harness get the new built-in `documents` skill."""

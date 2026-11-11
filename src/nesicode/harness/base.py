@@ -18,11 +18,24 @@ Work the task end to end:
 Prefer small, correct edits over rewrites. Do not invent files, APIs or results you have not verified.
 """
 
+DESTRUCTIVE_RULE = "- Never run destructive commands ("
+# The working tree may hold the user's own uncommitted edits (and ignored files such as .env): a revert, a stash or a
+# clean loses them for good, and a cage's «Aplicar» copies such a loss into the project. Projects created before these
+# lines get them at startup (with_git_rules).
+GIT_RULES = (
+    "- Never discard work you did not do: the working tree may hold the user's uncommitted changes. No `git reset "
+    "--hard`, `git checkout`/`git restore` of files, `git clean`, `git stash`, deleting branches or rewriting history "
+    "unless the user asks; to undo a change of yours, edit it back.",
+    "- Never commit, amend or push unless the user asks.",
+)
+GIT_RULE_KEYS = ("Never discard work you did not do", "Never commit, amend or push")  # (a reworded line still counts)
+
 GUARDRAILS = """\
 - When the user asks for a chart, a presentation (pptx), a spreadsheet (xlsx) or a Word/PDF document, load the `documents` skill.
 - Stay inside the workspace. Never touch files outside it.
 - Never type passwords, codes or other credentials and never log in to accounts (in a browser or anywhere else). If a site asks you to sign in, stop and ask the user to do it.
 - Never run destructive commands (rm -rf on broad paths, git push --force, dropping databases).
+""" + "\n".join(GIT_RULES) + """
 - Do not exfiltrate secrets or print credentials you find.
 - If the request is ambiguous and a wrong guess is costly, say what you assumed in the final summary.
 """
@@ -74,6 +87,25 @@ def upgrade_hooks(rules: dict) -> dict:
             out[phase] = [{**r, "match": RM_MATCH} if isinstance(r, dict) and r.get("match") in LEGACY_RM_MATCHES else r
                           for r in out[phase]]
     return out
+
+
+def with_git_rules(files: Harness) -> Harness | None:
+    """`files` with the GIT_RULES lines its guardrails lack, placed where the base harness has them (after the
+    destructive-commands rule, or after a git rule already there; at the end when neither is), or None when none is
+    missing. An untouched older base harness becomes exactly today's."""
+    text = files.get("guardrails.md", "")
+    keys = [key.casefold() for key in GIT_RULE_KEYS]
+    missing = [rule for rule, key in zip(GIT_RULES, keys) if key not in text.casefold()]
+    if not missing:
+        return None
+    lines = text.split("\n")
+    anchors = [i for i, line in enumerate(lines)
+               if line.startswith(DESTRUCTIVE_RULE) or any(k in line.casefold() for k in keys)]
+    if anchors:
+        at = anchors[-1] + 1
+        return {**files, "guardrails.md": "\n".join(lines[:at] + missing + lines[at:])}
+    body = text.rstrip("\n")
+    return {**files, "guardrails.md": (body + "\n" if body else "") + "\n".join(missing) + "\n"}
 
 
 DOCUMENTS_SKILL = """\

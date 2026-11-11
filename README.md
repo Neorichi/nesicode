@@ -62,6 +62,10 @@ skills, sub-agents, scripts and hooks).
 | `scripts/<f>.py` | deterministic helper | via bash in `.nesicode/` |
 | `plugins/hooks.json` | declarative hooks (block, warn, add a hint, trim) | inside the loop |
 
+The agent also reads the repository's own instructions for coding agents (`AGENTS.md`, `CLAUDE.md`,
+`.github/copilot-instructions.md`, `.cursorrules`; up to 16,000 characters) as project instructions. They are labelled
+as repository content, so they never override your requests or the guardrails.
+
 **Harnessing (Propose → Probe → Compose)** on a task, with a budget `k`:
 
 1. **Base**: `k` runs with the current harness, each in an isolated copy of the workspace.
