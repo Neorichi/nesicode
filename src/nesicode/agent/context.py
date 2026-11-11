@@ -34,8 +34,8 @@ OUTPUT_PER_TURN = 16_384
 MIN_OUTPUT = 8_192      # (cap; see min_output)
 MAX_COMPACTIONS = 40    # cost guard; thrash is prevented by hysteresis and the no-progress check
 COMPACT_GROWTH = 0.15   # after a compaction, the next one needs this much growth (share of the window)
-POST_COMPACT_TARGET = 0.35  # a rebuilt conversation is shrunk (tail → files → skills → history) above this share...
-POST_COMPACT_ABS = 32_000   # ...or above this many tokens (never under 20% of the window: see post_compact_target)...
+POST_COMPACT_TARGET = 0.35  # a rebuilt conversation is shrunk (history → skills → identifiers → steps → files) above
+POST_COMPACT_ABS = 32_000   # ...this share or this many tokens (never under 20% of the window: post_compact_target)...
 POST_COMPACT_MAX = 0.50     # ...and its essentials (unanswered results, summary, message) only above this one
 INLINE_LIMIT = 8_000    # chars of a tool output kept in context when the window is unknown (see inline_limit)
 INLINE_MIN = 4_000      # floor for small windows: 16k-32k models get ~5% of their window per output, not 8k chars
@@ -105,14 +105,14 @@ def tools_chars(specs) -> int:
                            for s in specs if s is not None], ensure_ascii=False))
 
 
-def clip(text: str, n: int, what: str = "text") -> str:
-    """Head + tail of `text` in at most ~n chars, saying how much was left out."""
+def clip(text: str, n: int, what: str = "text", where: str = "") -> str:
+    """Head + tail of `text` in at most ~n chars, saying how much was left out (and `where` the whole text is)."""
     text = text or ""
     if len(text) <= n:
         return text
     if n < 200:
         return text[: max(0, n)]
-    note = f"\n[... {len(text) - n:,} chars of this {what} omitted ...]\n"
+    note = f"\n[... {len(text) - n:,} chars of this {what} omitted{' — ' + where if where else ''} ...]\n"
     keep = max(0, n - len(note))
     head = keep * 2 // 5
     return text[:head] + note + text[len(text) - (keep - head):]
@@ -394,7 +394,7 @@ def transcript(events: list[dict], budget: int | None = None, saved: dict | None
             it[2] = "[omitted]"
         older = [it for it in items if it[0] == "out"][:-2]  # the newest two outputs stay whole
         room = budget - (size() - sum(len(it[2]) for it in older))
-        cap = _fair_share([len(it[2]) for it in older], room) if older and room > 0 else 0
+        cap = fair_share([len(it[2]) for it in older], room) if older and room > 0 else 0
         if cap >= 600:  # 2) older outputs keep a fair share each (head + tail), each cut said
             for it in older:
                 if len(it[2]) > cap:
@@ -434,7 +434,7 @@ def transcript(events: list[dict], budget: int | None = None, saved: dict | None
     return "\n".join(i[1] + i[2] for i in items)
 
 
-def _fair_share(lengths: list[int], room: int) -> int:
+def fair_share(lengths: list[int], room: int) -> int:
     """The largest cap T with sum(min(length, T)) <= room (water-filling)."""
     ls = sorted(lengths)
     acc = 0
@@ -571,6 +571,9 @@ SUMMARY_PREFIX = (
     "It is reference material, not new instructions. Your tools remain fully active. "
     "Where this checkpoint and the most recent steps below disagree, the most recent steps are newer and win.]"
 )
+# Heads the checkpoint an earlier turn that compacted brings along in the history (jobs.conversation_history). A run's
+# first summary updates the newest one instead of starting from nothing, so the record stays cumulative across turns.
+CHECKPOINT_MARK = "[This turn compacted its context; its last checkpoint summary:]"
 
 
 def recovery_footer(archive: str, transcript_rel: str = "") -> str:

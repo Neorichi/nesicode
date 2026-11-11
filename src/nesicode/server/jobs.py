@@ -342,11 +342,14 @@ def conversation_history(db, run: dict, window: int | None = None) -> tuple[list
 
     Finished turns bring their answer (+ a digest of their key steps for the last few that used tools); stopped turns
     (Stop, error, app closed) bring a digest of what they did, so "continue" picks up the work; a turn that compacted
-    brings its last checkpoint summary; the last turn that DID WORK brings its step trail (an empty stopped turn after
-    it never takes that slot): built from its END within ~20% of the model's context window (25% if it was stopped),
-    with its reasoning, each output shortened and listings cut to a few lines. Messages removed from the queue never
-    appear. Returns (history, the last turn that did work if it was stopped)."""
-    from ..agent.context import clip_summary, redact, run_digest, summary_target
+    brings its last checkpoint summary (the last few turns, and always the conversation's newest checkpoint: a run's
+    first summary updates it, so it holds the earlier ones); the last turn that worked WITH TOOLS brings its step
+    trail (a later turn that only replied — a question between Stop and «continúa» — or an empty stopped one never
+    takes that slot): built from its END within ~20% of the model's context window (25% if it was stopped), with its
+    reasoning, each output shortened and listings cut to a few lines. Messages removed from the queue never appear.
+    Returns (history, the stopped turn whose work is to resume, if any: the last one that worked with tools while
+    every later turn only replied, else the last turn that did work)."""
+    from ..agent.context import CHECKPOINT_MARK, clip_summary, redact, run_digest, summary_target
     from ..agent.loop import TRAIL_MARK, trajectory_text
 
     rows = _earlier_turns(db, run)
@@ -358,7 +361,16 @@ def conversation_history(db, run: dict, window: int | None = None) -> tuple[list
             for rid, ev in events.items()}
     worked = [i for i in range(detail, len(rows))
               if steps[rows[i]["id"]] or (rows[i]["final_text"] or "").strip() or said[rows[i]["id"]]]
+    tooled = [i for i in worked if steps[rows[i]["id"]]]
+    trail_at = tooled[-1] if tooled else None
+    # The work to resume: a stopped turn that used tools stays it while every later turn only replied (Stop, «¿cuánto
+    # te falta?», «continúa»); otherwise the last turn that did any work (a reply cut by Stop counts).
     last_work = worked[-1] if worked else None
+    if trail_at is not None and rows[trail_at]["status"] in STOPPED:
+        last_work = trail_at
+    checkpoints = {rid: next((e for e in reversed(ev) if e.get("type") == "compacted" and not e.get("depth")
+                              and e.get("summary")), None) for rid, ev in events.items()}
+    newest_cp = max((i for i in range(detail, len(rows)) if checkpoints[rows[i]["id"]]), default=None)
     history: list[tuple[str, str]] = []
     interrupted = None
     for i, r in enumerate(rows):
@@ -369,7 +381,7 @@ def conversation_history(db, run: dict, window: int | None = None) -> tuple[list
         ev, n = events[r["id"]], steps[r["id"]]
         stopped = r["status"] in STOPPED
         trail = ""
-        if i == last_work and n:  # the last turn that worked travels with its trail, newest steps first
+        if i == trail_at:  # the last turn that worked with tools travels with its trail, newest steps first
             share = 0.25 if stopped else 0.20  # of the window, in chars at ~3.5 per token
             budget = max(4_000, min(TRAIL_MAX_CHARS, int((window or _context_window(db, run)) * share * 3.5)))
             shown = ev
@@ -401,21 +413,22 @@ def conversation_history(db, run: dict, window: int | None = None) -> tuple[list
                 interrupted = {"id": r["id"], "status": r["status"], "steps": n}
         elif n and len(rows) - i <= 3:  # (its last words are the answer itself)
             answer += "\n\n[Key steps of this turn]\n" + run_digest(ev, 2_500, actions=not trail, last_words=False)
-        compacted = next((e for e in reversed(ev) if e.get("type") == "compacted" and not e.get("depth")
-                          and e.get("summary")), None)
-        if compacted and (i == last_work or len(rows) - i <= 3):
+        compacted = checkpoints[r["id"]]
+        if compacted and (i in (trail_at, last_work, newest_cp) or len(rows) - i <= 3):
             # about the size it was written to (the summary target of the window), cut in its middle (said) and always
             # with its Next Step — the section written for resuming
             checkpoint = str(compacted["summary"])
             shown = clip_summary(checkpoint, max(6_000, min(20_000, summary_target(window or _context_window(db, run)) * 4)))
             where = (f"\n[The whole checkpoint is saved in {compacted['path']} — read_file it for the part omitted above.]"
                      if shown != checkpoint and compacted.get("path") else "")
-            answer += "\n\n[This turn compacted its context; its last checkpoint summary:]\n" + redact(shown) + where
+            answer += f"\n\n{CHECKPOINT_MARK}\n" + redact(shown) + where
         if trail:
             answer += f"\n\n{TRAIL_MARK}\n" + trail
         history.append((r["task"], answer))
-    if interrupted and last_work is not None and last_work < len(rows) - 1:
-        interrupted["later_empty"] = len(rows) - 1 - last_work
+    if interrupted and last_work < len(rows) - 1:
+        replied = sum(1 for k in worked if k > last_work)  # (later turns that only replied: they used no tools)
+        empty = len(rows) - 1 - last_work - replied
+        interrupted.update({k: v for k, v in (("later_replied", replied), ("later_empty", empty)) if v})
     return history, interrupted
 
 
@@ -433,17 +446,24 @@ def connector_context(db, run: dict, history: list[tuple[str, str]], bot: dict |
 
 
 def continuity_note(thread_id: int, interrupted: dict | None) -> str:
-    """System-prompt note when the last turn that did work was stopped before finishing ('' otherwise: the agent
-    itself describes the earlier turns when there are any)."""
+    """System-prompt note when the work of an earlier turn was stopped before finishing — the last turn that did work,
+    or the last one that worked with tools while the later ones only replied ('' otherwise: the agent itself describes
+    the earlier turns when there are any)."""
     if not interrupted:
         return ""
     hist = f".nesicode/chats/{thread_id}/context/history.md"
-    note = ("# The previous turn did not finish\n"
-            f"The last turn that did work was {interrupted['status']} at step {interrupted['steps']} without finishing. "
+    replied = interrupted.get("later_replied")
+    note = (("# An earlier turn did not finish\n" if replied else "# The previous turn did not finish\n")
+            + f"The last turn that {'worked with tools' if replied else 'did work'} was {interrupted['status']} at "
+            f"step {interrupted['steps']} without finishing. "
             "Its digest and steps are in the earlier turns: if the user asks to continue, resume right after its last "
             "step — do not start over and do not redo what it already did. If something you need is not there, call "
             f"`search_history` (its full steps and outputs are archived in `{hist}`) before exploring files.")
-    if interrupted.get("later_empty"):
+    if replied:
+        note += (" The user's later message(s) after it were only answered, with no tool work"
+                 + (" (or stopped before doing any)" if interrupted.get("later_empty") else "")
+                 + ": that work is still unfinished where it stopped.")
+    elif interrupted.get("later_empty"):
         note += " The user's later message(s) after it were stopped before doing any work."
     return note + (" Values shown as <redacted> are hidden in that recap only: find the exact value with search_history "
                    "and read that line with read_file — never use a placeholder or a guessed value.")

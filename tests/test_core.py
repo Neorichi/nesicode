@@ -220,9 +220,10 @@ def test_context_compaction(tmp_path):
 
 def test_history_fits_context(tmp_path):
     a = Agent(model="mock/demo", harness=base_harness(), workspace=Workspace(tmp_path / "ws"), context_limit=10_000)
-    hist = [("q" * 3000, "a" * 3000)] * 10  # each turn ~2000 tokens; only ~1 fits in 30% of 10k
+    hist = [("q" * 3000, "a" * 3000)] * 10  # each turn ~1,500 tokens: 30% of 10k holds ~2 of them whole
     kept = a._fit_history(hist, "system")
-    assert 0 < len(kept) < 3
+    assert 0 < len(kept) < 10 and sum(len(u) + len(x) for u, x in kept) <= (3_000 - 1) * 4 + 200
+    assert all("search_history finds it" in u for u, _ in kept)  # each clipped message says where the rest is
 
 
 def test_known_limits():

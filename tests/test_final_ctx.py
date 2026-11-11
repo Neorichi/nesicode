@@ -217,9 +217,11 @@ def test_turns_the_context_omits_are_findable_with_search_history(tmp_path):
     ws = Workspace(tmp_path / "ws")
     archive = f".nesicode/chats/{t['id']}"
     _write_thread_history(db, ws, cur, archive)
-    fitted = Agent(model="mock/demo", harness=base_harness(), workspace=ws, context_limit=131_072,
-                   archive=archive)._fit_history(history, "s")
-    assert not any("REGLA-T5" in u for u, _ in fitted)
+    agent = Agent(model="mock/demo", harness=base_harness(), workspace=ws, context_limit=131_072, archive=archive)
+    fitted = agent._fit_history(history, "s")
+    assert len(fitted) == 50 and any("REGLA-T5" in u for u, _ in fitted)  # a 128k window holds these 50 short turns
+    fitted = agent._fit_history(history, "s", budget=200)  # one that cannot: the oldest go (never the first)
+    assert not any("REGLA-T5" in u for u, _ in fitted) and fitted[0][0] == "mensaje 1"
     assert "search_history finds them" in fitted[0][1]  # the promise...
     for needle in ("REGLA-T5", "VALOR-T7"):  # ...holds
         assert needle in ctxm.search_history(ws, {"query": needle}, archive)

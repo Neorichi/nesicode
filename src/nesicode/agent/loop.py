@@ -124,6 +124,10 @@ MASK_NOTE_REASONING = ("[harness] Your reasoning from earlier steps was cleared 
                        "have not written down yet (e.g. in the deliverable or a notes file).")
 THINKING_CAP = 32_000  # chars of one reply's reasoning kept in the event log (its END: the conclusions sit there)
 TRAIL_MARK = "[PREVIOUS TURN — STEPS]"  # heads the step trail of the previous turn in the history (see _trim_answer)
+USER_SHARE = 0.6  # of the earlier turns' budget, at most, for the user's own messages (the answers get the rest)
+MESSAGE_MIN = 1_500  # chars an earlier user message keeps at least (head + tail); fewer: the oldest turns go
+ANSWER_MIN = 400  # chars an earlier answer is trimmed to before it is left out
+ANSWER_LEFT_OUT = "[the answer to this message is left out here to save context — search_history finds it]"
 WRITE_TOOLS = {"write_file", "edit_file", "generate_image", "share_file"}
 # A path into a conversation's archive: on Windows '\' separates folders too, and there (as on macOS) the disk ignores
 # case: .NESICODE\Chats\5 is .nesicode/chats/5.
@@ -226,6 +230,11 @@ def _trim_answer(text: str, n: int) -> str:
     keep = max(0, n - len(note))
     head = keep * 2 // 5
     return text[:head] + note + text[len(text) - (keep - head):]
+
+
+def _carries_state(answer: str) -> bool:
+    """An earlier answer that brings the step trail or a checkpoint of the work (trimmed after the others)."""
+    return TRAIL_MARK in answer or ctxm.CHECKPOINT_MARK in answer
 
 
 class Agent:
@@ -366,36 +375,53 @@ class Agent:
 
     # ------------------------------------------------------------------ history
     def _fit_history(self, history: list[tuple[str, str]], system: str = "", budget: int | None = None) -> list[tuple[str, str]]:
-        """Earlier turns within `budget` tokens (default ~30% of the window minus the system prompt).
+        """Earlier turns within `budget` tokens (default ~30% of the window minus the system prompt): the budget alone
+        decides what is left out, and nothing goes silently.
 
-        Nothing is dropped silently: the conversation's FIRST user message always stays (bounded — it usually holds
-        the main request and its rules), a note says how many turns are left out (search_history has them), then the
-        most recent turns that fit. User messages are kept verbatim (a single huge one: head + tail) and take at most
-        ~60% of the budget; assistant answers are trimmed first, oldest first; whole turns go last."""
+        The user's messages hold the requests and the rules: they stay verbatim while they fit ~60% of the budget (past
+        it each long one keeps head + tail of a fair share and says where the full text is). The answers give way
+        first, oldest first and those that carry a step trail or a checkpoint last of all: trimmed (a trail keeps its
+        newest steps), then left out while their user message stays. Whole turns go last, oldest first, never the
+        conversation's first one, and a note says how many (search_history has them)."""
         if not history:
             return []
-        first, rest = history[0], list(history[1:])
-        omitted = max(0, len(rest) - 19)
-        rest = rest[-19:]
         if budget is None and self.context_limit:
             budget = int(self.context_limit * 0.3) - len(system) // 4
-        if budget is None:
-            return self._note_omitted([first] + rest, omitted)
+        turns = [[u or "", a or ""] for u, a in history]
+        if budget is None:  # (an unknown window: nothing to fit to)
+            return [(u, a) for u, a in turns]
         chars = max(0, budget) * 4
-        ucap = max(1_500, min(12_000, chars // 4))
-        turns = [[ctxm.clip(u, ucap, "message"), a or ""] for u, a in [first] + rest]
-        while len(turns) > 1 and sum(len(u) for u, _ in turns) > chars * 0.6:
-            turns.pop(1)
+        share, omitted = int(chars * USER_SHARE), 0
+        while len(turns) > 1 and sum(len(u) for u, _ in turns) > share \
+                and ctxm.fair_share([len(u) for u, _ in turns], share) < MESSAGE_MIN:
+            turns.pop(1)  # not even MESSAGE_MIN each fits: the oldest turns go (never the first)
             omitted += 1
-        if len(turns[0][0]) > max(1_500, chars):  # even alone the first message is too big: keep its head and tail
-            turns[0][0] = ctxm.clip(turns[0][0], max(1_500, chars), "message")
+        lengths = [len(u) for u, _ in turns]
+        if sum(lengths) <= share:
+            each = max(lengths)
+        else:  # a fair share each (alone, the first message may take the whole budget)
+            each = ctxm.fair_share(lengths, share) if len(turns) > 1 else max(MESSAGE_MIN, chars)
+        where = None
+        for t in turns:
+            if len(t[0]) > each:
+                if where is None:
+                    hist = self._history_md()
+                    where = (f"the full message is in `{hist}`; " if hist else "") + "search_history finds it"
+                t[0] = ctxm.clip(t[0], each, "message", where)
         excess = sum(len(u) + len(a) for u, a in turns) - chars
-        for t in turns:  # answers, oldest first, only as much as needed
+        order = sorted(range(len(turns)), key=lambda i: (_carries_state(turns[i][1]), i))
+        for i in order:  # answers, only as much as needed
             if excess <= 0:
                 break
-            new = _trim_answer(t[1], max(400, len(t[1]) - excess))
-            excess -= len(t[1]) - len(new)
-            t[1] = new
+            old = turns[i][1]
+            turns[i][1] = _trim_answer(old, max(ANSWER_MIN, len(old) - excess))
+            excess -= len(old) - len(turns[i][1])
+        for i in order:  # still too big: the answers themselves (their user message stays)
+            if excess <= 0:
+                break
+            if len(turns[i][1]) > len(ANSWER_LEFT_OUT):
+                excess -= len(turns[i][1]) - len(ANSWER_LEFT_OUT)
+                turns[i][1] = ANSWER_LEFT_OUT
         while excess > 0 and len(turns) > 1:  # still too big: whole turns, oldest first (never the first one)
             u, a = turns.pop(1)
             omitted += 1
@@ -410,16 +436,20 @@ class Agent:
                                        "here — search_history finds them]")
         return turns
 
-    def _history_note(self) -> str:
+    def _history_md(self) -> str:
+        """`<archive>/context/history.md` — every earlier turn, whole — when it exists, else ''."""
         hist = f"{self.archive}/context/history.md"
         try:
-            archived = self.ws.resolve(hist).is_file()
+            return hist if self.ws.resolve(hist).is_file() else ""
         except Exception:
-            archived = False
+            return ""
+
+    def _history_note(self) -> str:
+        hist = self._history_md()
         return ("# Earlier turns of this conversation\n"
                 "The user/assistant messages before the current request are this conversation's earlier turns (oldest "
                 "first), including turns the user stopped; rules and preferences the user stated there still apply. "
-                + (f"Their full steps and tool outputs are archived in `{hist}` and `{self.archive}/outputs/`. " if archived else "")
+                + (f"Their full steps and tool outputs are archived in `{hist}` and `{self.archive}/outputs/`. " if hist else "")
                 + "If something you need is not shown, call `search_history` (plain keywords; typos are tolerated) before "
                 "exploring files. Never claim to remember a finding that is not shown or in a search result.")
 
@@ -751,9 +781,10 @@ class Agent:
         fit, each elision said). Its request is sized with the densest chars/token measured in this run; one the window
         still rejects is sized again from the prompt size the provider reports and sent once more. Stop works during
         the call; a summary cut short, empty or stuck in reasoning is retried once with a smaller transcript; "" means
-        use the fallback."""
+        use the fallback. A run's first summary updates the newest checkpoint of the earlier turns, if there is one."""
         saved = {cid: info[1] for cid, info in self._saved.items()}
         thinking = getattr(provider, "name", "") != "anthropic"  # reasoning notes help; Claude's are not re-sent
+        previous = self._summary or self._earlier_checkpoint()
         shrink, resized = 1, False
         for _ in range(3):
             lim = self.context_limit
@@ -764,11 +795,11 @@ class Agent:
             room = int((lim - out_tokens - ctxm.safety_tokens(lim)) * cpt) - len(ctxm.SUMMARY_SYSTEM)
             target = ctxm.summary_target(lim) // shrink
             earlier = ctxm.earlier_turns(self._history, min(20_000, int(lim * 4 * 0.06)))
-            base = ctxm.summary_prompt(task, "", self._summary, anchors, earlier=earlier,
+            base = ctxm.summary_prompt(task, "", previous, anchors, earlier=earlier,
                                        date=time.strftime("%Y-%m-%d"), target=target)
             budget = max(2_000, (room - len(base)) // shrink)
             prompt = ctxm.summary_prompt(task, ctxm.transcript(new_events, budget=budget, saved=saved, thinking=thinking),
-                                         self._summary, anchors, earlier=earlier, date=time.strftime("%Y-%m-%d"),
+                                         previous, anchors, earlier=earlier, date=time.strftime("%Y-%m-%d"),
                                          target=target)
             opts = ModelOptions(effort="low", role="summarizer", max_tokens=out_tokens, cancel=self.cancel)
             setattr(opts, "max_attempts", 2)  # a fallback exists: retries only lengthen the wait
@@ -813,13 +844,25 @@ class Agent:
             self.emit({"type": "context_learned", "limit": learned})
         return True
 
+    def _earlier_checkpoint(self) -> str:
+        """The newest checkpoint the earlier turns bring (ctxm.CHECKPOINT_MARK), for this run's first summary to
+        update: what earlier turns completed stays in the record instead of fading with the turns that compacted."""
+        for _, answer in reversed(self._history):
+            head = (answer or "").split(TRAIL_MARK, 1)[0]  # (before the step trail, whose outputs may quote anything)
+            i = head.find(ctxm.CHECKPOINT_MARK)
+            if i >= 0 and (text := head[i + len(ctxm.CHECKPOINT_MARK):].strip()):
+                return ("(The checkpoint an earlier turn of this conversation left; the current request and the new "
+                        "turns are newer.)\n" + text)
+        return ""
+
     def _fallback_summary(self, new_events: list[dict]) -> str:
         """Bounded and honest: the last good summary marked as OLDER, plus what the agent stated since (verbatim)."""
         lim = self.context_limit
         parts = ["## Checkpoint (automatic — the summarizer failed, so this one is partial)"]
-        if self._summary:
+        previous = self._summary or self._earlier_checkpoint()
+        if previous:
             parts.append("### Earlier checkpoint (OLDER than everything below — where they disagree, the newer lines win)\n"
-                         + ctxm.clip(self._summary, int(lim * 4 * 0.04), "checkpoint"))
+                         + ctxm.clip(previous, int(lim * 4 * 0.04), "checkpoint"))
         said = [" ".join(e["text"].split()) for e in new_events
                 if e.get("type") == "assistant" and e.get("text") and not e.get("depth")]
         kept, used = [], 0
@@ -838,36 +881,46 @@ class Agent:
     def _rebuild(self, provider, model, system, options, task, summary, anchors, new_events, tr_rel):
         """New conversation: system + earlier turns (re-fitted) + checkpoint, aiming at ~35% of a small window and ~32k
         tokens of a 128k one (ctxm.post_compact_target), so the next compaction is far away and Layer 1 has room to work
-        in between: above it the parts shrink in order (tail, files, skills,
-        identifiers, history); the essentials (unanswered results, summary, the user's message) only while the rebuild
-        is still over half the window."""
+        in between. Above it one part at a time gives up exactly what is still over, in order: the earlier turns (their
+        answers and step trail first; the user's messages stay whole while they fit), skills, identifiers, then this
+        run's recent steps and its files (each down to an eighth of its budget); the essentials (unanswered results,
+        summary, the user's message) only while the rebuild is still over half the window."""
         lim = self.context_limit
         window = lim * 4
         shares = {"history": 0.15, "task": 0.08, "pending": 0.12, "tail": 0.06, "files": 0.08, "skills": 0.03,
                   "anchors": 0.02, "summary": 0.10, "git": 0.01}
         caps = {"tail": 40_000, "files": 80_000, "skills": 12_000, "anchors": 8_000, "summary": 60_000, "git": 4_000}  # chars
-        order =["tail", "files", "skills", "anchors", "history", "pending", "summary", "task"]
-        scale = {k: 1.0 for k in shares}
+        order = ["history", "skills", "anchors", "tail", "files", "pending", "summary", "task"]
+        b = {k: min(int(window * shares[k]), caps.get(k, 10**9)) for k in shares}
+        least = {k: v // 8 for k, v in b.items()}
+        # the earlier turns give up their answers first: the user's messages (the rules) stay whole down to here
+        users = sum(len(u or "") for u, _ in self._history)
+        least["history"] = max(least["history"], min(b["history"] // 2, int(users / USER_SHARE) + 64))
         cache: dict = {}
         pend_ids = {c.id for c, _ in self._pending}
         tail_events = [e for e in new_events if e.get("id") not in pend_ids][-24:]
         git = ctxm.git_state(self.ws, int(window * shares["git"]))
         saved = {cid: info[1] for cid, info in self._saved.items()}
         essential = ("pending", "summary", "task")  # shrunk only while the rebuild is over POST_COMPACT_MAX
-        for _ in range(30):
-            b = {k: min(int(window * shares[k] * scale[k]), caps.get(k, 10**9)) for k in shares}
+        target = ctxm.post_compact_target(lim)
+        for _ in range(40):
+            sizes: dict[str, int] = {}
             hist = self._fit_history(self._history, system, b["history"] // 4)
-            msg = self._checkpoint(task, summary, anchors, tail_events, b, cache, git, saved, tr_rel)
-            chars = sum(len(u) + len(a) + 32 for u, a in hist) + len(msg) + 16
+            msg = self._checkpoint(task, summary, anchors, tail_events, b, cache, git, saved, tr_rel, sizes)
+            sizes["history"] = sum(len(u) + len(a) + 32 for u, a in hist)
+            chars = sizes["history"] + len(msg) + 16
             est = int((self._fixed_chars + chars) / self._cpt)
-            if est <= ctxm.post_compact_target(lim):
+            if est <= target:
                 break
-            k = next((k for k in order if scale[k] > 0.125 and k not in essential), None)
+            goal = target
+            k = next((k for k in order if k not in essential and b[k] > least[k] and sizes.get(k)), None)
             if k is None and est > lim * ctxm.POST_COMPACT_MAX:
-                k = next((k for k in order if scale[k] > 0.125), None)
+                goal = lim * ctxm.POST_COMPACT_MAX
+                k = next((k for k in order if b[k] > least[k] and sizes.get(k)), None)
             if k is None:
                 break
-            scale[k] /= 2
+            # exactly what is still over (a part that frees less than that is cut again on the next pass)
+            b[k] = max(least[k], min(b[k], sizes[k]) - int((est - goal) * self._cpt) - 1)
         conv = provider.conversation(model, system, self.tool_specs(), options)
         self._conv_chars, self._anchor, self._round_sizes = 0, None, []
         self._strip_noted = False  # (a new conversation: no reasoning cleared from it yet)
@@ -878,7 +931,9 @@ class Agent:
         self._add_user(conv, msg)
         return conv
 
-    def _checkpoint(self, task, summary, anchors, tail_events, b, cache, git, saved, tr_rel) -> str:
+    def _checkpoint(self, task, summary, anchors, tail_events, b, cache, git, saved, tr_rel, sizes=None) -> str:
+        """The checkpoint message within the budgets `b` (chars); `sizes` gets what each budgeted part really took."""
+        sizes = {} if sizes is None else sizes
         lines = [ctxm.SUMMARY_PREFIX]
         if self._history:
             lines.append("(The user/assistant messages before this one are earlier turns of this conversation; rules the "
@@ -888,10 +943,13 @@ class Agent:
         if where and where not in shown:
             shown += f"\n[The user's full message is saved in {where} — read what is not shown here with read_file.]"
         lines.append("## The user's latest message (verbatim)\n" + shown)
+        sizes["task"] = len(lines[-1])
         if summary:
             lines.append(self._clip_summary(summary, max(1_200, b["summary"])))
+            sizes["summary"] = len(lines[-1])
         if anchors and b["anchors"] >= 300:
             lines.append(ctxm.clip(ctxm.anchors_block(anchors), b["anchors"], "list"))
+            sizes["anchors"] = len(lines[-1])
         if self._pending:
             per = max(600, b["pending"] // max(1, len(self._pending)))
             rows = []
@@ -910,14 +968,18 @@ class Agent:
                             else ctxm.clip(body, per, "output"))
                 rows.append(f"### {'ERROR ' if res.is_error else ''}{call.name} {args}\n{body}")
             lines.append("## Results of your last tool calls (you have not seen them yet — act on them)\n" + "\n\n".join(rows))
+            sizes["pending"] = len(lines[-1])
         if b["tail"] >= 400:
             tail = ctxm.transcript(tail_events, budget=b["tail"], saved=saved, args_cap=600, for_agent=True)
             if tail:
                 lines.append("## Most recent steps (abridged — long outputs shortened; the full ones are archived)\n" + tail)
+                sizes["tail"] = len(lines[-1])
         lines.append(ctxm.files_block(self.ws, list(reversed(list(self._touched.items()))), b["files"], cache))
+        sizes["files"] = len(lines[-1])
         if self._skills_loaded:  # (a small budget still lists their names: the model knows to re-load them)
             bodies = {n: (s.get("body") or "") for n, s in skills(self.harness).items()}
             lines.append(ctxm.skills_block(bodies, self._skills_loaded, min(12_000, b["skills"])))
+            sizes["skills"] = len(lines[-1])
         lines.append(git)
         lines.append(ctxm.recovery_footer(self.archive, tr_rel))
         if self._parts:  # a reply cut by the output limit is being continued: pick it up, never restart it
