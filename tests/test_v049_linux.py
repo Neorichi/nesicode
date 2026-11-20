@@ -73,16 +73,30 @@ def _webkit():
     )
 
 
-class _WebView:
+class _Signals:
     def __init__(self):
-        self.uri, self.handlers = "", {}
-
-    def get_uri(self):
-        return self.uri
+        self.handlers = {}
 
     def connect(self, signal, fn):
         self.handlers.setdefault(signal, []).append(fn)
         return len(self.handlers[signal])
+
+
+class _WebView(_Signals):
+    def __init__(self):
+        super().__init__()
+        self.uri = ""
+        self.settings = types.SimpleNamespace(props=types.SimpleNamespace(javascript_can_access_clipboard=True))
+        self.context = _Signals()
+
+    def get_uri(self):
+        return self.uri
+
+    def get_settings(self):
+        return self.settings
+
+    def get_context(self):
+        return self.context
 
 
 def _gtk():
@@ -115,11 +129,14 @@ class _Request:
 
 
 class _Action:
-    def __init__(self, uri, nav_type=0, frame=""):
-        self.uri, self.nav_type, self.frame = uri, nav_type, frame
+    def __init__(self, uri, nav_type=0, frame="", gesture=True):
+        self.uri, self.nav_type, self.frame, self.gesture = uri, nav_type, frame, gesture
 
     def get_navigation_type(self):
         return self.nav_type
+
+    def is_user_gesture(self):
+        return self.gesture
 
     def get_request(self):
         return _Request(self.uri)
@@ -129,9 +146,12 @@ class _Action:
 
 
 class _Decision:
-    def __init__(self, uri=None, nav_type=0, frame="", main=None):
-        self.action, self.main, self.ignored = _Action(uri, nav_type, frame), main, False
-        self.uri = uri
+    def __init__(self, uri=None, nav_type=0, frame="", main=None, displayable=True, gesture=True):
+        self.action, self.main, self.ignored = _Action(uri, nav_type, frame, gesture), main, False
+        self.uri, self.displayable = uri, displayable
+
+    def is_mime_type_supported(self):
+        return self.displayable
 
     def get_navigation_action(self):
         return self.action
@@ -168,6 +188,7 @@ def test_linux_new_windows_open_only_websites_and_mail_links_the_user_clicked(op
     assert _wait_for(opened) == ["https://example.org/n"]
     for d in (_Decision("file:///etc/passwd"), _Decision("smb://evil.example/share"),
               _Decision("https://example.org/popup", nav_type=5),  # window.open by a script
+              _Decision("https://example.org/scripted", gesture=False),  # a.click() by a preview's script, no click
               _Decision(f"{APP}/api/health"), _Decision(None)):  # an API file; something unexpected
         assert view.on_navigation(view.webview, d, NEW) is True and d.ignored
     blank = _Decision("mailto:someone@example.com", frame="_blank")  # pywebview also took '_blank' navigations
@@ -313,14 +334,15 @@ class _Message:
         return self.value
 
 
-def test_linux_bridge_answers_only_calls_signed_with_the_launch_key():
+def test_linux_bridge_answers_only_calls_signed_with_the_launch_key(monkeypatch):
+    monkeypatch.setitem(desktop._guarded_nav, "port", PORT)
     gtk, calls = _gtk()
     util = types.SimpleNamespace(load_js_files=lambda window, platform: ("/*pywebview*/", "/*finish*/"))
     desktop._guard_gtk_bridge(gtk, util)
     js, finish = util.load_js_files(None, "gtkwebkit2")
     assert finish == "/*finish*/" and js.startswith("/*pywebview*/") and "nesiKey" in js
-    key = json.loads(js.rsplit("})(", 1)[1].rsplit(");", 1)[0])
-    assert len(key) >= 40
+    key, origin = json.loads("[" + js.rsplit("})(", 1)[1].rsplit(");", 1)[0] + "]")
+    assert len(key) >= 40 and origin == APP  # (the port the navigation guard was given)
     assert util.load_js_files(None, "cocoa") == ("/*pywebview*/", "/*finish*/")  # other web views: untouched
 
     view = gtk.BrowserView()
@@ -339,11 +361,12 @@ def test_linux_bridge_answers_only_calls_signed_with_the_launch_key():
 @pytest.mark.skipif(not shutil.which("node"), reason="node")
 def test_linux_app_page_signs_every_bridge_call(tmp_path):
     """The script added to pywebview's: every API call and alert() carries the key; nothing else changes."""
-    script = desktop._GTK_KEYED_CALLS % json.dumps("K3y")
+    script = desktop._GTK_KEYED_CALLS % (json.dumps("K3y"), json.dumps(APP))
     page = tmp_path / "page.js"
     page.write_text(
         "const posted = [];\n"
         "globalThis.window = globalThis;\n"
+        "window.location = {origin: " + json.dumps(APP) + "};\n"
         "window.webkit = {messageHandlers: {jsBridge: {postMessage: m => posted.push(JSON.parse(m))}}};\n"
         "window.pywebview = {platform: 'gtkwebkit2', stringify: JSON.stringify,\n"
         "  _jsApiCallback: () => { throw new Error('unsigned') }};\n"
@@ -351,6 +374,10 @@ def test_linux_app_page_signs_every_bridge_call(tmp_path):
         "window.pywebview._jsApiCallback('open_external', ['https://example.org'], '12');\n"
         "window.pywebview._jsApiCallback('pywebviewStateUpdate', {key: 'a', value: 1}, '13');\n"
         "window.alert('hi');\n"
+        "window.location = {origin: 'null'};\n"  # another document (an opaque preview) never gets the key
+        "window.pywebview = {platform: 'gtkwebkit2', stringify: JSON.stringify, _jsApiCallback: () => 'unsigned'};\n"
+        + script +
+        "posted.push(window.pywebview._jsApiCallback('f', [], '14'));\n"
         "console.log(JSON.stringify(posted));\n", encoding="utf-8")
     out = subprocess.run(["node", str(page)], capture_output=True, text=True, timeout=30)
     assert out.returncode == 0, out.stderr
@@ -359,6 +386,7 @@ def test_linux_app_page_signs_every_bridge_call(tmp_path):
         {"funcName": "open_external", "params": ["https://example.org"], "id": "12", "nesiKey": "K3y"},
         {"funcName": "pywebviewStateUpdate", "params": {"key": "a", "value": 1}, "id": "13", "nesiKey": "K3y"},
         {"funcName": "_pywebviewAlert", "params": "hi", "id": "alert", "nesiKey": "K3y"},
+        "unsigned",
     ]
 
 
@@ -483,7 +511,9 @@ def test_the_deb_package_layout(tmp_path):
     control = (tree / "DEBIAN" / "control").read_text(encoding="utf-8")
     fields = dict(line.split(": ", 1) for line in control.splitlines() if ": " in line and not line.startswith(" "))
     assert fields["Package"] == "nesicode" and fields["Version"] == "0.4.9" and fields["Architecture"] == "amd64"
-    assert "gir1.2-webkit2-4.1" in fields["Depends"] and "libgirepository-1.0-1" in fields["Depends"]
+    assert "gir1.2-webkit2-4.1 (>= 2.40)" in fields["Depends"] and "libgirepository-1.0-1" in fields["Depends"]
+    preinst = tree / "DEBIAN" / "preinst"
+    assert os.stat(preinst).st_mode & 0o777 == 0o755 and "/opt/nesicode/nesicode" in preinst.read_text(encoding="utf-8")
     assert int(fields["Installed-Size"]) > 0 and control.endswith("\n")
     assert all(line.startswith(" ") for line in control.split("Description: ", 1)[1].splitlines()[1:])
     assert os.readlink(tree / "usr" / "bin" / "nesicode") == "/opt/nesicode/nesicode"
@@ -514,3 +544,68 @@ def test_pywebview_helper_threads_never_keep_the_app_alive():
     other = types.SimpleNamespace(Thread=object)
     desktop._daemon_bridge_threads(other)
     assert other.Thread is object  # something else than threading's Thread: left alone
+
+
+def test_linux_pages_are_sandboxed_cannot_read_the_clipboard_nor_download_unasked(opened):
+    """As on macOS and Windows: the web process sandboxed (when bubblewrap can start), no clipboard reads from a
+    script, no file saved in ~/Downloads behind the user's back."""
+    created = []
+
+    class Context(_Signals):
+        def __init__(self, *args):
+            super().__init__()
+            self.args, self.sandbox = args, False
+            created.append(self)
+
+        def set_sandbox_enabled(self, on):
+            self.sandbox = on
+
+    class WebContext:
+        new_with_website_data_manager = staticmethod(lambda manager: Context(manager))
+        new_ephemeral = staticmethod(lambda: Context())
+
+    gtk, calls = _gtk()
+    gtk.webkit.WebContext, gtk.settings = WebContext, {"ALLOW_DOWNLOADS": False}
+    assert desktop._gtk_web_content(gtk, sandbox=True) is True
+    assert WebContext.new_with_website_data_manager("data").sandbox is True and created[-1].args == ("data",)
+    assert WebContext.new_ephemeral().sandbox is True
+    desktop._gtk_web_content(gtk, sandbox=True)  # (once only)
+    assert WebContext.new_ephemeral().sandbox is True and len(created) == 3
+
+    view = gtk.BrowserView()
+    assert view.webview.settings.props.javascript_can_access_clipboard is False
+    (started,) = view.webview.context.handlers["download-started"]
+    download = types.SimpleNamespace(cancelled=False)
+    download.cancel = lambda: setattr(download, "cancelled", True)
+    started(view.webview.context, download)
+    assert download.cancelled is True
+
+    # a download in a preview (a response WebKit cannot show) is refused, not saved
+    desktop._guard_gtk_navigation(gtk)
+    view = gtk.BrowserView()
+    d = _Decision("https://example.org/file.zip", main=False, displayable=False)
+    assert view.on_navigation(view.webview, d, 2) is True and d.ignored
+    gtk.settings["ALLOW_DOWNLOADS"] = True  # (pywebview's own setting: then its Save dialog)
+    d = _Decision("https://example.org/file.zip", main=False, displayable=False)
+    assert view.on_navigation(view.webview, d, 2) is None and not d.ignored
+
+    gtk2, _ = _gtk()
+
+    class Untouched:
+        new = staticmethod(lambda: "ctx")
+
+    gtk2.webkit.WebContext, gtk2.settings = Untouched, {}
+    assert desktop._gtk_web_content(gtk2, sandbox=False) is False and Untouched.new() == "ctx"
+
+
+def test_no_sandbox_where_bubblewrap_cannot_start(monkeypatch):
+    monkeypatch.setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1")
+    assert desktop._sandbox_available() is False
+
+
+def test_refused_bridge_calls_are_logged_without_filling_the_log(monkeypatch, capsys):
+    monkeypatch.setattr(desktop, "_blocked_calls", {"n": 0})
+    for _ in range(250):
+        desktop._note_blocked("from a frame that is not the app")
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 7 and lines[-1].endswith("(200 so far)")

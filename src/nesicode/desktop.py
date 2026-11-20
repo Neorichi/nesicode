@@ -61,10 +61,22 @@ def trusted_frame(message, port: int) -> bool:
         return False
 
 
+_blocked_calls = {"n": 0}
+
+
+def _note_blocked(why: str) -> None:
+    """Log a refused bridge call: the first ones, then one line per 100 (a page posting in a loop must not fill the
+    log)."""
+    _blocked_calls["n"] += 1
+    n = _blocked_calls["n"]
+    if n <= 5 or n % 100 == 0:
+        print(f"nesicode: blocked a desktop bridge call {why} ({n} so far)", file=sys.stderr)
+
+
 def _guarded_js_bridge_call(original):
     def js_bridge_call(window, func_name, param, value_id):
         if not bridge_call_ok(func_name, value_id):
-            print("nesicode: blocked a desktop bridge call with an invalid name or id", file=sys.stderr)
+            _note_blocked("with an invalid name or id")
             return None
         return original(window, func_name, param, value_id)
 
@@ -93,7 +105,7 @@ def guard_js_bridge(port: int) -> list[str]:
             mod.js_bridge_call = _guarded_js_bridge_call(fn)
         if name in ("cocoa", "gtk") and name not in _guarded_bridge:
             try:  # the per-frame lock: WebKit, on macOS and on Linux, hands the bridge to every frame
-                _guarded_bridge[name] = _guard_cocoa_bridge(mod, port) if name == "cocoa" else _guard_gtk_bridge(mod)
+                _guarded_bridge[name] = _guard_cocoa_bridge(mod, port) if name == "cocoa" else _guard_gtk_bridge(mod, port=port)
             except Exception as exc:
                 print(f"nesicode: could not guard the {name} bridge:", exc, file=sys.stderr)
                 continue
@@ -123,7 +135,7 @@ def _guard_cocoa_bridge(cocoa, port: int):
             if trusted_frame(message, port):
                 objc.super(NesiJSBridge, self).userContentController_didReceiveScriptMessage_(controller, message)
             else:
-                print("nesicode: blocked a desktop bridge call from a frame that is not the app", file=sys.stderr)
+                _note_blocked("from a frame that is not the app")
 
     cocoa.BrowserView.JSBridge = NesiJSBridge  # pywebview creates BrowserView.JSBridge for every window
     return NesiJSBridge
@@ -133,16 +145,17 @@ def _guard_cocoa_bridge(cocoa, port: int):
 # which the window runs in the main frame only, gets a key made at launch and adds it to every call. The previews are
 # sandboxed in an opaque origin (no allow-same-origin), so they can never read the app page's variables.
 _GTK_KEYED_CALLS = """
-;(function (key) {
+;(function (key, origin) {
   var p = window.pywebview;
-  if (!p || p.platform !== 'gtkwebkit2') return;
+  // only the app's own page: a page that is not (were one ever to load in the window) never sees the key
+  if (!p || p.platform !== 'gtkwebkit2' || window.location.origin !== origin) return;
   function post(funcName, params, id) {
     return window.webkit.messageHandlers.jsBridge.postMessage(
       p.stringify({ funcName: funcName, params: params, id: id, nesiKey: key }));
   }
   p._jsApiCallback = post;
   window.alert = function (message) { post('_pywebviewAlert', message, 'alert'); };
-})(%s);
+})(%s, %s);
 """
 
 
@@ -157,9 +170,10 @@ def gtk_bridge_message_ok(message, key: str) -> bool:
         return False
 
 
-def _guard_gtk_bridge(gtk, util=None):
+def _guard_gtk_bridge(gtk, util=None, port: int | None = None):
     if util is None:
         import webview.util as util
+    origin = json.dumps(f"http://127.0.0.1:{port if port is not None else _guarded_nav.get('port')}")
 
     key = secrets.token_urlsafe(32)
     view_cls = gtk.BrowserView
@@ -168,14 +182,14 @@ def _guard_gtk_bridge(gtk, util=None):
 
     def on_js_bridge_call(self, manager, message):
         if not gtk_bridge_message_ok(message, key):
-            print("nesicode: blocked a desktop bridge call from a frame that is not the app", file=sys.stderr)
+            _note_blocked("from a frame that is not the app")
             return None
         return original(self, manager, message)
 
     def load_js_files(window, platform):
         js_code, finish_script = original_js(window, platform)
         if platform == "gtkwebkit2":  # the script pywebview runs in the main frame on every load
-            js_code += _GTK_KEYED_CALLS % json.dumps(key)
+            js_code += _GTK_KEYED_CALLS % (json.dumps(key), origin)
         return js_code, finish_script
 
     view_cls.on_js_bridge_call = on_js_bridge_call  # connected to the window's script messages when pywebview builds it
@@ -336,12 +350,15 @@ def _guard_edge_navigation(edgechromium):
 # So the main frame is turned away there, before the new page replaces the app (the browser opens then), or when its
 # load fails before any response (an unknown host, a mailto: link: the browser or the mail app opens then, and WebKit's
 # error page never replaces the app). Turning away from the policy signal of the navigation itself would cut the
-# frames' navigations too, and stopping the load would also cut the app's own streams (the replies). The address the
-# web view reports when a load starts is still the app's (checked on WebKitGTK 2.50 and 2.52), so it cannot be used.
+# frames' navigations too. The address the web view reports when a load starts is still the app's (checked on
+# WebKitGTK 2.50 and 2.52), so it cannot be used. WebKit stops the page's own loads as soon as it lets a main-frame
+# navigation start: the replies' stream then reconnects where it was (api.ts streamRun), and the context menu has no
+# «Open Link» here (the page sends clicked links to the browser itself, without any navigation).
 def gtk_new_window_decision(action, port: int, link_clicked) -> tuple[str, str]:
-    """`new_window_decision` for a WebKitGTK navigation action."""
+    """`new_window_decision` for a WebKitGTK navigation action, which also says whether the user's own click (or key)
+    caused it: a script's a.click() in an agent-written preview counts as a clicked link too, and opens nothing here."""
     try:
-        if action.get_navigation_type() != link_clicked:
+        if action.get_navigation_type() != link_clicked or not action.is_user_gesture():
             return "none", ""
         url = str(action.get_request().get_uri())
     except Exception:
@@ -420,6 +437,13 @@ def _guard_gtk_navigation(gtk):
                     decision.ignore()
                     turn_away_once(self, kind, url)
                     return True
+            try:
+                displayable = bool(decision.is_mime_type_supported())
+            except Exception:
+                displayable = True
+            if not displayable and not _gtk_downloads_allowed(gtk):
+                decision.ignore()  # a download: refused, as on macOS and Windows (pywebview's GTK saved it silently)
+                return True
         return original_policy(self, webview, decision, decision_type)
 
     def on_load_finish(self, webview, status):  # (load-changed: the main frame's loads only)
@@ -455,6 +479,80 @@ def _guard_gtk_navigation(gtk):
     view_cls.on_navigation, view_cls.on_load_finish = on_navigation, on_load_finish
     _gtk_after_init(gtk, watch_failures)
     return on_navigation
+
+
+def _gtk_downloads_allowed(gtk) -> bool:
+    return bool((getattr(gtk, "settings", None) or {}).get("ALLOW_DOWNLOADS"))
+
+
+def _sandbox_available() -> bool:
+    """Can WebKitGTK's sandbox (bubblewrap, with a user namespace) start here? Not in most containers, nor where an
+    administrator turned unprivileged user namespaces off."""
+    flag = os.environ.get("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS")
+    if flag and flag != "0":
+        return False
+    import shutil
+    import subprocess
+
+    bwrap = "/usr/bin/bwrap" if os.path.exists("/usr/bin/bwrap") else shutil.which("bwrap")
+    if not bwrap:
+        return False
+    try:
+        probe = [bwrap, "--unshare-user", "--unshare-pid", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "true"]
+        return subprocess.run(probe, capture_output=True, timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
+def _gtk_web_content(gtk, sandbox: bool | None = None) -> bool:
+    """What the pages in the Linux window may do, as on macOS and Windows: their web process sandboxed (WebKitGTK's
+    4.1 API leaves it off unless asked; WKWebView and WebView2 always have one), no reading the clipboard from a script
+    (pywebview turns it on, and a preview of an agent-written page could read what the user copied), no downloads
+    saved unasked. Returns whether the sandbox is on."""
+    webkit = gtk.webkit
+    if sandbox is None:
+        sandbox = _sandbox_available()
+    if sandbox:  # before the window's web process starts: pywebview makes the context and loads the page in one go
+        cls = webkit.WebContext
+        for name in ("new_with_website_data_manager", "new_ephemeral", "new"):
+            original = getattr(cls, name, None)
+            if original is None or getattr(original, "_nesi_sandboxed", False):
+                continue
+
+            def sandboxed(*args, _original=original):
+                context = _original(*args)
+                context.set_sandbox_enabled(True)
+                return context
+
+            sandboxed._nesi_sandboxed = True
+            setattr(cls, name, staticmethod(sandboxed))
+    else:
+        print("nesicode: WebKit's sandbox cannot start here (no user namespaces): the window's pages run without it",
+              file=sys.stderr)
+
+    def harden(view):
+        view.webview.get_settings().props.javascript_can_access_clipboard = False
+        if not _gtk_downloads_allowed(gtk):
+            view.webview.get_context().connect("download-started", lambda context, download: download.cancel())
+
+    if not gtk.BrowserView.__dict__.get("_nesi_web_content"):  # (once per process)
+        gtk.BrowserView._nesi_web_content = True
+        _gtk_after_init(gtk, harden)
+    return sandbox
+
+
+_web_sandbox: dict[str, bool] = {}
+
+
+def _harden_web_content() -> None:
+    if not sys.platform.startswith("linux"):
+        return  # (WKWebView and WebView2 already do all of it)
+    try:
+        from webview.platforms import gtk
+
+        _web_sandbox["on"] = _gtk_web_content(gtk)
+    except Exception as exc:
+        print("nesicode: could not restrict the window's pages:", exc, file=sys.stderr)
 
 
 _GUARDS = {"cocoa": "_guard_cocoa_navigation", "edgechromium": "_guard_edge_navigation", "gtk": "_guard_gtk_navigation"}
@@ -577,9 +675,10 @@ def _enable_native_context_menu(webview) -> None:
             print("nesicode: could not enable the context menu:", exc)
 
 
-# WebKitGTK's items that make no sense inside the app window (as _MENU_BLOCK on macOS)
+# WebKitGTK's items that make no sense inside the app window (as _MENU_BLOCK on macOS), and «Open Link», which would
+# navigate the window (see the navigation guard): a click on the link opens it in the browser
 _GTK_MENU_BLOCK = (
-    "OPEN_LINK_IN_NEW_WINDOW", "DOWNLOAD_LINK_TO_DISK", "OPEN_IMAGE_IN_NEW_WINDOW", "DOWNLOAD_IMAGE_TO_DISK",
+    "OPEN_LINK", "OPEN_LINK_IN_NEW_WINDOW", "DOWNLOAD_LINK_TO_DISK", "OPEN_IMAGE_IN_NEW_WINDOW", "DOWNLOAD_IMAGE_TO_DISK",
     "OPEN_FRAME_IN_NEW_WINDOW", "GO_BACK", "GO_FORWARD", "STOP", "RELOAD", "INSPECT_ELEMENT",
     "OPEN_VIDEO_IN_NEW_WINDOW", "OPEN_AUDIO_IN_NEW_WINDOW", "DOWNLOAD_VIDEO_TO_DISK", "DOWNLOAD_AUDIO_TO_DISK",
 )
@@ -874,11 +973,13 @@ def main() -> None:
     _daemon_bridge_threads()
     _enable_native_context_menu(webview)
     _allow_microphone(port)
-    guard_navigation(port)  # these two before the window exists: pywebview builds its delegate and bridge with it
+    _harden_web_content()
+    kept = guard_navigation(port)  # these two before the window exists: pywebview builds its delegate and bridge with it
     guarded = guard_js_bridge(port)
     # WebKit (macOS, Linux) must have the per-frame lock: it hands the bridge to every frame. Without it, no native
-    # API at all: folder picking, the file manager and "Save as…" fall back to what the page can do itself
-    safe = bridge_is_safe(guarded)
+    # API at all: folder picking, the file manager and "Save as…" fall back to what the page can do itself. On Linux
+    # the lock is a key given to the page in the window, so the window must also be kept on the app's pages.
+    safe = bridge_is_safe(guarded) and (not linux or "gtk" in kept)
     if not safe:
         print("nesicode: the desktop bridge could not be secured; native dialogs are disabled", file=sys.stderr)
     window = webview.create_window("Nesicode", url, width=1360, height=880, min_size=(900, 600), text_select=True,

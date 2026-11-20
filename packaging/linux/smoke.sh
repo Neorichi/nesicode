@@ -15,18 +15,18 @@ fail() { echo "FAIL: $*"; [ -f "${APPLOG:-/nonexistent}" ] && { echo "---- app l
 log "install $(basename "$DEB") (its dependencies only, no recommended packages)"
 $SUDO apt-get update -qq
 $SUDO apt-get install -y -qq --no-install-recommends "$DEB" >/dev/null
-$SUDO apt-get install -y -qq --no-install-recommends xvfb x11-utils imagemagick openbox wmctrl dbus dbus-x11 curl \
-  procps iproute2 desktop-file-utils >/dev/null
 grep -h PRETTY_NAME /etc/os-release
 dpkg-query -W -f='${Package} ${Version}\n' nesicode libwebkit2gtk-4.1-0 libgtk-3-0 libgtk-3-0t64 2>/dev/null || true
 
-log "libraries"
+log "libraries (before this script's own tools are installed: only what the package's Depends brought)"
 missing=""
 while IFS= read -r -d '' f; do
   nf=$(ldd "$f" 2>/dev/null | grep "not found" || true)
   [ -z "$nf" ] || missing+="$f:"$'\n'"$nf"$'\n'
 done < <(find /opt/nesicode -type f \( -name '*.so' -o -name '*.so.*' -o -path /opt/nesicode/nesicode \) -print0)
 [ -z "$missing" ] || { echo "$missing"; fail "libraries not found"; }
+$SUDO apt-get install -y -qq --no-install-recommends xvfb x11-utils imagemagick openbox wmctrl dbus dbus-x11 curl \
+  procps iproute2 desktop-file-utils >/dev/null
 
 log "menu entry, command and icons"
 desktop-file-validate /usr/share/applications/nesicode.desktop
@@ -83,16 +83,19 @@ echo "screenshot colors: $colors"
 log "what the app starts does not inherit the bundle's libraries"
 echo "app $APP: $(tr '\0' '\n' </proc/"$APP"/environ | grep -E '^LD_LIBRARY_PATH' || echo 'no LD_LIBRARY_PATH at exec')"
 descendants() { for c in $(pgrep -P "$1"); do echo "$c"; descendants "$c"; done; }
-found_child=0
+found_child=0; sandboxed=0
 for c in $(descendants "$APP"); do
   [ -r "/proc/$c/environ" ] || continue
   found_child=1
   name=$(cat "/proc/$c/comm" 2>/dev/null || echo "?")
+  [ "$name" = bwrap ] && sandboxed=1
   ldp=$(tr '\0' '\n' <"/proc/$c/environ" | grep -E '^(LD_LIBRARY_PATH|GI_TYPELIB_PATH|GTK_PATH|GIO_MODULE_DIR|GDK_PIXBUF_MODULE_FILE)=' || true)
   echo "  $c $name: ${ldp:-clean}"
   case "$ldp" in *"/opt/nesicode"*) fail "$name inherited the bundle's paths" ;; esac
 done
 [ "$found_child" = 1 ] || fail "no child processes (WebKit's) found"
+echo "WebKit's sandbox (bubblewrap): $([ $sandboxed = 1 ] && echo on || echo off)"
+if [ "${NESICODE_EXPECT_SANDBOX:-}" = 1 ] && [ $sandboxed != 1 ]; then fail "WebKit's web process is not sandboxed"; fi
 
 log "app log"
 cat "$APPLOG"
@@ -118,4 +121,13 @@ for round in 1 2 3; do
   fi
   echo "round $round: closed while loading, quit"
 done
+log "upgrading while the app runs is refused (its files would change under it), and works once it is closed"
+start_app
+wait_port || fail "the app did not start again"
+APP3=$(app_pid)
+if $SUDO dpkg -i "$DEB" >"$OUT/upgrade.out" 2>&1; then fail "dpkg replaced the files of the running app"; fi
+grep -q "Nesicode is open" "$OUT/upgrade.out" || { cat "$OUT/upgrade.out"; fail "no message saying why"; }
+for _ in $(seq 240); do wmctrl -l 2>/dev/null | grep -q Nesicode && break; sleep 0.25; done
+close_app "$APP3" || fail "the app did not quit"
+$SUDO dpkg -i "$DEB" >"$OUT/upgrade2.out" 2>&1 || { cat "$OUT/upgrade2.out"; fail "reinstalling a closed app failed"; }
 echo "OK: $(basename "$DEB")"

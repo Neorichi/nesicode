@@ -47,7 +47,8 @@ jobs:
           - { name: debian-13, runner: ubuntu-24.04, arch: amd64, image: "debian:13" }
           - { name: ubuntu-24.04, runner: ubuntu-24.04-arm, arch: arm64, image: "ubuntu:24.04" }
           - { name: debian-13, runner: ubuntu-24.04-arm, arch: arm64, image: "debian:13" }
-          # the runners themselves: a real kernel with AppArmor, WebKit's sandbox on
+          # the runners themselves: a real kernel (Ubuntu 24.04's AppArmor rules), where the app must run its pages in
+          # WebKit's bubblewrap sandbox
           - { name: host-ubuntu-24.04, runner: ubuntu-24.04, arch: amd64, image: "" }
           - { name: host-ubuntu-22.04, runner: ubuntu-22.04, arch: amd64, image: "" }
     runs-on: ${{ matrix.runner }}
@@ -65,7 +66,7 @@ jobs:
             docker run --rm -e WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 -v "$PWD:/w" -w /w "${{ matrix.image }}" \
               bash packaging/linux/smoke.sh "$deb" out
           else
-            bash packaging/linux/smoke.sh "$deb" out
+            NESICODE_EXPECT_SANDBOX=1 bash packaging/linux/smoke.sh "$deb" out
           fi
       - uses: actions/upload-artifact@v4
         if: always()

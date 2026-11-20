@@ -1,0 +1,13 @@
+#!/bin/sh
+# Upgrading while Nesicode runs would swap its files under the running copy, which reads more of them as it goes
+# (and could then fail mid-reply). Ask for it to be closed first; a first install or a removal goes on as usual.
+set -e
+if [ "$1" = upgrade ]; then
+  for exe in /proc/[0-9]*/exe; do
+    if [ "$(readlink "$exe" 2>/dev/null)" = /opt/nesicode/nesicode ]; then
+      echo "Nesicode is open: close it (and let a running reply finish) before installing this version." >&2
+      exit 1
+    fi
+  done
+fi
+exit 0

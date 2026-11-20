@@ -79,10 +79,13 @@ CASES = {
                              f"b.textContent = 'img'; a.appendChild(b); {ROOT}.appendChild(a); b.click(); return 1 }})()",
                              ["https://example.com/h"], True),
     "J_same_origin_link_click": (_click("/projects"), [], False),
+    # the page's fallback before the bridge exists: a detached target=_blank link it clicks. Inside the user's click it
+    # opens the browser everywhere; run from a script, as here, WebKitGTK (which tells a user's gesture from a script)
+    # opens nothing, as it must for a preview's own a.click()
     "K_no_bridge_yet_fallback": ("(() => { const saved = window.pywebview; window.pywebview = undefined; "
                                  "const a = document.createElement('a'); a.href = 'https://example.com/k'; a.textContent = 'K'; "
                                  f"{ROOT}.appendChild(a); a.click(); window.pywebview = saved; return 1 }})()",
-                                 ["https://example.com/k"], True),
+                                 [] if sys.platform.startswith("linux") else ["https://example.com/k"], True),
     "M_encoded_api_link_click": (_click("/%61pi/health"), [], True),
     "M2_encoded_api_direct": (_go("/api%2Fhealth"), [], True),
     "N_assets_direct": (_go("/assets/missing.js"), [], True),
@@ -133,6 +136,29 @@ PREVIEW = """(() => {
   })();
   return 1;
 })()""" % json.dumps(EVIL)
+
+def _descendants(root: int) -> list[str]:
+    """The names of the processes this one started, and theirs (Linux /proc)."""
+    parent: dict[int, int] = {}
+    names: dict[int, str] = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            raw = open(f"/proc/{d}/stat", "rb").read()
+        except OSError:
+            continue
+        names[int(d)] = raw[raw.index(b"(") + 1:raw.rindex(b")")].decode(errors="replace")
+        parent[int(d)] = int(raw[raw.rindex(b")") + 2:].split()[1])
+    out, todo = [], [root]
+    while todo:
+        p = todo.pop()
+        for c, pp in parent.items():
+            if pp == p:
+                out.append(names[c])
+                todo.append(c)
+    return sorted(out)
+
 
 holder: dict = {}
 real_create, real_start = webview.create_window, webview.start
@@ -185,13 +211,18 @@ def steps():
 
         views = list(gtk.BrowserView.instances.values())
         res["gtk_context_menu_kept"] = bool(views and getattr(views[0], "_nesi_menu", 0))
-    for name, (script, _, _) in CASES.items():
+        res["gtk_clipboard_reads_off"] = bool(views) and views[0].webview.get_settings().props.javascript_can_access_clipboard is False
+        res["web_sandbox"] = desktop._web_sandbox.get("on")
+        res["web_processes"] = _descendants(os.getpid())
+    for name, (script, want, _) in CASES.items():
         home()
         opened.clear()
         before = url()
         js("window.pywebview.__e2eProbe = 1")
         res[name] = {"js": js(script)}
-        time.sleep(2.5)
+        # what must open may take a while on a busy machine; then a moment more for anything that must not
+        wait(lambda: len(opened) >= len(want), 10 if want else 3)
+        time.sleep(1.0)
         after = url()
         res[name].update({"url_after": after.replace(base, "<app>").split("?token=")[0],
                           "stayed_in_app": after.startswith(base + "/") and "/api/" not in after,
@@ -219,7 +250,12 @@ desktop.main()
 
 res = holder.get("res") or {}
 fails = []
-for key in ("api_ready", "start_url_is_app") + (("gtk_context_menu_kept",) if sys.platform.startswith("linux") else ()):
+linux_keys = ("gtk_context_menu_kept", "gtk_clipboard_reads_off")
+if sys.platform.startswith("linux") and os.environ.get("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "0") == "0":
+    linux_keys += ("web_sandbox",)  # (a real machine: its pages must run in WebKit's bubblewrap sandbox)
+    if "bwrap" not in (res.get("web_processes") or []):
+        fails.append(f"no bubblewrap among the window's processes: {res.get('web_processes')}")
+for key in ("api_ready", "start_url_is_app") + (linux_keys if sys.platform.startswith("linux") else ()):
     if res.get(key) is not True:
         fails.append(f"{key}: {res.get(key)!r}")
 for name, (_, want, same) in CASES.items():

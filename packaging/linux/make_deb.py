@@ -4,7 +4,8 @@
 
 Layout: the app in /opt/nesicode, the `nesicode` command in /usr/bin, the menu entry and its icons under /usr/share.
 The window is the system's WebKitGTK (see bundle.py), hence the Depends. dpkg's triggers refresh the menu and the icon
-cache, so there are no maintainer scripts. Run on Linux: dpkg-deb builds the package (the tree alone elsewhere).
+cache; the only maintainer script (preinst) stops an upgrade while the app runs. Run on Linux: dpkg-deb builds the
+package (the tree alone elsewhere).
 """
 
 from __future__ import annotations
@@ -24,11 +25,15 @@ ICON_SIZES = (16, 24, 32, 48, 64, 128, 256, 512)
 MAINTAINER = "Nesi Labs <3147619+Neorichi@users.noreply.github.com>"
 HOMEPAGE = "https://github.com/Neorichi/nesicode"
 # gir1.2-* bring GTK 3, WebKitGTK (4.1 API) and their typelibs; the rest is what the bundled PyGObject links to.
-DEPENDS = "gir1.2-gtk-3.0, gir1.2-webkit2-4.1, libgirepository-1.0-1, libcairo-gobject2, libffi8"
+# WebKitGTK 2.40+: pywebview 6 runs scripts with its evaluate_javascript, the window guard reads which frame a response
+# is for (every supported release has it, from security updates: 2.50 on Ubuntu 22.04)
+DEPENDS = "gir1.2-gtk-3.0, gir1.2-webkit2-4.1 (>= 2.40), libgirepository-1.0-1, libcairo-gobject2, libffi8"
 # xdg-utils opens links in the browser; the GStreamer ones give WebKitGTK the microphone (the mic button); the emoji
 # font draws the icons the UI writes as emoji (a bare system shows boxes)
 RECOMMENDS = ("xdg-utils, git, gstreamer1.0-plugins-good, gstreamer1.0-pipewire | gstreamer1.0-pulseaudio, "
               "fonts-noto-color-emoji")
+# no maintainer scripts but this one: it stops an upgrade while the app runs (dpkg's triggers do the menu and icons)
+PREINST = HERE / "preinst"
 DESCRIPTION = """Coding agent with a chat, projects, connectors and bots
  Nesicode is a desktop app for working with AI coding agents: a chat that edits
  and runs code in your projects, connectors (MCP servers, Gmail, GitHub…),
@@ -122,9 +127,10 @@ def build_tree(bundle: Path, version: str, arch: str, work: Path) -> Path:
     meta.mkdir()
     (meta / "control").write_text(control(version, arch, _installed_kib(tree)), encoding="utf-8")
     (meta / "md5sums").write_text("".join(sums), encoding="utf-8")
+    shutil.copyfile(PREINST, meta / "preinst")
     os.chmod(meta, 0o755)
     for f in meta.iterdir():
-        os.chmod(f, 0o644)
+        os.chmod(f, 0o755 if f.name == "preinst" else 0o644)
     return tree
 
 
