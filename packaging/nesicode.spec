@@ -6,7 +6,7 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 ROOT = Path(SPECPATH).parent
-VERSION = "0.4.8"
+VERSION = "0.4.9"
 WEB = ROOT / "web" / "dist"
 LINUX = sys.platform.startswith("linux")
 if not (WEB / "index.html").exists():
