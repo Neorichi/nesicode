@@ -143,6 +143,7 @@ export default function ProjectSettings() {
       </div>
 
       <ReadDirsCard project={project} onSaved={() => refreshProjects()} />
+      <CageCard project={project} onSaved={() => refreshProjects()} />
 
       <div className="card danger">
         <h3>{t('Zona peligrosa')}</h3>
@@ -248,6 +249,53 @@ export function ReadDirsCard({ project, onSaved }: { project: Project; onSaved: 
           )}
           {mode === 'none' && (
             <p className="muted small">{t('En este equipo los comandos del agente no van en una jaula: esta lista le dice qué carpetas puede leer, pero no le impide leer otras.')}</p>
+          )}
+          {error && <div className="error-box">{error}</div>}
+        </>
+      )}
+    </div>
+  )
+}
+
+export function CageCard({ project, onSaved }: { project: Project; onSaved: () => void }) {
+  useLang()
+  const [on, setOn] = useState(!!project.uncaged)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  useEffect(() => setOn(!!project.uncaged), [project.uncaged])
+
+  const save = async (next: boolean) => {
+    setBusy(true)
+    setError('')
+    try {
+      const p = await api.patch<Project>(`/api/projects/${project.id}`, { uncaged: next })
+      setOn(!!p.uncaged)
+      onSaved()
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="card form">
+      <h3>{t('Sin jaula')}</h3>
+      {project.uncaged_allowed === false ? (
+        <p className="muted small">{t('Solo en la app de escritorio / modo local')}</p>
+      ) : (
+        <>
+          <p className="muted small">
+            {t('Los comandos del agente en las conversaciones de este proyecto se ejecutan como en tu terminal: con tu carpeta personal, tu entorno, tus herramientas y tu Docker, sin la jaula del sistema. Los bots del proyecto siguen en la jaula. Cuenta desde el siguiente mensaje.')}
+          </p>
+          <label className="check">
+            <input type="checkbox" checked={on} disabled={busy} onChange={(e) => save(e.target.checked)} />
+            {t('Ejecutar los comandos sin jaula')}
+          </label>
+          {on && (
+            <div className="error-box small">
+              {t('Sin jaula, el agente puede leer y cambiar cualquier archivo tuyo (también tus claves y las de Nesicode) y usar tus sesiones. Actívalo solo en proyectos en los que confíes.')}
+            </div>
           )}
           {error && <div className="error-box">{error}</div>}
         </>

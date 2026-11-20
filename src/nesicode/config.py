@@ -37,6 +37,11 @@ def _read_dotenv(path: Path) -> str | None:
     return None
 
 
+# The names a .env file of Nesicode's put in the environment (its API keys…): commands that run as the user, outside the
+# sandbox (a project's «Sin jaula»), get the user's environment without them.
+DOTENV_KEYS: set[str] = set()
+
+
 def _load_dotenv(path: Path) -> None:
     """Minimal .env loader: KEY=VALUE lines, existing env vars win. A line the environment cannot hold (no name, a NUL
     character) is skipped: a .env must never keep the app from starting."""
@@ -59,7 +64,9 @@ def _load_dotenv(path: Path) -> None:
         if not key or "\0" in key + value:
             continue
         try:
-            os.environ.setdefault(key, value)
+            if key not in os.environ:
+                os.environ[key] = value
+                DOTENV_KEYS.add(key)
         except (ValueError, OSError):  # a name the system refuses
             continue
 

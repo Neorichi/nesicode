@@ -41,8 +41,8 @@ from ..agent.vision import image_mime
 from ..agent.workspace import ATTACHMENTS_DIR, apply_cage, cage_plan, manifest, manifest_paths
 from .cage_git import report as git_report
 from .jobs import (
-    FINAL, Jobs, create_cage, current_harness, merge_harness, project_root, project_ws, run_dir, save_harness_version,
-    thread_dir, thread_ws, user_root,
+    FINAL, Jobs, create_cage, current_harness, merge_harness, project_root, project_uncaged, project_ws, run_dir,
+    save_harness_version, thread_dir, thread_ws, user_root,
 )
 from .config_io import KEY_RX
 from .limits import endpoint_problem, vetted
@@ -1897,13 +1897,16 @@ class ProjectPatch(BaseModel):
     transcribe_model: str | None = Field(default=None, max_length=200)
     # folders the agent may read (the whole list; [] = none): checked by read_dirs.check_read_dirs, local mode only
     read_dirs: list[str] | None = Field(default=None, max_length=100)
+    # «Sin jaula»: the project's chat commands run as the user, outside any sandbox (local mode only)
+    uncaged: bool | None = None
 
 
 def project_view(p: dict) -> dict:
     # read_dirs_mode: what keeps the agent to them — 'macos' | 'docker' (a sandbox), 'none' (nothing: Windows, Linux
-    # without Docker) or 'off' (a shared server: the setting is not available)
+    # without Docker) or 'off' (a shared server: the setting is not available). uncaged_allowed: the same for «Sin jaula»
     return {**p, "workspace": str(project_ws(p)), "external": bool(p.get("folder")), "read_dirs": stored_read_dirs(p),
-            "read_dirs_mode": "off" if settings.auth_enabled else sandbox_mode()}
+            "read_dirs_mode": "off" if settings.auth_enabled else sandbox_mode(),
+            "uncaged": project_uncaged(p), "uncaged_allowed": not settings.auth_enabled}
 
 
 @app.get("/api/projects")
@@ -2075,6 +2078,10 @@ def patch_project(project_id: int, body: ProjectPatch, user: dict = Depends(curr
                                              ensure_ascii=False)
         except ReadDirError as exc:
             raise HTTPException(exc.status, str(exc)) from None
+    if "uncaged" in fields:
+        if settings.auth_enabled:  # a shared server would run one user's commands as its own OS user, free
+            raise HTTPException(403, "«Sin jaula» solo está disponible en la app de escritorio o en modo local")
+        fields["uncaged"] = 1 if fields["uncaged"] else 0
     if fields:
         sets = ", ".join(f"{k}=?" for k in fields)
         db.execute(f"UPDATE projects SET {sets} WHERE id=?", (*fields.values(), project_id))

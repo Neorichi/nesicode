@@ -305,6 +305,11 @@ export default function Chat() {
             </select>
           )}
           <ContextMeter runs={runs} live={activeId ? ctxLive : null} />
+          {project?.uncaged && !thread?.bot && (
+            <Link to={`/p/${project.id}/settings`} className="pill uncaged" title={t('Los comandos de este proyecto se ejecutan como en tu terminal, sin la jaula del sistema (ajustes del proyecto)')}>
+              {t('Sin jaula')}
+            </Link>
+          )}
           {project && (
             <div className="chat-model" title={t('Modelo ejecutor · versión del harness')}>
               {project.executor_model} · v{project.harness_version}

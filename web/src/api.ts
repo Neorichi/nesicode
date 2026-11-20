@@ -22,6 +22,9 @@ export type Project = {
   read_dirs?: string[]
   /** what keeps the agent to them: a sandbox ('macos' | 'docker'), nothing ('none') or not available ('off': a shared server) */
   read_dirs_mode?: 'macos' | 'docker' | 'none' | 'off'
+  /** «Sin jaula»: the project's chat commands run as the user, outside any sandbox (local mode only) */
+  uncaged?: boolean
+  uncaged_allowed?: boolean
 }
 
 export type Thread = { id: number; project_id: number; title: string; isolated: number; exec_mode?: string; effective_mode?: string; telegram?: { linked: boolean; attached: boolean }; bot?: any; created_at: number; updated_at: number }

@@ -93,8 +93,8 @@ EMPTY_CUT_NOTE = (
 # The OS sandbox keeps the user's other folders and apps out of reach: say so up front, so a needed file is asked
 # for instead of hunted (seen live: an agent relaunching Finder «cold» to read ~/Downloads).
 OUT_OF_REACH = (
-    "You only see this workspace: the user's other folders (Downloads, Documents…) and apps are out of reach. If you "
-    "need a file from there, ask the user to attach it to the chat or put it in the project, and wait."
+    "You only see this workspace: the user's other folders (Downloads, Documents…), apps and Docker are out of reach. "
+    "If you need a file from there, ask the user to attach it to the chat or put it in the project, and wait."
 )
 # Folders the user lets the agent read (a project setting): which, and how (only bash reaches them). Only when set.
 READ_DIRS_NOTE = (
@@ -103,8 +103,14 @@ READ_DIRS_NOTE = (
     "not the user's: use those absolute paths."
 )
 OUT_OF_REACH_BESIDES = (
-    "Apart from those folders you only see this workspace: the user's other folders and apps are out of reach. If you "
-    "need a file from elsewhere, ask the user to attach it to the chat or put it in the project, and wait."
+    "Apart from those folders you only see this workspace: the user's other folders, apps and Docker are out of reach. "
+    "If you need a file from elsewhere, ask the user to attach it to the chat or put it in the project, and wait."
+)
+# «Sin jaula» (a project setting the user turned on): no sandbox at all.
+UNCAGED = (
+    "This project runs without a sandbox (the user turned it off in its settings): your commands run as the user, with "
+    "their home, files, tools, sessions and Docker. Be as careful as in their own terminal: touch nothing the task does "
+    "not need, and ask before changing or deleting anything of theirs outside the workspace."
 )
 # Seen live: to get a file the user had downloaded in their browser, an agent replayed the site's anti-bot download-token
 # flow with curl posing as Chrome. The user stopped it; ask instead.
@@ -340,7 +346,7 @@ def build_system(h: Harness, ws: Workspace, *, base: str | None = None, extra_to
     scripts = sorted(p for p in h if p.startswith("scripts/") or "/scripts/" in p)
     budget = min(REPO_RULES_MAX, int(context_limit * ctxm.CHARS_PER_TOKEN * 0.05)) if context_limit else REPO_RULES_MAX
     parts.append(repo_instructions(ws, budget))
-    mode = sandbox_mode()
+    mode = "host" if getattr(ws, "uncaged", False) else sandbox_mode()
     # (two helpful but optional lines only where tokens are cheap: on a small window every token of this prompt is
     # paid on every request and moves the compactions earlier)
     roomy = not context_limit or context_limit >= ROOMY_WINDOW
@@ -368,6 +374,8 @@ def build_system(h: Harness, ws: Workspace, *, base: str | None = None, extra_to
                                          example=shlex.quote(dirs[0].rstrip(sep) + sep + "<file>")))
     if mode in ("macos", "docker"):
         env.append(OUT_OF_REACH_BESIDES if dirs else OUT_OF_REACH)
+    elif mode == "host":
+        env.append(UNCAGED)
     env.append(NO_BOT_EVASION)
     if scripts:
         env.append(

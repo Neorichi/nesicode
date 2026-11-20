@@ -28,7 +28,7 @@ import weakref
 from pathlib import Path, PurePath
 from typing import NamedTuple
 
-from ..config import DOTENV_PATHS, app_data_dir, settings
+from ..config import DOTENV_KEYS, DOTENV_PATHS, app_data_dir, settings
 from ..harness import Harness
 
 # Not listed, not diffed, not copied back.
@@ -166,6 +166,56 @@ READ_DIRS_HINT = ("You may READ (never change) only these folders of the user, w
                   "private home, not the user's). Copy what you need into the workspace and work on the copy. Other "
                   "files only reach you when the user attaches them to the chat or puts them in the project folder: "
                   "ask for the file instead of looking for a way in.")
+
+
+# «Sin jaula» (a project setting, local mode only): the project's chat commands run as the user, outside any sandbox.
+HOST_HINT = ("Your file tools work only inside the workspace; with bash you reach the user's other folders too (this "
+             "project runs without a sandbox): copy what you need into the workspace and work on the copy.")
+
+
+def user_environment() -> dict[str, str]:
+    """The environment the user's terminal has (their HOME, PATH, Docker context, COLIMA_HOME…): their login shell's,
+    read once (the desktop app starts with the bare one macOS gives apps); this process's own where there is none
+    (Windows, or the shell would not answer)."""
+    global _USER_ENV
+    with _USER_ENV_LOCK:
+        if _USER_ENV is None:
+            _USER_ENV = _login_environment() or dict(os.environ)
+        return dict(_USER_ENV)
+
+
+_USER_ENV: dict[str, str] | None = None
+_USER_ENV_LOCK = threading.Lock()
+_ENV_MARK = b"\0__NESI_ENV__\0"
+
+
+def _login_environment() -> dict[str, str] | None:
+    if os.name == "nt":
+        return None
+    shell = os.environ.get("SHELL") or ("/bin/zsh" if sys.platform == "darwin" else "/bin/bash")
+    try:
+        out = subprocess.run([shell, "-ilc", "printf '\\0__NESI_ENV__\\0'; env -0"], capture_output=True, timeout=15,
+                             stdin=subprocess.DEVNULL).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if _ENV_MARK not in out:
+        return None
+    env: dict[str, str] = {}
+    for item in out.split(_ENV_MARK, 1)[1].split(b"\0"):
+        name, sep, value = item.partition(b"=")
+        if sep and name and b"\n" not in name:
+            env[name.decode("utf-8", "surrogateescape")] = value.decode("utf-8", "surrogateescape")
+    return env if env.get("PATH") else None
+
+
+def host_environment() -> dict[str, str]:
+    """What a «Sin jaula» command gets: the user's environment without Nesicode's own variables (its settings, the
+    desktop app's API token) nor the keys Nesicode's .env files brought in (theirs to keep, not the commands')."""
+    env = {k: v for k, v in user_environment().items() if not k.upper().startswith("NESICODE_") and k not in DOTENV_KEYS}
+    env.update({"TERM": "dumb", "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})  # (output read back as UTF-8 text)
+    if os.name != "nt":
+        env["NESICODE_PATH"] = env.get("PATH") or "/usr/bin:/bin"  # see RESTORE_PATH
+    return env
 
 
 def sandbox_mode() -> str:
@@ -1161,22 +1211,31 @@ def apply_cage(base: dict[str, str], root: Path, target: Path, changes=None) -> 
 
 
 class Workspace:
-    def __init__(self, root: Path | str, read_dirs=()):
+    def __init__(self, root: Path | str, read_dirs=(), uncaged: bool = False):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         # Folders of the user's that its commands may also READ (a project setting: chat and bot runs; jobs.py passes
         # them validated and canonical). Only bash reaches them: the file tools below stay inside the root.
         self.read_dirs: tuple[str, ...] = tuple(str(d) for d in read_dirs)
+        # «Sin jaula» (a project setting, chats only, local mode only): commands run as the user, with their
+        # environment, outside any sandbox (mode "host"). The file tools still stay inside the root.
+        self.uncaged = bool(uncaged)
         self._bg = _Background()
         self._watcher: threading.Thread | None = None
         weakref.finalize(self, self._bg.kill)  # the run that used this workspace is over
 
+    def mode(self) -> str:
+        """How this workspace's commands run: "host" (as the user, «Sin jaula»), else sandbox_mode()."""
+        return "host" if self.uncaged else sandbox_mode()
+
     def seen_read_dirs(self) -> list[str]:
         """read_dirs as this workspace's commands see them (in docker mode, where they are mounted)."""
-        return seen_paths(self.read_dirs, sandbox_mode()) if self.read_dirs else []
+        return seen_paths(self.read_dirs, self.mode()) if self.read_dirs else []
 
     def outside_hint(self) -> str:
         """What the agent is told when it reaches for something outside the workspace."""
+        if self.uncaged:
+            return HOST_HINT
         dirs = self.seen_read_dirs()
         return READ_DIRS_HINT.format(dirs=", ".join(f"`{d}`" for d in dirs)) if dirs else OUTSIDE_HINT
 
@@ -1328,11 +1387,13 @@ class Workspace:
 
     def run(self, command: str, timeout: int = 120) -> tuple[int, str]:
         timeout = max(1, min(int(timeout or 120), 900))
-        mode = sandbox_mode()
+        mode = self.mode()
         container = None
         if mode == "docker":
             container = f"nesicode-{uuid.uuid4().hex[:16]}"
             argv, env = docker_argv(self.root, command, container, self.read_dirs), None
+        elif mode == "host":
+            env, argv = host_environment(), shell_argv(command)
         else:
             env = self._local_env(mode)
             argv = shell_argv(command)

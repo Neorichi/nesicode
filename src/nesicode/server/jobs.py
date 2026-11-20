@@ -29,6 +29,12 @@ from .auth import user_keys
 from .db import DB, loads
 from .read_dirs import usable_read_dirs
 
+
+def project_uncaged(project: dict) -> bool:
+    """«Sin jaula» (a project setting): its chat commands run as the user, outside any sandbox. Only where Nesicode
+    serves one person (the desktop app, local mode): on a shared server it would run them as the server's own user."""
+    return bool(project.get("uncaged")) and not settings.auth_enabled
+
 FINAL = {"done", "error", "cancelled", "interrupted", "max_steps", "refusal"}
 
 
@@ -1418,8 +1424,10 @@ class Jobs:
         keys = user_keys(db, project["user_id"])
         vision = project.get("vision_model") or settings.vision_model
         image = project.get("image_model") or settings.image_model
-        # the folders of the user's this project lets the agent read (chat and bot runs; never harnessing rollouts)
-        ws = Workspace(thread_ws(project, thread), read_dirs=usable_read_dirs(project))
+        # the folders of the user's this project lets the agent read (chat and bot runs; never harnessing rollouts), and
+        # «Sin jaula» for the user's own chats only: a bot answers other people, its commands stay in the sandbox
+        ws = Workspace(thread_ws(project, thread), read_dirs=usable_read_dirs(project),
+                       uncaged=project_uncaged(project) and not run.get("bot_id"))
         bot = db.one("SELECT * FROM bots WHERE id=?", (run["bot_id"],)) if run.get("bot_id") else None
         from .limits import learn_limit, model_limits
 

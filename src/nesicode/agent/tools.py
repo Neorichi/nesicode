@@ -1337,14 +1337,17 @@ def bash(ws: Workspace, args: dict) -> str:
     code, out = ws.run(command, _int(args, "timeout", 120))
     out = out if len(out) <= 30_000 else out[:15_000] + "\n... (output truncated) ...\n" + out[-15_000:]
     dirs = ws.seen_read_dirs() if hasattr(ws, "seen_read_dirs") else []
+    mode = "host" if getattr(ws, "uncaged", False) else sandbox_mode()
     # (whatever the exit code: `ls ~/Downloads | head; echo` ends 0)
-    if _refused_by_sandbox(command, out, dirs, _own_paths(ws)):
+    if _refused_by_sandbox(command, out, dirs, _own_paths(ws), mode):
         out += ("\n[sandbox] That is out of your reach, and no other command will get you there. " + ws.outside_hint()
                 if dirs else
                 "\n[sandbox] That is out of your reach: you only see this workspace, not the user's other folders or "
                 "apps, and no other command will get you there. " + OUTSIDE_HINT)
-    elif _refused_in_read_dirs(command, out, dirs):
+    elif _refused_in_read_dirs(command, out, dirs, mode):
         out += READ_ONLY_NOTE
+    if mode in ("macos", "docker") and _DOCKER_CMD.search(command) and _DOCKER_OUT.search(out):
+        out += DOCKER_NOTE
     if "Operation not permitted" in out and _KILL_CMD.search(command):
         out += ("\n[sandbox] A process that an earlier command started cannot be signalled from this one: stop it "
                 "with the stop_process tool (no arguments lists them).")
@@ -1355,6 +1358,17 @@ def bash(ws: Workspace, args: dict) -> str:
 
 
 _PIPE_CODES = re.compile(r"\[pipeline exit codes: ([0-9 ]+)\]")  # PIPE_TRAP's line
+# Docker from inside the sandbox: its socket, its contexts and the apps or VMs that run it are the user's. Seen live: an
+# agent spent three replies and 10 GB building its own Lima VM to get round it, where the user had Docker running.
+_DOCKER_CMD = re.compile(r"(?:^|[;&|(\s/])(?:docker|docker-compose|podman|nerdctl|colima|limactl|lima)\b")
+_DOCKER_OUT = re.compile(r"docker\.sock|docker daemon|docker API|is the docker daemon running|colima is not running|"
+                         r"No instance found|UNIX_PATH_MAX|Cannot connect to the Docker|podman\.sock", re.I)
+DOCKER_NOTE = ("\n[sandbox] Docker is out of your reach: your commands run in a sandbox that keeps the user's Docker "
+               "away (its socket, its contexts, the apps and virtual machines that run it), and nothing you start from "
+               "here (Docker Desktop, Colima, Lima, a VM of your own) changes that: do not try. Tell the user now. They "
+               "can turn the sandbox off for this project (project settings → «Sin jaula», then send the message "
+               "again), or start the containers themselves and give you their address: ports on 127.0.0.1 are "
+               "reachable from here.")
 _KILL_CMD = re.compile(r"(?:^|[;&|(\s])(?:kill|pkill|killall)\b")
 
 
@@ -1381,9 +1395,9 @@ def _without_read_dirs(command: str, read_dirs) -> str:
     return command
 
 
-def _refused_in_read_dirs(command: str, out: str, read_dirs) -> bool:
+def _refused_in_read_dirs(command: str, out: str, read_dirs, mode: str | None = None) -> bool:
     """A command that tried to change something in a folder the agent may only read (or to read a secret in it)."""
-    if not read_dirs or sandbox_mode() not in ("macos", "docker"):
+    if not read_dirs or (mode or sandbox_mode()) not in ("macos", "docker"):
         return False
     low = out.lower()
     return ("operation not permitted" in low or "read-only file system" in low) and \
@@ -1402,12 +1416,12 @@ def _own_paths(ws) -> list[str]:
     return out
 
 
-def _refused_by_sandbox(command: str, out: str, read_dirs=(), own=()) -> bool:
+def _refused_by_sandbox(command: str, out: str, read_dirs=(), own=(), mode: str | None = None) -> bool:
     """A command that tried to reach the user's folders or launch an app while the OS sandbox is on — judged by what
     it printed, not its exit code (a pipe or a trailing `; echo` hides the failure). Paths into the folders the user
     lets the agent read (`read_dirs`) do not count: a read there works, and a failure there is of another kind; nor do
     paths into the workspace itself (`own`)."""
-    if sandbox_mode() not in ("macos", "docker"):
+    if (mode or sandbox_mode()) not in ("macos", "docker"):
         return False
     command = _without_read_dirs(command, [*read_dirs, *own])
     low = out.lower()

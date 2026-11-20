@@ -113,6 +113,7 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 .icon-btn:hover { background: var(--side-hover); color: var(--ink); }
 .link { border: 0; background: none; color: var(--accent); padding: 4px; }
 .pill { font-size: 11px; padding: 1px 7px; border-radius: 99px; background: var(--side-hover); color: var(--ink-2); font-family: var(--mono); }
+.pill.uncaged { background: var(--err-soft); color: var(--err); text-decoration: none; white-space: nowrap; }
 
 .error-box, .ok-box { border-radius: 8px; padding: 9px 12px; font-size: 13.5px; margin: 8px 0; }
 .error-box { background: var(--err-soft); color: var(--err); }

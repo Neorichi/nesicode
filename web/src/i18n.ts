@@ -247,6 +247,14 @@ const EN: Record<string, string> = {
   'Esa carpeta es la de datos de Nesicode; elige otra': "That is Nesicode's data folder; choose another one",
   'Elige una carpeta de proyecto, no la raíz del disco ni tu carpeta personal': 'Choose a project folder, not the disk root or your home folder',
   'Carpetas que el agente puede leer': 'Folders the agent can read',
+  'Sin jaula': 'No sandbox',
+  'Los comandos del agente en las conversaciones de este proyecto se ejecutan como en tu terminal: con tu carpeta personal, tu entorno, tus herramientas y tu Docker, sin la jaula del sistema. Los bots del proyecto siguen en la jaula. Cuenta desde el siguiente mensaje.':
+    "The agent's commands in this project's conversations run as in your terminal: with your home folder, your environment, your tools and your Docker, outside the system sandbox. The project's bots stay in the sandbox. It applies from the next message.",
+  'Ejecutar los comandos sin jaula': 'Run commands without a sandbox',
+  'Los comandos de este proyecto se ejecutan como en tu terminal, sin la jaula del sistema (ajustes del proyecto)':
+    "This project's commands run as in your terminal, outside the system sandbox (project settings)",
+  'Sin jaula, el agente puede leer y cambiar cualquier archivo tuyo (también tus claves y las de Nesicode) y usar tus sesiones. Actívalo solo en proyectos en los que confíes.':
+    "Without a sandbox, the agent can read and change any file of yours (your keys and Nesicode's too) and use your sessions. Only turn it on for projects you trust.",
   'El agente puede leer estas carpetas (nunca cambiarlas) y lo que lea se envía al modelo.': 'The agent can read these folders (never change them), and what it reads is sent to the model.',
   'Ninguna: el agente solo ve la carpeta de la conversación.': "None: the agent only sees the conversation's folder.",
   '/ruta/a/la/carpeta': '/path/to/the/folder',
