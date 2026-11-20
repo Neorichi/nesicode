@@ -1,0 +1,74 @@
+name: linux-deb
+
+# Builds the Linux .deb (amd64, arm64) on the oldest release it supports and installs it on each supported one, then
+# starts the installed app (packaging/linux/smoke.sh). Called by desktop.yml (releases) and linux-check.yml (pushes).
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-22.04, arch: amd64 }
+          - { runner: ubuntu-22.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: system packages (PyGObject's headers; the GTK stack PyInstaller inspects)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libgirepository1.0-dev libcairo2-dev gir1.2-gtk-3.0 gir1.2-webkit2-4.1
+      - name: build
+        run: packaging/linux/build_deb.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nesicode-linux-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  install:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # fresh containers of each supported release (no user namespaces there: WebKit's sandbox is turned off)
+          - { name: ubuntu-22.04, runner: ubuntu-24.04, arch: amd64, image: "ubuntu:22.04" }
+          - { name: ubuntu-24.04, runner: ubuntu-24.04, arch: amd64, image: "ubuntu:24.04" }
+          - { name: ubuntu-26.04, runner: ubuntu-24.04, arch: amd64, image: "ubuntu:26.04" }
+          - { name: debian-12, runner: ubuntu-24.04, arch: amd64, image: "debian:12" }
+          - { name: debian-13, runner: ubuntu-24.04, arch: amd64, image: "debian:13" }
+          - { name: ubuntu-24.04, runner: ubuntu-24.04-arm, arch: arm64, image: "ubuntu:24.04" }
+          - { name: debian-13, runner: ubuntu-24.04-arm, arch: arm64, image: "debian:13" }
+          # the runners themselves: a real kernel with AppArmor, WebKit's sandbox on
+          - { name: host-ubuntu-24.04, runner: ubuntu-24.04, arch: amd64, image: "" }
+          - { name: host-ubuntu-22.04, runner: ubuntu-22.04, arch: amd64, image: "" }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: Nesicode-linux-${{ matrix.arch }}
+          path: pkg
+      - name: install and start on ${{ matrix.name }} (${{ matrix.arch }})
+        run: |
+          deb=$(ls pkg/*.deb)
+          if [ -n "${{ matrix.image }}" ]; then
+            docker run --rm -e WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 -v "$PWD:/w" -w /w "${{ matrix.image }}" \
+              bash packaging/linux/smoke.sh "$deb" out
+          else
+            bash packaging/linux/smoke.sh "$deb" out
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-${{ matrix.name }}-${{ matrix.arch }}
+          path: out

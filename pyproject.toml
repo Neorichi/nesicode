@@ -27,6 +27,9 @@ desktop = [
     "pywebview>=6.2.1",
     "pyobjc-framework-speech>=11; sys_platform == 'darwin'",
     "pyobjc-framework-avfoundation>=11; sys_platform == 'darwin'",
+    # Linux: the window is the system's WebKitGTK. 3.50 is the last PyGObject that runs on libgirepository-1.0
+    # (Ubuntu 22.04, Debian 12); it builds from source: apt install pkg-config libgirepository1.0-dev libcairo2-dev
+    "pygobject>=3.48,<3.51; sys_platform == 'linux'",
 ]
 
 [build-system]

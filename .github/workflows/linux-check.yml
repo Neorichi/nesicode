@@ -1,0 +1,59 @@
+name: linux-check
+
+# The release workflow builds the .deb; this one also runs the test suite on Linux and drives the real window
+# (WebKitGTK under Xvfb, scripts/desktop_window_check.py): links never replace the app, the native bridge answers
+# the app page and nothing inside it.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, 'linux-*']
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: web
+        working-directory: web
+        run: npm ci --silent && npm run build --silent
+      - name: pytest
+        run: uv run pytest -q -p no:cacheprovider -rfEs --junitxml=junit.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: junit-linux, path: junit.xml }
+
+  window:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: system packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libgirepository1.0-dev libcairo2-dev gir1.2-gtk-3.0 gir1.2-webkit2-4.1 \
+            xvfb xauth dbus-x11
+          dpkg-query -W -f='${Package} ${Version}\n' libwebkit2gtk-4.1-0
+      - name: web
+        working-directory: web
+        run: npm ci --silent && npm run build --silent
+      - name: the real window
+        run: |
+          uv sync --extra desktop
+          xvfb-run -a -s "-screen 0 1600x1000x24" dbus-run-session -- uv run --no-sync python scripts/desktop_window_check.py window.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "window-${{ matrix.runner }}", path: window.json, if-no-files-found: ignore }
+
+  deb:
+    uses: ./.github/workflows/linux-deb.yml

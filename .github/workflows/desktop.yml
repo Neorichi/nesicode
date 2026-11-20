@@ -1,7 +1,8 @@
 name: desktop
 
-# Builds the macOS .dmg (Apple Silicon) and the Windows installer.
-# Run it by hand from the Actions tab, or push a tag like v0.1.0 to also attach them to a release.
+# Builds the macOS .dmg (Apple Silicon), the Windows installer and the Linux .deb (amd64, arm64; linux-deb.yml, which
+# also installs and starts it on Ubuntu and Debian). Run it by hand from the Actions tab, or push a tag like v0.1.0 to
+# also attach them to a release.
 on:
   workflow_dispatch:
   push:
@@ -53,13 +54,16 @@ jobs:
           name: Nesicode-windows
           path: dist/*-setup.exe
 
+  linux:
+    uses: ./.github/workflows/linux-deb.yml
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [macos, windows]
+    needs: [macos, windows, linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
-        with: { path: out, merge-multiple: true }
+        with: { path: out, pattern: "Nesicode-*", merge-multiple: true }  # (not the Linux checks' screenshots)
       - uses: softprops/action-gh-release@v2
         with:
           files: out/*

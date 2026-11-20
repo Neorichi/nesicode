@@ -107,11 +107,12 @@ uv run nesicode run "fix the failing test" --workspace ./my-repo --model anthrop
 uv run nesicode harness "add pagination to /users" --workspace ./my-repo --k 2 --mode sequential --check "uv run pytest -q" --apply
 ```
 
-## Desktop app (macOS and Windows)
+## Desktop app (macOS, Windows and Linux)
 
 A single program: it starts the server on a private port and opens it in its own window (WebKit on Mac,
-WebView2 on Windows). No login, but a random token per launch so other programs on the computer cannot use
-its API. Data lives in `~/Library/Application Support/nesicode` (Mac) or `%APPDATA%\nesicode` (Windows);
+WebView2 on Windows, WebKitGTK on Linux). No login, but a random token per launch so other programs on the computer
+cannot use its API. Data lives in `~/Library/Application Support/nesicode` (Mac), `%APPDATA%\nesicode` (Windows) or
+`~/.local/share/nesicode` (Linux);
 optional configuration goes in a `.env` inside that folder.
 
 Closing the window stops the replies in progress (they are kept as interrupted; queued messages wait for the next
@@ -124,9 +125,16 @@ launch) and every MCP server the app started.
   Git for Windows' bash if installed, or PowerShell. Each of its commands runs in a job object of its own, so Stop,
   a timeout and the end of the reply end everything the command started, also what it left running in the
   background (as process groups do on macOS/Linux); local MCP servers (`npx`, `uvx`…) get the same from the MCP SDK.
-- **GitHub Actions** (`.github/workflows/desktop.yml`): builds both (Mac Apple Silicon + Windows) on demand from
-  the Actions tab or when a `v*` tag is pushed, and attaches them to the release.
-- From source: `uv sync --extra desktop && uv run nesicode desktop`.
+- **Linux** (Ubuntu 22.04 or later, Debian 12 or later; amd64 and arm64): `sudo apt install ./Nesicode-<version>-linux-<arch>.deb`.
+  The app appears in the applications menu and as `nesicode` in a terminal; its window is the system's WebKitGTK,
+  which apt installs with it. `sudo apt remove nesicode` uninstalls it (your data stays in `~/.local/share/nesicode`).
+  As on Windows, there is no OS cage unless you use Docker. Build with `packaging/linux/build_deb.sh` on Ubuntu 22.04
+  (the oldest release it supports; it needs `pkg-config libgirepository1.0-dev libcairo2-dev gir1.2-gtk-3.0
+  gir1.2-webkit2-4.1`) → `dist/Nesicode-<version>-linux-<arch>.deb`.
+- **GitHub Actions** (`.github/workflows/desktop.yml`): builds all of them (Mac Apple Silicon, Windows, Linux amd64 and
+  arm64) on demand from the Actions tab or when a `v*` tag is pushed, and attaches them to the release. The .deb is
+  first installed and started on Ubuntu 22.04, 24.04 and 26.04 and Debian 12 and 13 (`linux-deb.yml`).
+- From source: `uv sync --extra desktop && uv run nesicode desktop` (on Linux, with the packages above installed).
 
 Downloads are on the [Releases](../../releases) page.
 
@@ -198,7 +206,7 @@ A conversation's "Apply" is three-way, like a harnessing run's: a file that chan
 
 Every bash command runs under the OS sandbox (macOS `sandbox-exec`; on Linux use `NESICODE_SANDBOX=docker`). It can write only inside its cage and read only its cage, the system and the toolchains it needs (Python, Node, Rust… under your home); your home folder, `data/`, the repo (`.env`), other disks, other programs' Unix sockets (use TCP `127.0.0.1` for a local database) and Nesicode's own API port stay out of reach, and it cannot signal other processes, open apps or send Apple Events. The network stays open. What the sandbox cannot hide: on macOS the launch environment of every process of the same user (its command line and environment variables, `KERN_PROCARGS2`) stays readable, so keep secrets out of other processes' environment — put API keys in `.env` or the vault instead of exporting them in the shell that starts `nesicode serve` or other programs. Caged commands and MCP servers get a minimal environment without them.
 
-**Folders the agent may read** (off by default, local mode only): in a project's settings, «Carpetas que el agente puede leer» names up to 10 folders of yours — your Downloads, a folder on another disk — that the agent's commands may READ in that project's conversations and bots (never in harnessing runs). Nothing there is ever writable, and inside them the sandbox still keeps out what holds keys (`~/.ssh`, `~/.aws`, `~/.config/gh`, `~/Library/Keychains`, browser profiles, Nesicode's data, the vault key, its `.env` files), also behind a link: it judges the real path. The server refuses the disk root, your home or a folder that holds it, other users' homes, Nesicode's own folders, places with keys, the temporary folders every program shares (`/tmp`…), and folders that only hold apps' data (`~/Library`, `~/.config`: name a folder inside them). In Docker mode the folders are mounted read-only — but a read-only mount does not stop a program from connecting to a Unix socket inside it, so there never name a folder that holds a running service's socket (a project's local database, say). The agent copies what it needs into its conversation with bash, and what it reads goes to the model. On Windows there is no OS cage: the list tells the agent where it may read but cannot stop it from reading elsewhere. Exported configurations never carry the list, and an imported one never sets it.
+**Folders the agent may read** (off by default, local mode only): in a project's settings, «Carpetas que el agente puede leer» names up to 10 folders of yours — your Downloads, a folder on another disk — that the agent's commands may READ in that project's conversations and bots (never in harnessing runs). Nothing there is ever writable, and inside them the sandbox still keeps out what holds keys (`~/.ssh`, `~/.aws`, `~/.config/gh`, `~/Library/Keychains`, browser profiles, Nesicode's data, the vault key, its `.env` files), also behind a link: it judges the real path. The server refuses the disk root, your home or a folder that holds it, other users' homes, Nesicode's own folders, places with keys, the temporary folders every program shares (`/tmp`…), and folders that only hold apps' data (`~/Library`, `~/.config`: name a folder inside them). In Docker mode the folders are mounted read-only — but a read-only mount does not stop a program from connecting to a Unix socket inside it, so there never name a folder that holds a running service's socket (a project's local database, say). The agent copies what it needs into its conversation with bash, and what it reads goes to the model. On Windows and Linux there is no OS cage: the list tells the agent where it may read but cannot stop it from reading elsewhere. Exported configurations never carry the list, and an imported one never sets it.
 
 ## Security (read before opening it to other users)
 
@@ -227,7 +235,7 @@ src/nesicode/
   speech.py     speech to text for the microphone button
 web/            React + Vite (chat, harness editor, harnessing pipeline, lessons, integrations)
 extension/      Chrome extension ("Nesicode" tab group)
-packaging/      macOS (.app/.dmg) and Windows (installer) builds
+packaging/      macOS (.app/.dmg), Windows (installer) and Linux (.deb) builds
 docs/demo/      quick-start and providers videos, and the scripts that record them
 tests/          uv run pytest
 ```

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Nesicode
+GenericName=AI coding agent
+Comment=Coding agent with a chat, projects, connectors and bots
+Exec=nesicode
+Icon=nesicode
+Terminal=false
+Categories=Development;
+Keywords=AI;agent;code;chat;LLM;
+StartupNotify=true
+StartupWMClass=Nesicode
