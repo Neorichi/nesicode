@@ -103,12 +103,19 @@ fi
 log "closing the window quits the app"
 close_app "$APP" || fail "the app is still running after its window was closed"
 
-log "a quick reopen keeps port 47821"
-ss -tan | grep -c ':47821 .*TIME-WAIT' || true
-start_app
-wait_port || fail "the reopened app is not on 127.0.0.1:47821"
-APP2=$(app_pid)
-ss -ltnp | grep ':47821' | grep -q "pid=$APP2," || fail "47821 is not the reopened app's"
-for _ in $(seq 120); do xwininfo -root -tree | grep -q '"Nesicode"' && break; sleep 0.5; done
-close_app "$APP2" || fail "the reopened app did not quit"
+log "a quick reopen keeps port 47821; closing the window as soon as it opens (the page still loading) quits too"
+echo "connections in TIME-WAIT: $(ss -tan | grep -c ':47821 .*TIME-WAIT' || true)"
+for round in 1 2 3; do
+  start_app
+  wait_port || fail "the reopened app is not on 127.0.0.1:47821 (round $round)"
+  APP2=$(app_pid)
+  ss -ltnp | grep ':47821' | grep -q "pid=$APP2," || fail "47821 is not the reopened app's (round $round)"
+  for _ in $(seq 240); do wmctrl -l 2>/dev/null | grep -q Nesicode && break; sleep 0.25; done
+  if ! close_app "$APP2"; then
+    echo "windows:"; wmctrl -l || true; xwininfo -root -tree | grep -i nesicode || true
+    grep -E '^(State|Threads)' "/proc/$APP2/status" || true
+    fail "the app did not quit when its window was closed right after opening (round $round)"
+  fi
+  echo "round $round: closed while loading, quit"
+done
 echo "OK: $(basename "$DEB")"

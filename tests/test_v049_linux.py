@@ -207,66 +207,72 @@ def test_linux_main_frame_is_turned_away_at_its_response_and_frames_are_left_alo
     assert len(passed) == 6 and away not in passed and raw not in passed
 
 
-def test_linux_the_browser_opens_when_the_load_starts_once_and_the_page_keeps_its_bridge(opened):
+def test_linux_the_browser_opens_once_per_navigation_and_the_page_keeps_its_bridge(opened):
+    """The main frame's loads (load-changed, load-failed) as WebKitGTK reports them: the address it gives when a load
+    starts is still the app's, so the response or the failure decides; the page that stays keeps its bridge."""
     gtk, calls = _gtk()
     desktop._guard_gtk_navigation(gtk)
     view = gtk.BrowserView()
     STARTED, REDIRECTED, COMMITTED, FINISHED, RESPONSE = 0, 1, 2, 3, 2
     web = view.webview
+    (failed,) = web.handlers["load-failed"]
 
-    def load(uri, event):
-        web.uri = uri
+    def load(event):
         return view.on_load_finish(web, event)
+
+    def respond(uri):
+        d = _Decision(uri, main=True)
+        return view.on_navigation(web, d, RESPONSE), d
 
     # the app itself loads: pywebview sees every event and injects its bridge at the end
     for event in (STARTED, REDIRECTED, COMMITTED, FINISHED):
-        load(f"{APP}/?token=t" if event == STARTED else f"{APP}/", event)
+        load(event)
     assert calls["load"] == [STARTED, REDIRECTED, COMMITTED, FINISHED] and opened == []
 
-    # a link to another site: the browser opens as soon as the main frame starts, once (not again at its response)
+    # a link to another site: the browser opens at its response, once (not again when the cancelled load fails)
     calls["load"].clear()
-    load("https://example.org/a", STARTED)
-    assert _wait_for(opened) == ["https://example.org/a"]
-    resp = _Decision("https://example.org/a", main=True)
-    assert view.on_navigation(web, resp, RESPONSE) is True and resp.ignored
-    web.uri = f"{APP}/"  # (WebKit restores the page's address when the navigation fails)
-    load(f"{APP}/", FINISHED)
+    load(STARTED)
+    handled, d = respond("https://example.org/a")
+    assert handled is True and d.ignored and _wait_for(opened) == ["https://example.org/a"]
+    assert failed(web, STARTED, "https://example.org/a", None) is True  # (cancelled by the guard: no error page)
+    load(FINISHED)
     assert calls["load"] == [STARTED]  # no FINISHED for pywebview: it would inject its bridge again
     time.sleep(0.1)
     assert opened == ["https://example.org/a"]
 
-    # the same link again opens again; a redirect of it does not open a second time
-    load("http://example.org/b", STARTED)
-    load("https://example.org/b", REDIRECTED)
-    load(f"{APP}/", FINISHED)
-    assert _wait_for(opened, 2) == ["https://example.org/a", "http://example.org/b"]
-    load("https://example.org/a", STARTED)
-    load(f"{APP}/", FINISHED)
-    assert _wait_for(opened, 3)[-1] == "https://example.org/a"
+    # a site that never answers (unknown host) or a mailto: link: the browser or mail app opens when the load fails,
+    # and WebKit's error page never replaces the app
+    for url in ("https://nesicode-check.invalid/c2", "mailto:someone@example.com", "https://example.org/a"):
+        load(STARTED)
+        assert failed(web, STARTED, url, None) is True
+        load(FINISHED)
+    assert _wait_for(opened, 4)[1:] == ["https://nesicode-check.invalid/c2", "mailto:someone@example.com",
+                                        "https://example.org/a"]  # (the same link again: opens again)
 
-    # an app route that redirects to another site: turned away at the redirect
-    load(f"{APP}/somewhere", STARTED)
-    load("https://elsewhere.example/", REDIRECTED)
-    assert _wait_for(opened, 4)[-1] == "https://elsewhere.example/"
-    load(f"{APP}/", FINISHED)
-    # an API file: never sent anywhere, the page stays
+    # an app route that redirects to another site: turned away at the final response
+    load(STARTED)
+    load(REDIRECTED)
+    handled, d = respond("https://elsewhere.example/")
+    assert handled is True and _wait_for(opened, 5)[-1] == "https://elsewhere.example/"
+    failed(web, STARTED, "https://elsewhere.example/", None)
+    load(FINISHED)
+
+    # an API file or a local file: never sent anywhere, no error page, the page stays
     calls["load"].clear()
-    load(f"{APP}/api/health", STARTED)
-    load(f"{APP}/", FINISHED)
-    assert calls["load"] == [STARTED]
+    for url in (f"{APP}/api/health", "file:///etc/hosts"):
+        load(STARTED)
+        handled, d = respond(url)
+        assert handled is True and d.ignored
+        assert failed(web, STARTED, url, None) is True
+        load(FINISHED)
+    assert calls["load"] == [STARTED, STARTED]
     time.sleep(0.1)
-    assert len(opened) == 4
+    assert len(opened) == 5
 
-
-def test_linux_no_webkit_error_page_replaces_the_app(opened):
-    gtk, _ = _gtk()
-    desktop._guard_gtk_navigation(gtk)
-    view = gtk.BrowserView()
-    (failed,) = view.webview.handlers["load-failed"]
-    assert failed(view.webview, 0, "https://nesicode-check.invalid/x", None) is True  # unknown host: no error page
-    assert failed(view.webview, 0, "mailto:someone@example.com", None) is True
-    assert failed(view.webview, 0, f"{APP}/api/health", None) is True
-    assert failed(view.webview, 0, f"{APP}/", None) is False  # the app's own page failing: WebKit's page says why
+    # the app's own page failing to load: WebKit's error page says why (nothing to turn away)
+    load(STARTED)
+    assert failed(web, STARTED, f"{APP}/", None) is False
+    assert len(opened) == 5
 
 
 def test_guard_navigation_picks_the_platform_backend(monkeypatch):
@@ -491,3 +497,18 @@ def test_the_deb_package_layout(tmp_path):
     assert "Nesi Labs" in (tree / "usr" / "share" / "doc" / "nesicode" / "copyright").read_text(encoding="utf-8")
     sums = (tree / "DEBIAN" / "md5sums").read_text(encoding="utf-8")
     assert "  opt/nesicode/nesicode\n" in sums and "usr/bin/nesicode" not in sums  # (a link has no sum)
+
+
+def test_pywebview_helper_threads_never_keep_the_app_alive():
+    """pywebview's script injection and bridge calls wait, with no time limit, for a window that may be gone (closed
+    while the page loaded): such a thread kept the quit app's process alive on Ubuntu. They are daemons now."""
+    import threading
+
+    util = types.SimpleNamespace(Thread=threading.Thread)
+    desktop._daemon_bridge_threads(util)
+    t = util.Thread(target=lambda: None)
+    assert t.daemon is True and isinstance(t, threading.Thread)
+    assert util.Thread(target=lambda: None, daemon=False).daemon is False  # (an explicit choice stays)
+    other = types.SimpleNamespace(Thread=object)
+    desktop._daemon_bridge_threads(other)
+    assert other.Thread is object  # something else than threading's Thread: left alone

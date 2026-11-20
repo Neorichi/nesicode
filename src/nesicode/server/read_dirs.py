@@ -32,7 +32,9 @@ APP_DATA_ROOTS = ("Library", "Library/Application Support", "Library/Containers"
 # /proc/<pid>/root/…).
 SYSTEM_ROOTS = ("/System", "/dev", "/proc", "/sys") if os.name != "nt" else ()
 ROOT_HOMES = ("/var/root", "/private/var/root", "/root") if os.name != "nt" else ()
-SHARED_HOMES = {"shared", "public"}  # /Users/Shared (macOS), C:\Users\Public (Windows): nobody's home
+# /Users/Shared (macOS), C:\Users\Public (Windows): nobody's home. Linux has no such folder: in /home, a "shared" or a
+# "public" is some user's home (and its names are case-sensitive there, so the check below never matched "Shared")
+SHARED_HOMES = {"shared", "public"} if sys.platform == "darwin" or os.name == "nt" else set()
 # Places every program shares (temporary files, sockets, the local databases Homebrew/MacPorts run): never one of them,
 # a folder inside one or a folder that holds one. Other programs' files are there (the sandbox keeps them out for that:
 # workspace.SHARED_DIRS), and in docker mode a folder is mounted, and a read-only mount still lets a socket in it be

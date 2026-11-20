@@ -1610,7 +1610,8 @@ def _process_table(commands: bool = False, proc_root: str = "/proc") -> dict[int
     """Every process of the machine by pid (POSIX), {} when it cannot be read: `ps`, else Linux's /proc (a slim
     container has no `ps`)."""
     table: dict[int, _Proc] = {}
-    argv = ["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "stat="] + (["-o", "command="] if commands else [])
+    # -ww: the whole command (Linux's ps cuts it at 80 columns when its output is not a terminal; macOS's never does)
+    argv = ["ps", "-ww", "-A", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "stat="] + (["-o", "command="] if commands else [])
     try:
         out = subprocess.run(argv, capture_output=True, timeout=5).stdout.decode("utf-8", "replace")
     except (OSError, subprocess.SubprocessError):
@@ -1974,6 +1975,9 @@ class _Background:
                     if not g.active():  # every process in it has ended
                         g.close()
                         self.groups.discard(g)
+                    continue
+                if g <= 1:  # never a command's group (0 is our own; on Linux killpg(1) reaches every process we may signal)
+                    self.groups.discard(g)
                     continue
                 try:
                     os.killpg(g, 0)

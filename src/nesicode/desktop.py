@@ -333,10 +333,11 @@ def _guard_edge_navigation(edgechromium):
 
 # Linux (WebKitGTK). Its policy signal for a navigation does not say whether the main frame or a frame inside the page
 # (an agent-written preview) is navigating; its response signal does (WebKitGTK 2.40+, which pywebview 6 needs anyway).
-# So the main frame is turned away there, before the new page replaces the app: the browser opens as soon as the main
-# frame starts the navigation (load-changed, main frame only), and WebKit's error page never replaces the app when such
-# a navigation fails (an unknown host, mailto:…). Turning away from the policy signal of the navigation itself would
-# cut the frames' navigations too, and stopping the load would also cut the app's own streams (the replies).
+# So the main frame is turned away there, before the new page replaces the app (the browser opens then), or when its
+# load fails before any response (an unknown host, a mailto: link: the browser or the mail app opens then, and WebKit's
+# error page never replaces the app). Turning away from the policy signal of the navigation itself would cut the
+# frames' navigations too, and stopping the load would also cut the app's own streams (the replies). The address the
+# web view reports when a load starts is still the app's (checked on WebKitGTK 2.50 and 2.52), so it cannot be used.
 def gtk_new_window_decision(action, port: int, link_clicked) -> tuple[str, str]:
     """`new_window_decision` for a WebKitGTK navigation action."""
     try:
@@ -385,12 +386,11 @@ def _guard_gtk_navigation(gtk):
     view_cls = gtk.BrowserView
     new_window, response = webkit.PolicyDecisionType.NEW_WINDOW_ACTION, webkit.PolicyDecisionType.RESPONSE
     link_clicked = webkit.NavigationType.LINK_CLICKED
-    started, redirected = webkit.LoadEvent.STARTED, webkit.LoadEvent.REDIRECTED
-    committed, finished = webkit.LoadEvent.COMMITTED, webkit.LoadEvent.FINISHED
+    started, committed, finished = webkit.LoadEvent.STARTED, webkit.LoadEvent.COMMITTED, webkit.LoadEvent.FINISHED
     original_policy, original_load = view_cls.on_navigation, view_cls.on_load_finish
 
     def turn_away_once(view, decision: str, url: str) -> None:
-        if not getattr(view, "_nesi_away", False):  # once per navigation (its redirects, then its response)
+        if not getattr(view, "_nesi_away", False):  # once per navigation (its response, then the failure it ends in)
             view._nesi_away = True
             _turned_away(decision, url)
 
@@ -422,15 +422,10 @@ def _guard_gtk_navigation(gtk):
                     return True
         return original_policy(self, webview, decision, decision_type)
 
-    def on_load_finish(self, webview, status):
+    def on_load_finish(self, webview, status):  # (load-changed: the main frame's loads only)
         try:
             if status == started:
                 self._nesi_away, self._nesi_committed = False, False
-            if status in (started, redirected):  # main frame only: open the browser now, cancel at the response
-                url = str(webview.get_uri() or "")
-                kind = window_navigation(url, _guarded_nav["port"])
-                if kind != "allow":
-                    turn_away_once(self, kind, url)
             elif status == committed:
                 self._nesi_committed = True
             elif status == finished:
@@ -443,15 +438,22 @@ def _guard_gtk_navigation(gtk):
             print("nesicode: window navigation check failed:", exc, file=sys.stderr)
         return original_load(self, webview, status)
 
-    def on_load_failed(webview, load_event, url, error):
-        try:  # True: no WebKit error page in place of the app for a navigation it turned away
-            return window_navigation(str(url), _guarded_nav["port"]) != "allow"
-        except Exception:
-            return False
+    def watch_failures(view):
+        def on_load_failed(webview, load_event, url, error):
+            try:
+                kind = window_navigation(str(url), _guarded_nav["port"])
+            except Exception:
+                return False
+            if kind == "allow":
+                return False  # the app's own page did not load: WebKit's error page says why
+            turn_away_once(view, kind, str(url))  # (unless its response already did)
+            return True  # no error page in place of the app
+
+        view.webview.connect("load-failed", on_load_failed)
 
     # pywebview connects these to each window's web view when it builds it
     view_cls.on_navigation, view_cls.on_load_finish = on_navigation, on_load_finish
-    _gtk_after_init(gtk, lambda view: view.webview.connect("load-failed", on_load_failed))
+    _gtk_after_init(gtk, watch_failures)
     return on_navigation
 
 
@@ -730,14 +732,37 @@ def _prepare_gtk() -> None:
 
 
 def _window_icon() -> str | None:
-    """The Linux window's icon: the bundle's, the installed one, or the source checkout's."""
+    """The Linux window's icon (X11; Wayland takes the menu entry's): the installed 256 px one, else the bundle's or
+    the source checkout's (1024 px)."""
     here = Path(__file__).resolve()
-    for p in (Path(getattr(sys, "_MEIPASS", "") or "/nonexistent") / "nesicode.png",
-              Path("/usr/share/icons/hicolor/256x256/apps/nesicode.png"),
+    for p in (Path("/usr/share/icons/hicolor/256x256/apps/nesicode.png"),
+              Path(getattr(sys, "_MEIPASS", "") or "/nonexistent") / "nesicode.png",
               here.parents[2] / "packaging" / "icons" / "nesicode.png"):
         if p.is_file():
             return str(p)
     return None
+
+
+class _HelperThread(threading.Thread):
+    """A pywebview helper thread that cannot keep the app alive once its window is gone."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("daemon", True)
+        super().__init__(*args, **kwargs)
+
+
+def _daemon_bridge_threads(util=None) -> None:
+    """pywebview injects its script and runs each bridge call in a thread of its own that waits, with no time limit,
+    for the window to answer. Closed meanwhile (right after it opened, while the page loaded), the window never
+    answers: the app quit its server but its process stayed alive, invisible (seen on Ubuntu). Those threads must not
+    keep the process alive after the window is gone."""
+    if util is None:
+        try:
+            import webview.util as util
+        except Exception:
+            return
+    if getattr(util, "Thread", None) is threading.Thread:
+        util.Thread = _HelperThread
 
 
 def _browser_fallback(url: str, server, thread: threading.Thread, stop_runtime) -> None:
@@ -846,6 +871,7 @@ def main() -> None:
                 f.write(r.read())
             return True
 
+    _daemon_bridge_threads()
     _enable_native_context_menu(webview)
     _allow_microphone(port)
     guard_navigation(port)  # these two before the window exists: pywebview builds its delegate and bridge with it

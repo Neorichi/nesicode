@@ -77,9 +77,14 @@ def _refused(raw, why: str) -> None:
 def test_folders_the_agent_may_be_let_read(home, tmp_path):
     usb = tmp_path / "Volumes" / "USB" / "apks"  # (an external disk's folder)
     usb.mkdir(parents=True)
+    shared = tmp_path / "Users" / "Shared" / "fotos"  # /Users/Shared (macOS), C:\\Users\\Public: nobody's home
     for p in (home / "Downloads", home / "Documents" / "x", home / ".config" / "myapp", usb,
-              home / "Library" / "Mobile Documents" / "com~apple~CloudDocs", tmp_path / "Users" / "Shared" / "fotos"):
+              home / "Library" / "Mobile Documents" / "com~apple~CloudDocs") + ((shared,) if rd.SHARED_HOMES else ()):
         assert rd.check_read_dir(str(p)) == _c(p)
+    if not rd.SHARED_HOMES:  # Linux: in /home, "Shared" or "public" would be some user's home
+        for p in (shared, tmp_path / "Users" / "public"):
+            p.mkdir(parents=True, exist_ok=True)
+            _refused(p, "de otro usuario")
     assert rd.check_read_dir("~/Downloads") == _c(home / "Downloads")  # what «Añadir Descargas» sends
     assert rd.check_read_dir(f"  {home / 'Downloads'}  ") == _c(home / "Downloads")
 
