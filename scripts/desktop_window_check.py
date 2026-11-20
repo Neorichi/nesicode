@@ -20,6 +20,7 @@ import webbrowser
 OUT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else None
 sys.argv[0] = os.path.abspath(sys.argv[0])  # (pywebview resolves its base folder from it; the cwd changes below)
 HOME = tempfile.mkdtemp(prefix="nesi-window-")
+EXPECT_SANDBOX = os.environ.get("NESICODE_EXPECT_SANDBOX") == "1"  # (CI: a machine where WebKit's sandbox must be on)
 for _k in [k for k in os.environ if k.startswith("NESICODE_")]:  # nothing of a real setup (its data dir, keys…)
     del os.environ[_k]
 os.environ.update(HOME=HOME, XDG_DATA_HOME=os.path.join(HOME, ".local", "share"), NESICODE_NO_DOTENV="1",
@@ -259,7 +260,7 @@ linux_keys = ("gtk_context_menu_kept", "gtk_clipboard_reads_off")
 # AppArmor refuses it to programs without a profile, and the app then runs its pages without (as before 0.4.9)
 if res.get("web_sandbox") and "bwrap" not in (res.get("web_processes") or []):
     fails.append(f"the sandbox was asked for but no bubblewrap runs: {res.get('web_processes')}")
-if os.environ.get("NESICODE_EXPECT_SANDBOX") == "1" and res.get("web_sandbox") is not True:
+if EXPECT_SANDBOX and res.get("web_sandbox") is not True:
     fails.append("WebKit's sandbox is off on a machine where it must be on")
 for key in ("api_ready", "start_url_is_app") + (linux_keys if sys.platform.startswith("linux") else ()):
     if res.get(key) is not True:
