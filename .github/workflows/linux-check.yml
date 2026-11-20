@@ -50,6 +50,8 @@ jobs:
       - name: the real window
         run: |
           uv sync --extra desktop
+          # Ubuntu 22.04 lets bubblewrap make user namespaces: the window's pages must run in WebKit's sandbox there
+          export NESICODE_EXPECT_SANDBOX=${{ matrix.runner == 'ubuntu-22.04' && '1' || '0' }}
           xvfb-run -a -s "-screen 0 1600x1000x24" dbus-run-session -- uv run --no-sync python scripts/desktop_window_check.py window.json
       - uses: actions/upload-artifact@v4
         if: always()

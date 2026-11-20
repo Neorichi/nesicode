@@ -79,13 +79,12 @@ CASES = {
                              f"b.textContent = 'img'; a.appendChild(b); {ROOT}.appendChild(a); b.click(); return 1 }})()",
                              ["https://example.com/h"], True),
     "J_same_origin_link_click": (_click("/projects"), [], False),
-    # the page's fallback before the bridge exists: a detached target=_blank link it clicks. Inside the user's click it
-    # opens the browser everywhere; run from a script, as here, WebKitGTK (which tells a user's gesture from a script)
-    # opens nothing, as it must for a preview's own a.click()
+    # the page's fallback before the bridge exists: a detached target=_blank link it clicks (scripts this check runs
+    # count as the user's gesture for WebKit, as the user's own click does)
     "K_no_bridge_yet_fallback": ("(() => { const saved = window.pywebview; window.pywebview = undefined; "
                                  "const a = document.createElement('a'); a.href = 'https://example.com/k'; a.textContent = 'K'; "
                                  f"{ROOT}.appendChild(a); a.click(); window.pywebview = saved; return 1 }})()",
-                                 [] if sys.platform.startswith("linux") else ["https://example.com/k"], True),
+                                 ["https://example.com/k"], True),
     "M_encoded_api_link_click": (_click("/%61pi/health"), [], True),
     "M2_encoded_api_direct": (_go("/api%2Fhealth"), [], True),
     "N_assets_direct": (_go("/assets/missing.js"), [], True),
@@ -114,7 +113,12 @@ t(function () { window.chrome.webview.postMessage(['open_external', JSON.stringi
 t(function () { parent.pywebview.api.open_external('https://evil.example/parent') });
 t(function () { top.location.href = 'https://evil.example/top' });
 t(function () { window.open('https://evil.example/popup') });
-"""
+""" + ("""
+// a target=_blank link the page's own script clicks, with no click of the user's (WebKitGTK tells them apart; macOS's
+// window does not yet, so only here)
+t(function () { var a = document.createElement('a'); a.href = 'https://evil.example/scripted'; a.target = '_blank';
+  document.body.appendChild(a); a.click() });
+""" if sys.platform.startswith("linux") else "")
 PREVIEW = """(() => {
   window.__e2ePreview = 'pending';
   const html = '<!doctype html><meta charset="utf-8"><p>preview</p><script>' + %s + '<\\/script>';
@@ -251,10 +255,12 @@ desktop.main()
 res = holder.get("res") or {}
 fails = []
 linux_keys = ("gtk_context_menu_kept", "gtk_clipboard_reads_off")
-if sys.platform.startswith("linux") and os.environ.get("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "0") == "0":
-    linux_keys += ("web_sandbox",)  # (a real machine: its pages must run in WebKit's bubblewrap sandbox)
-    if "bwrap" not in (res.get("web_processes") or []):
-        fails.append(f"no bubblewrap among the window's processes: {res.get('web_processes')}")
+# WebKit's bubblewrap sandbox: on wherever bubblewrap may make a user namespace (Ubuntu 22.04, Debian); Ubuntu 24.04's
+# AppArmor refuses it to programs without a profile, and the app then runs its pages without (as before 0.4.9)
+if res.get("web_sandbox") and "bwrap" not in (res.get("web_processes") or []):
+    fails.append(f"the sandbox was asked for but no bubblewrap runs: {res.get('web_processes')}")
+if os.environ.get("NESICODE_EXPECT_SANDBOX") == "1" and res.get("web_sandbox") is not True:
+    fails.append("WebKit's sandbox is off on a machine where it must be on")
 for key in ("api_ready", "start_url_is_app") + (linux_keys if sys.platform.startswith("linux") else ()):
     if res.get(key) is not True:
         fails.append(f"{key}: {res.get(key)!r}")
