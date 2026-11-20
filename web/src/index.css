@@ -172,7 +172,9 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 .auth-card label, .form label { display: flex; flex-direction: column; gap: 5px; font-size: 13.5px; font-weight: 500; color: var(--ink-2); }
 
 /* welcome / new chat */
-.welcome { flex: 1; display: grid; place-items: center; padding: 24px 16px; overflow-y: auto; }
+/* safe: content taller than the window (the first project's form at 880 px) starts at the top, where it can be
+   scrolled to; plain centering pushed its heading above the scroll range. (center: engines without `safe`) */
+.welcome { flex: 1; display: grid; place-items: center; place-items: safe center; padding: 24px 16px; overflow-y: auto; }
 .welcome-inner { width: min(720px, 100%); text-align: center; }
 .welcome h1 { font-size: 34px; }
 .welcome .composer { margin: 22px 0 14px; text-align: left; }

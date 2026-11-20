@@ -25,8 +25,10 @@ MAINTAINER = "Nesi Labs <3147619+Neorichi@users.noreply.github.com>"
 HOMEPAGE = "https://github.com/Neorichi/nesicode"
 # gir1.2-* bring GTK 3, WebKitGTK (4.1 API) and their typelibs; the rest is what the bundled PyGObject links to.
 DEPENDS = "gir1.2-gtk-3.0, gir1.2-webkit2-4.1, libgirepository-1.0-1, libcairo-gobject2, libffi8"
-# xdg-utils opens links in the browser; the GStreamer ones give WebKitGTK the microphone (the mic button)
-RECOMMENDS = "xdg-utils, git, gstreamer1.0-plugins-good, gstreamer1.0-pipewire | gstreamer1.0-pulseaudio"
+# xdg-utils opens links in the browser; the GStreamer ones give WebKitGTK the microphone (the mic button); the emoji
+# font draws the icons the UI writes as emoji (a bare system shows boxes)
+RECOMMENDS = ("xdg-utils, git, gstreamer1.0-plugins-good, gstreamer1.0-pipewire | gstreamer1.0-pulseaudio, "
+              "fonts-noto-color-emoji")
 DESCRIPTION = """Coding agent with a chat, projects, connectors and bots
  Nesicode is a desktop app for working with AI coding agents: a chat that edits
  and runs code in your projects, connectors (MCP servers, Gmail, GitHub…),

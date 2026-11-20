@@ -10,7 +10,7 @@ Build with uv's own Python (as packaging/linux/build_deb.sh does), not the distr
 
 from __future__ import annotations
 
-import os
+import posixpath  # (Linux paths, wherever this module is imported: the tests run on Windows too)
 
 SYSTEM_ROOTS = ("/usr/", "/lib/", "/lib32/", "/lib64/", "/libx32/", "/bin/", "/sbin/", "/etc/")
 
@@ -31,13 +31,13 @@ FORBIDDEN = ("libgtk-3.so", "libgdk-3.so", "libwebkit2gtk-4", "libjavascriptcore
 
 def from_system(src: str) -> bool:
     """Is this file one of the system's (under /usr, /lib…), rather than Python's or a package's?"""
-    path = os.path.abspath(str(src))
-    return path.startswith(SYSTEM_ROOTS) or os.path.realpath(path).startswith(SYSTEM_ROOTS)
+    path = posixpath.abspath(str(src))
+    return path.startswith(SYSTEM_ROOTS) or posixpath.realpath(path).startswith(SYSTEM_ROOTS)
 
 
 def keep_binary(entry) -> bool:
     dest, src = entry[0], entry[1]
-    if os.path.basename(str(dest)).startswith("libpython"):
+    if posixpath.basename(str(dest)).startswith("libpython"):
         return True  # the interpreter itself (from wherever this Python is installed)
     return not from_system(src)
 
@@ -52,4 +52,4 @@ def keep_script(entry) -> bool:
 
 def forbidden(names) -> list[str]:
     """The files of a built bundle (relative names) that must have been left to the system."""
-    return sorted(n for n in names if os.path.basename(n).startswith(FORBIDDEN))
+    return sorted(n for n in names if posixpath.basename(n).startswith(FORBIDDEN))

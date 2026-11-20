@@ -275,6 +275,7 @@ def test_linux_the_browser_opens_once_per_navigation_and_the_page_keeps_its_brid
     assert len(opened) == 5
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows always picks WebView2 (os.name)")
 def test_guard_navigation_picks_the_platform_backend(monkeypatch):
     seen = []
     monkeypatch.setattr(desktop, "_guarded_nav", {})
@@ -415,6 +416,7 @@ def test_linux_context_menu_keeps_editing_and_drops_browser_items():
 
 
 # ------------------------------------------------------------------ the bundle
+@pytest.mark.skipif(os.name == "nt", reason="the Linux bundle's library path (':'-separated)")
 def test_what_the_app_starts_gets_the_users_library_path_back(monkeypatch):
     monkeypatch.setattr(desktop.sys, "frozen", True, raising=False)
     monkeypatch.setattr(desktop.sys, "_MEIPASS", "/opt/nesicode/_internal", raising=False)
