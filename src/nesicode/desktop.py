@@ -13,6 +13,7 @@ import socket
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import webbrowser
 
@@ -112,6 +113,162 @@ def _guard_cocoa_bridge(cocoa, port: int):
 
     cocoa.BrowserView.JSBridge = NesiJSBridge  # pywebview creates BrowserView.JSBridge for every window
     return NesiJSBridge
+
+
+# ------------------------------------------------------------- the window never leaves the app
+# The window has no address bar and no Back button: a link that replaced the app's page (another website, a local
+# file, a raw file of the API) left the user stuck on it until they quit the app. The page itself sends links to other
+# sites to the browser, but a navigation can reach the window in ways the page never sees (a click inside a modal that
+# stops it, the context menu's «Abrir enlace», a script), so the window turns such navigations away natively too.
+_guarded_nav: dict[str, object] = {}
+# what the server answers with something other than the app's page: FastAPI's API docs (and /assets, /api below)
+_RAW_PAGES = ("/assets", "/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json")
+
+
+def app_page(path: str) -> bool:
+    """Is this path of the app's own origin one of its pages, rather than the API, the page's scripts and styles or the
+    API docs? Judged the way the server routes it: uvicorn decodes the path once, so /%61pi/… and /api%2F… are the API
+    (web/src/logic.ts `appPagePath` is the page's twin)."""
+    p = urllib.parse.unquote(path)
+    return not (p.startswith(("/api/", "/assets/")) or p.rstrip("/") in _RAW_PAGES)
+
+
+def window_navigation(url: str, port: int) -> str:
+    """What the app window does with a navigation of its main frame to `url`: "allow" (the app's own pages), "browser"
+    (another website or an e-mail link: the user's browser or mail app opens it instead) or "block" (anything else:
+    the API's raw output, local files, other schemes)."""
+    try:
+        text = str(url).strip()
+        if text == "about:blank":
+            return "allow"  # what a web view may load before the app
+        parts = urllib.parse.urlsplit(text)
+        scheme = parts.scheme.lower()
+        if scheme == "mailto":
+            return "browser"
+        if scheme in ("http", "https") and parts.hostname:
+            if scheme == "http" and parts.hostname == "127.0.0.1" and parts.port == port:
+                return "allow" if app_page(parts.path) else "block"
+            return "browser"
+    except ValueError:  # e.g. a port that is not a number
+        pass
+    return "block"
+
+
+def navigation_decision(action, port: int) -> tuple[str, str]:
+    """`window_navigation` for a WKNavigationAction of the main frame, as (decision, url). New windows (target=_blank,
+    which pywebview already sends to the browser) and the frames inside the page (the sandboxed previews) are left as
+    they are, and so is anything unexpected."""
+    try:
+        frame = action.targetFrame()
+        if frame is None or not frame.isMainFrame():
+            return "allow", ""
+        url = str(action.request().URL().absoluteString())
+    except Exception:
+        return "allow", ""
+    return window_navigation(url, port), url
+
+
+def new_window_decision(action, port: int, link_activated: int) -> tuple[str, str]:
+    """For a request to open a new window (a target=_blank link, window.open): ("browser", url) only for a link the
+    user activated to another website or an e-mail address, else ("none", url). pywebview hands whatever such a link
+    holds to the system, any scheme: a target=_blank smb: or file: link in an agent-written page (the previews allow
+    popups) would reach Finder / Explorer, which on Windows connects to that share with the user's credentials."""
+    try:
+        if action.navigationType() != link_activated:
+            return "none", ""
+        url = str(action.request().URL().absoluteString())
+    except Exception:
+        return "none", ""
+    return ("browser" if window_navigation(url, port) == "browser" else "none"), url
+
+
+def _turned_away(decision: str, url: str) -> None:
+    if decision == "browser":  # off the UI thread: the macOS browser hand-off waits for osascript
+        threading.Thread(target=webbrowser.open, args=(url,), name="nesicode-open-link", daemon=True).start()
+    else:
+        kind = url.split(":", 1)[0] if ":" in url else "bare"
+        print(f"nesicode: kept the window on the app (a {kind[:20]} link)", file=sys.stderr)
+
+
+def _guard_cocoa_navigation(cocoa):
+    import objc
+
+    base = cocoa.BrowserView.BrowserDelegate
+    cancel = getattr(cocoa.WebKit, "WKNavigationActionPolicyCancel", 0)
+    link_activated = getattr(cocoa.WebKit, "WKNavigationTypeLinkActivated", 0)
+
+    class NesiBrowserDelegate(base):
+        def webView_decidePolicyForNavigationAction_decisionHandler_(self, webview, action, handler):
+            decision, url = navigation_decision(action, _guarded_nav["port"])
+            if decision == "allow":
+                objc.super(NesiBrowserDelegate, self).webView_decidePolicyForNavigationAction_decisionHandler_(
+                    webview, action, handler)
+                return
+            handler(cancel)
+            _turned_away(decision, url)
+
+        def webView_createWebViewWithConfiguration_forNavigationAction_windowFeatures_(
+                self, webview, config, action, features):
+            decision, url = new_window_decision(action, _guarded_nav["port"], link_activated)
+            if decision == "browser":
+                _turned_away(decision, url)
+            return None  # never a second web view
+
+    cocoa.BrowserView.BrowserDelegate = NesiBrowserDelegate  # pywebview creates one per window from this attribute
+    return NesiBrowserDelegate
+
+
+def _guard_edge_navigation(edgechromium):
+    """WebView2's NavigationStarting is raised for the main frame only (frames have their own event);
+    NewWindowRequested for target=_blank links and window.open, from any frame (see new_window_decision)."""
+    original = edgechromium.EdgeChrome.on_navigation_start
+    original_new_window = edgechromium.EdgeChrome.on_new_window_request
+
+    def on_navigation_start(self, sender, args):
+        try:
+            url = str(args.Uri)
+            decision = window_navigation(url, _guarded_nav["port"])
+        except Exception:
+            decision, url = "allow", ""
+        if decision != "allow":
+            args.Cancel = True
+            _turned_away(decision, url)
+            return None
+        return original(self, sender, args)
+
+    def on_new_window_request(self, sender, args):
+        try:
+            url = str(args.get_Uri())
+            decision = window_navigation(url, _guarded_nav["port"])
+        except Exception:
+            return original_new_window(self, sender, args)
+        args.set_Handled(True)  # never a WebView2 popup window
+        if decision == "browser":
+            _turned_away(decision, url)
+        return None
+
+    # pywebview binds both to WebView2's events when it creates the window
+    edgechromium.EdgeChrome.on_navigation_start = on_navigation_start
+    edgechromium.EdgeChrome.on_new_window_request = on_new_window_request
+    return on_navigation_start
+
+
+def guard_navigation(port: int) -> list[str]:
+    """Keep the app window on the app (see above). Call it before the window exists. Returns the backends guarded."""
+    import importlib
+
+    _guarded_nav["port"] = port
+    name = "cocoa" if sys.platform == "darwin" else "edgechromium" if os.name == "nt" else None
+    if name is None:
+        return []
+    if name not in _guarded_nav:
+        try:
+            mod = importlib.import_module(f"webview.platforms.{name}")
+            _guarded_nav[name] = _guard_cocoa_navigation(mod) if name == "cocoa" else _guard_edge_navigation(mod)
+        except Exception as exc:  # the page still sends its links to the browser
+            print("nesicode: could not keep the window on the app:", exc, file=sys.stderr)
+            return []
+    return [name]
 
 
 def _free_port() -> int:
@@ -312,8 +469,8 @@ def main() -> None:
             return True
 
         def open_external(self, url: str):
-            """External links open in the user's browser, never inside the app window."""
-            if url.startswith(("http://", "https://")) and not url.startswith(base):
+            """Links to other sites (and e-mail links) open in the user's browser or mail app, never in the window."""
+            if isinstance(url, str) and window_navigation(url, port) == "browser":
                 webbrowser.open(url)
                 return True
             return False
@@ -334,7 +491,8 @@ def main() -> None:
 
     _enable_native_context_menu(webview)
     _allow_microphone(port)
-    guarded = guard_js_bridge(port)  # before the window exists: pywebview builds its bridge when creating it
+    guard_navigation(port)  # these two before the window exists: pywebview builds its delegate and bridge with it
+    guarded = guard_js_bridge(port)
     # macOS must have the per-frame check (WebKit hands the bridge to every frame); without any guard,
     # no native API at all: folder picking, Finder and "Save as…" fall back to what the page can do itself
     safe = "cocoa" in guarded if sys.platform == "darwin" else bool(guarded)

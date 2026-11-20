@@ -223,6 +223,50 @@ export function allowedImageSrc(src: string, base: string): boolean {
   }
 }
 
+// ------------------------------------------------------------------ links
+/**
+ * What a click on a link does, so that nothing replaces the app's page (the desktop window has no Back button):
+ * 'app' — a page of this app, followed as usual; 'external' — another site or an e-mail link: a new browser tab, or
+ * in the desktop app the user's browser or mail app; 'file' — a raw file of this app's API: a new tab in a browser,
+ * nothing in the desktop window; 'none' — anything else (local files, other schemes, a link that does not parse).
+ */
+export type LinkAction = 'app' | 'external' | 'file' | 'none'
+
+export function linkAction(href: string, page: string): LinkAction {
+  try {
+    const here = new URL(page)
+    const u = new URL(href.trim(), page)
+    if (u.protocol === 'mailto:') return 'external'
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return 'none'
+    if (u.origin !== here.origin) return 'external'
+    return appPagePath(u.pathname) ? 'app' : 'file'
+  } catch {
+    return 'none'
+  }
+}
+
+/** Is this path of the app's origin one of its pages, rather than the API, the page's scripts and styles or the API
+ * docs? Judged the way the server routes it: decoded once, so /%61pi/… and /api%2F… are the API (desktop.py
+ * `app_page` is the window's twin). */
+export function appPagePath(pathname: string): boolean {
+  const p = pathname.replace(/%([0-9a-f]{2})/gi, (_, h: string) => String.fromCharCode(parseInt(h, 16)))
+  const bare = p.replace(/\/+$/, '')
+  return !(p.startsWith('/api/') || p.startsWith('/assets/') || ['/assets', '/docs', '/docs/oauth2-redirect', '/redoc', '/openapi.json'].includes(bare))
+}
+
+/**
+ * What the page does with a click on a link sorted by linkAction: 'follow' (the browser's own way), 'external' (open
+ * it outside the app's page) or 'stop' (nothing). The desktop window has no Back button, so there only the app's pages
+ * are followed. A browser keeps its own way with downloads, clicks with a modifier key (new tab or window) and links
+ * to other apps (tel:, sms:…), none of which replace the page.
+ */
+export function linkClick(action: LinkAction, o: { desktop: boolean; download: boolean; modified: boolean }): 'follow' | 'external' | 'stop' {
+  if (action === 'app') return 'follow'
+  if (o.desktop) return action === 'external' ? 'external' : 'stop'
+  if (o.modified || action === 'none' || (action === 'file' && o.download)) return 'follow'
+  return 'external'
+}
+
 // ------------------------------------------------------------------ composer paste
 const CLIPBOARD_IMAGE = /^(image|pasted[ _-]?graphic(?:[ _-]?\d+)?|unknown|blob)?\.(png|jpe?g|gif|tiff?|bmp|webp)$/i
 

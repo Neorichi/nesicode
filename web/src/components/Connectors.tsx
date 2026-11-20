@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
 import { t, useLang } from '../i18n'
 import { triggerWords } from '../logic'
-import { downloadFile } from './ImageViewer'
+import { downloadFile, openExternal } from './ImageViewer'
 import { fileManager } from '../api'
 
 type Field = { key: string; label: string; secret?: boolean; help?: string; default?: string }
@@ -293,11 +293,7 @@ function Telegram() {
       setError((e as Error).message)
     }
   }
-  const openLink = (url: string) => {
-    const ext = window.pywebview?.api?.open_external
-    if (ext) ext(url)
-    else window.open(url, '_blank')
-  }
+  const openLink = openExternal
   return (
     <div className="your-chrome telegram">
       <div className="mcp-card-top">
