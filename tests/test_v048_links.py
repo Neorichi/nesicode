@@ -10,6 +10,7 @@ navigation, file: and /api/ pages, target=_blank, mailto:); these tests pin the 
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -236,6 +237,35 @@ def test_macos_window_cancels_navigations_away_from_the_app(monkeypatch):
     assert new(None, None, _Action(None, "https://example.org/popup", other), None) is None
     time.sleep(0.1)
     assert opened == ["https://tmpfiles.org/x/photo.png", "https://example.org/n"]
+
+
+# ------------------------------------------------------------------ the stable port after a quick reopen
+@pytest.mark.skipif(os.name == "nt", reason="TIME_WAIT and SO_REUSEADDR as on macOS and Linux")
+def test_a_quick_reopen_keeps_the_port_the_chrome_extension_knows(monkeypatch):
+    """Quitting the app leaves its port's closed connections in TIME_WAIT for ~30 s; a reopen in that time moved the
+    app to a random port (seen when updating the app), and the Chrome extension, paired with 47821, lost it."""
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen()
+    port = srv.getsockname()[1]
+    cli = socket.create_connection(("127.0.0.1", port))
+    conn, _ = srv.accept()
+    conn.close()  # the server's side closes first, as when the app quits: that side stays in TIME_WAIT
+    srv.close()
+    time.sleep(0.2)
+    cli.close()
+    monkeypatch.setattr(desktop, "PREFERRED_PORT", port)
+    assert desktop._free_port() == port
+
+    other = socket.socket()  # an app really listening there: never taken
+    other.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    other.bind(("127.0.0.1", port))
+    other.listen()
+    try:
+        assert desktop._free_port() != port
+    finally:
+        other.close()
 
 
 # ------------------------------------------------------------------ the page (web/src/logic.ts), run with node

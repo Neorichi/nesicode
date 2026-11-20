@@ -274,6 +274,11 @@ def guard_navigation(port: int) -> list[str]:
 def _free_port() -> int:
     for port in (PREFERRED_PORT, 0):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if os.name != "nt":
+                # As the server's own socket does (asyncio on Unix): the connections of an app just quit linger in
+                # TIME_WAIT for ~30 s and must not push a quick reopen off the port the Chrome extension knows; a
+                # running app still holds it (Windows' SO_REUSEADDR would let a second app take it, so not there)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 s.bind(("127.0.0.1", port))
             except OSError:
